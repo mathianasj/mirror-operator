@@ -8,9 +8,11 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -265,6 +267,261 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			Expect(names["trusted-artifact-signer"]).To(Equal("Disabled"))
 			Expect(names).To(HaveKey("openshift-pipelines"))
 			Expect(names).To(HaveKey("trusted-profile-analyzer"))
+		})
+	})
+
+	Describe("architect reconciliation", func() {
+		It("creates frontend and backend deployments when architect is enabled", func() {
+			replicas := int32(1)
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled:  true,
+						Replicas: replicas,
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+
+			names := make(map[string]string)
+			for _, c := range updated.Status.Components {
+				names[c.Name] = c.Status
+			}
+			Expect(names).To(HaveKey("airgap-architect-frontend"))
+			Expect(names).To(HaveKey("airgap-architect-backend"))
+			Expect(names["airgap-architect-frontend"]).To(Equal("Running"))
+			Expect(names["airgap-architect-backend"]).To(Equal("Running"))
+		})
+
+		It("creates route when route config is provided", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+						Route: &mirrorv1.RouteConfig{
+							Host: "architect.apps.example.com",
+							TLS: &mirrorv1.TLSConfig{
+								Termination: "edge",
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+
+			names := make(map[string]string)
+			for _, c := range updated.Status.Components {
+				names[c.Name] = c.Status
+			}
+			Expect(names).To(HaveKey("airgap-architect-frontend"))
+			Expect(names).To(HaveKey("airgap-architect-backend"))
+		})
+
+		It("does not create architect resources when architect is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+
+			for _, c := range updated.Status.Components {
+				Expect(c.Name).NotTo(Equal("airgap-architect-frontend"))
+				Expect(c.Name).NotTo(Equal("airgap-architect-backend"))
+			}
+		})
+
+		It("deletes all architect resources when disabled after being enabled", func() {
+			backendDepName := "mirror-operator-test-platform-airgap-architect-backend"
+			frontendDepName := "mirror-operator-test-platform-airgap-architect-frontend"
+			backendSvcName := backendDepName
+			frontendSvcName := frontendDepName
+
+			backendDep := &unstructured.Unstructured{}
+			backendDep.SetGroupVersionKind(deploymentGVK)
+			backendDep.SetName(backendDepName)
+			backendDep.SetNamespace(architectNamespace)
+
+			frontendDep := &unstructured.Unstructured{}
+			frontendDep.SetGroupVersionKind(deploymentGVK)
+			frontendDep.SetName(frontendDepName)
+			frontendDep.SetNamespace(architectNamespace)
+
+			backendSvc := &unstructured.Unstructured{}
+			backendSvc.SetGroupVersionKind(serviceGVK)
+			backendSvc.SetName(backendSvcName)
+			backendSvc.SetNamespace(architectNamespace)
+
+			frontendSvc := &unstructured.Unstructured{}
+			frontendSvc.SetGroupVersionKind(serviceGVK)
+			frontendSvc.SetName(frontendSvcName)
+			frontendSvc.SetNamespace(architectNamespace)
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      mirrorv1.PlatformModeAirgapped,
+					Architect: &mirrorv1.AirgapArchitectConfig{Enabled: false},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform, backendDep, frontendDep, backendSvc, frontendSvc).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			checkDeleted := func(name string) {
+				obj := &unstructured.Unstructured{}
+				obj.SetGroupVersionKind(deploymentGVK)
+				obj.SetName(name)
+				obj.SetNamespace(architectNamespace)
+				err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}
+			checkDeleted(backendDepName)
+			checkDeleted(frontendDepName)
+
+			checkDeletedSvc := func(name string) {
+				obj := &unstructured.Unstructured{}
+				obj.SetGroupVersionKind(serviceGVK)
+				obj.SetName(name)
+				obj.SetNamespace(architectNamespace)
+				err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}
+			checkDeletedSvc(backendSvcName)
+			checkDeletedSvc(frontendSvcName)
+		})
+
+		It("deletes architect resources on finalizer cleanup", func() {
+			now := metav1.Now()
+			backendDepName := "mirror-operator-test-platform-airgap-architect-backend"
+
+			backendDep := &unstructured.Unstructured{}
+			backendDep.SetGroupVersionKind(deploymentGVK)
+			backendDep.SetName(backendDepName)
+			backendDep.SetNamespace(architectNamespace)
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-platform",
+					Finalizers:        []string{platformFinalizer},
+					DeletionTimestamp: &now,
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform, backendDep).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(deploymentGVK)
+			obj.SetName(backendDepName)
+			obj.SetNamespace(architectNamespace)
+			err = r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			err = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
 

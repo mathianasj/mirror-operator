@@ -72,8 +72,28 @@ spec:
                 type: object
               architect:
                 properties:
+                  backendImage:
+                    type: string
                   enabled:
                     type: boolean
+                  frontendImage:
+                    type: string
+                  pullSecret:
+                    description: |-
+                      LocalObjectReference contains enough information to let you locate the
+                      referenced object inside the same namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   replicas:
                     format: int32
                     type: integer
@@ -153,6 +173,42 @@ spec:
                             type: boolean
                           startingCSV:
                             type: string
+                        type: object
+                    type: object
+                  rhtpa:
+                    properties:
+                      database:
+                        properties:
+                          host:
+                            type: string
+                          name:
+                            type: string
+                          password:
+                            type: string
+                          username:
+                            type: string
+                        required:
+                        - host
+                        - name
+                        - password
+                        - username
+                        type: object
+                      storage:
+                        properties:
+                          accessKey:
+                            type: string
+                          bucket:
+                            type: string
+                          region:
+                            type: string
+                          secretKey:
+                            type: string
+                          size:
+                            type: string
+                          type:
+                            type: string
+                        required:
+                        - type
                         type: object
                     type: object
                   triggerTypes:

@@ -17,9 +17,18 @@ spec:
       - manual
     operators:
       openshiftPipelines: {}
-      rhtas:
-        disabled: true
-      rhtpa:
-        disabled: true
+      rhtas: {}
+      rhtpa: {}
+    rhtpa:
+      storage:
+        type: local
+        size: 20Gi
+      database:
+        host: postgres.example.com
+        name: rhtpa
+        username: rhtpa
+        password: change-me
   architect:
     enabled: true
+    frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:9fa8f29be04be2c87b35abbba921def9021c3b80
+    backendImage: quay.io/mathianasj/openshift-airgap-architect-backend:9fa8f29be04be2c87b35abbba921def9021c3b80

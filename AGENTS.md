@@ -57,7 +57,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 ## Images
 - **Controller image** (`controller:latest`): operator controller Go binary on UBI 9 minimal (Dockerfile, multi-stage build with `golang:1.24`)
 - **Tooling image** (`quay.io/mirror-operator/oc-mirror:v2`): oc-mirror 4.21.0, cosign v2.4.3, syft v1.21.0, oc 4.21.17, kubectl (Dockerfile.tooling, multi-stage build for linux/amd64)
-- Single `--mirror-image` flag (default `quay.io/mirror-operator/oc-mirror:v2`) references the tooling image.
+- **Architect images**: frontend (`quay.io/mirror-operator/airgap-architect-frontend:latest`) and backend (`quay.io/mirror-operator/airgap-architect-backend:latest`) containers for the airgap-architect config UI; configurable via `--architect-frontend-image` / `--architect-backend-image` flags and per-CR `spec.architect.frontendImage` / `spec.architect.backendImage`.
 
 ## CRDs
 
@@ -67,7 +67,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
   - `mode` (PlatformMode) — `connected` or `airgapped`
   - `connected` (optional ConnectedConfig) — collection schedule, mirror registry, artifact storage, trigger types, operators
   - `airgapped` (optional AirgappedConfig) — management cluster flag, mirror registry, bootstrap enabled, import path, registryCredentials
-  - `architect` (optional AirgapArchitectConfig) — enable/disable airgap-architect UI deployment
+  - `architect` (optional AirgapArchitectConfig) — enable/disable airgap-architect UI deployment; controller creates two Deployments (frontend + backend) + two Services + optional Route on enable, cleans up on disable/delete
   - `gitOps` (optional GitOpsConfig) — GitOps integration (stub)
 - **Status**
   - `phase` (Ready / Collecting / Importing / Error)
@@ -139,19 +139,21 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 | Flag | Default | Description |
 |---|---|---|
 | `--mirror-image` | `quay.io/mirror-operator/oc-mirror:v2` | Container image for CollectionPipeline PipelineRun and Import Job |
+| `--architect-frontend-image` | `quay.io/mirror-operator/airgap-architect-frontend:latest` | Container image for DisconnectedPlatform airgap-architect frontend Deployment |
+| `--architect-backend-image` | `quay.io/mirror-operator/airgap-architect-backend:latest` | Container image for DisconnectedPlatform airgap-architect backend Deployment |
 | `--metrics-bind-address` | `0` | Metrics endpoint |
 | `--health-probe-bind-address` | `:8081` | Health probe endpoint |
 | `--leader-elect` | `false` | Leader election for controller manager |
 
 ## Tests
-- 61 tests, all passing (`make test`), coverage 64.3%.
+- 66 tests, all passing (`make test`), coverage 66.0%.
 - Uses envtest (k8s 1.31.0-darwin-arm64) + fake client.
 - Tests cover: ConfigMap creation, PipelineRun 3-task construction (oc-mirror, syft-sbom, cosign-sign with key/password workspaces), S3 env vars, Job construction (d2m path + registry URL + cosign verify-blob), finalizer lifecycle, phase transitions, default image fallback, DisconnectedPlatform/ClusterBootstrap finalizer/phase lifecycle, version generation (`generateVersion`), dependency validation (`versionExists`), platform history tracking, collectionVersionComplete helper, OLM subscription creation with overrides, cosign workspace/password conditions, SBOM reader Job.
 
 ## Stubs (not yet implemented)
 - Enterprise Contract `ec` CLI — not yet bundled in tooling image (cosign verify-blob works, full EC validation is stub).
 - ClusterBootstrap openshift-install orchestration.
-- DisconnectedPlatform sub-component scheduling (airgap-architect, full RHTAS/RHTPA beyond OLM Subscriptions).
+- DisconnectedPlatform sub-component scheduling (full RHTAS/RHTPA beyond OLM Subscriptions).
 - S3 import path for MirrorImport.
 - ImageSetConfiguration YAML parsing to auto-detect mirror sources for IDMS.
 - Incremental build number in version strings.
@@ -165,7 +167,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 ## Next Steps
 1. Deploy operator to a cluster and test end-to-end.
 2. Bundle Enterprise Contract `ec` CLI into tooling image for full EC validation on MirrorImport.
-3. Implement DisconnectedPlatform sub-component lifecycle (airgap-architect, full RHTAS/RHTPA integration beyond OLM subscriptions).
+3. Implement DisconnectedPlatform sub-component lifecycle (full RHTAS/RHTPA integration beyond OLM subscriptions).
 4. Implement ClusterBootstrap openshift-install orchestration.
 5. (Optional) Wire S3 import path for MirrorImport.
 6. (Optional) Parse ImageSetConfiguration YAML to auto-detect mirror sources for IDMS.

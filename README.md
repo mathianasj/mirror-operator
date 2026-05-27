@@ -6,6 +6,19 @@ This operator is an implementation component of the [OCP Disconnected Pipeline r
 
 ## Description
 
+The mirror-operator provides Kubernetes Custom Resource Definitions (CRDs) for automating disconnected OpenShift workflows:
+
+- **DisconnectedPlatform**: Orchestrates the complete connected/airgapped lifecycle
+- **CollectionPipeline**: Automates collection of OCP releases, operators, and container images
+- **MirrorImport**: Handles import of bundles into airgapped registries
+- **ClusterBootstrap**: Provisions new OpenShift clusters from mirrored content
+
+## Documentation
+
+- **[CRD Reference](docs/crd-reference.md)** - Complete API documentation for all Custom Resources
+- **[Integration Guide](docs/integration-guide.md)** - How to integrate mirror-operator with your tools and workflows
+- **[Reference Architecture](docs/reference-architecture-mapping.md)** - System design and architecture mapping
+
 ## Getting Started
 
 ### Prerequisites

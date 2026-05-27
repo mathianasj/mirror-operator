@@ -31,6 +31,7 @@ type ConnectedConfig struct {
 	ArtifactStorage    ArtifactStorageConfig `json:"artifactStorage"`
 	TriggerTypes       []TriggerType         `json:"triggerTypes,omitempty"`
 	Operators          *OperatorConfig       `json:"operators,omitempty"`
+	RHTPA              *RHTPAInstallerConfig `json:"rhtpa,omitempty"`
 }
 
 type OLMSubscriptionConfig struct {
@@ -46,6 +47,27 @@ type OperatorConfig struct {
 	OpenShiftPipelines *OLMSubscriptionConfig `json:"openshiftPipelines,omitempty"`
 	RHTAS              *OLMSubscriptionConfig `json:"rhtas,omitempty"`
 	RHTPA              *OLMSubscriptionConfig `json:"rhtpa,omitempty"`
+}
+
+type RHTPAInstallerConfig struct {
+	Storage  *RHTPAStorageConfig  `json:"storage,omitempty"`
+	Database *RHTPADatabaseConfig `json:"database,omitempty"`
+}
+
+type RHTPAStorageConfig struct {
+	Type      string `json:"type"`
+	Size      string `json:"size,omitempty"`
+	AccessKey string `json:"accessKey,omitempty"`
+	SecretKey string `json:"secretKey,omitempty"`
+	Bucket    string `json:"bucket,omitempty"`
+	Region    string `json:"region,omitempty"`
+}
+
+type RHTPADatabaseConfig struct {
+	Host     string `json:"host"`
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type AirgappedConfig struct {
@@ -66,9 +88,12 @@ type RouteConfig struct {
 }
 
 type AirgapArchitectConfig struct {
-	Enabled  bool         `json:"enabled"`
-	Replicas int32        `json:"replicas,omitempty"`
-	Route    *RouteConfig `json:"route,omitempty"`
+	Enabled       bool                         `json:"enabled"`
+	FrontendImage string                       `json:"frontendImage,omitempty"`
+	BackendImage  string                       `json:"backendImage,omitempty"`
+	Replicas      int32                        `json:"replicas,omitempty"`
+	Route         *RouteConfig                 `json:"route,omitempty"`
+	PullSecret    *corev1.LocalObjectReference `json:"pullSecret,omitempty"`
 }
 
 type GitOpsConfig struct {

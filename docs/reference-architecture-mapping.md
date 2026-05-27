@@ -65,7 +65,7 @@ The top-level orchestrator CRD. Maps directly from the reference spec with addit
 | `airgapped.bootstrapEnabled` | Bool | Same | Identical |
 | `airgapped.importPath` | File path | Same | Identical |
 | `airgapped.registryCredentials` | Secret reference | Same (`LocalObjectReference`) | Identical |
-| `airgapArchitect` (ref: `airgapArchitect`) | `{enabled, resources, route}` | `architect` with `{enabled}` only | Simplified |
+| `airgapArchitect` (ref: `airgapArchitect`) | `{enabled, resources, route}` | `architect` with `{enabled, frontendImage, backendImage, replicas, route}` | Two separate frontend/backend images, replicas, and route config added |
 | `gitOps` | `{enabled, repositoryURL, branch, path, credentials}` | Stub (`GitOpsConfig`) | Not yet implemented |
 | `status.phase` | `Ready / Collecting / Importing / Error / Unknown` | `Ready / Collecting / Importing / Error` | No `Unknown` |
 | `status.lastCollection` / `lastImport` | `{version, timestamp, size, status}` | `{version, timestamp}` + `collectionHistory[]` / `importHistory[]` | Extended with full history arrays |
@@ -238,7 +238,7 @@ Each operator config supports: `disabled`, `channel`, `approvalStrategy`, `catal
 | `storage` with two PVCs (`mirrorWorkspace` + `packageStorage`) | Single PVC with optional S3 | Simplified storage model; single workspace for oc-mirror output |
 | Separate `Packaging` phase | No `Packaging` phase | oc-mirror produces output directly; packaging is implicit in the output PVC |
 | `CollectionStatistics` in status | Not implemented | Not yet needed; could be added for UI display |
-| `AirgapArchitectConfig` with route/TLS/resources | Simple `{enabled}` only | Route management deferred until airgap-architect integration |
+| `AirgapArchitectConfig` with full routing | `{enabled, frontendImage, backendImage, replicas, route}` | Two separate Deployments (frontend+backend) managed by operator; Route with TLS and host |
 | `GitOpsConfig` with full ArgoCD integration | Stub | Deferred for future phase |
 | Import as manual script | `MirrorImport` CRD | Full lifecycle management, version tracking, and state machine |
 | API group `disconnected.openshift.io` | `mirror.mirror.mathianasj.github.com` | Custom domain; aligns with existing naming |
@@ -269,7 +269,7 @@ Each operator config supports: `disabled`, `channel`, `approvalStrategy`, `catal
 | Supply chain (Verification) | ✅ Complete (Cosign verify-blob) | `internal/controller/mirrorimport_controller.go` |
 | Supply chain (EC policy) | 📋 Stub (`ec` CLI not bundled) | `api/v1/mirrorimport_types.go` (field exists) |
 | OLM Subscription management | ✅ Complete | `internal/controller/disconnectedplatform_controller.go` |
-| Airgap-architect UI deployment | 📋 Not implemented | `api/v1/disconnectedplatform_types.go` (field exists) |
+| Airgap-architect UI deployment | ✅ Complete | `internal/controller/disconnectedplatform_controller.go` (`reconcileArchitect`) |
 | GitOps integration | 📋 Stub | `api/v1/disconnectedplatform_types.go` (field exists) |
 | ClusterBootstrap openshift-install | 📋 Not implemented | Stub phase machine only |
 | S3 import path | 📋 Not implemented | `api/v1/collectionpipeline_types.go` (field exists) |

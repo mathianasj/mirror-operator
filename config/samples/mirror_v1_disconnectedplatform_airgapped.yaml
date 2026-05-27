@@ -12,3 +12,14 @@ spec:
     mirrorRegistry: "quay.internal:8443/mirror"
     bootstrapEnabled: true
     importPath: /mnt/physical-media
+  architect:
+    enabled: true
+    frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:df56c591ae4f12ce8c297695b69f6c264c5f257b
+    backendImage: quay.io/mathianasj/openshift-airgap-architect-backend:df56c591ae4f12ce8c297695b69f6c264c5f257b
+    replicas: 1
+    route:
+      tls:
+        termination: edge
+    # Optional: specify custom pull secret (defaults to openshift-config/pull-secret)
+    # pullSecret:
+    #   name: my-custom-pull-secret

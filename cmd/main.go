@@ -60,6 +60,8 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var mirrorImage string
+	var architectFrontendImage string
+	var architectBackendImage string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -73,6 +75,10 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&mirrorImage, "mirror-image", "quay.io/mirror-operator/oc-mirror:v2",
 		"oc-mirror container image for CollectionPipeline and MirrorImport job steps")
+	flag.StringVar(&architectFrontendImage, "architect-frontend-image", "quay.io/mirror-operator/airgap-architect-frontend:latest",
+		"airgap-architect frontend UI container image")
+	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mirror-operator/airgap-architect-backend:latest",
+		"airgap-architect backend API container image")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -149,8 +155,10 @@ func main() {
 	}
 
 	if err = (&controller.DisconnectedPlatformReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		ArchitectFrontendImage: architectFrontendImage,
+		ArchitectBackendImage:  architectBackendImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DisconnectedPlatform")
 		os.Exit(1)
