@@ -1,0 +1,125 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - config.openshift.io
+  resources:
+  - imagecontentsourcepolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
+  - clusterbootstraps
+  - collectionpipelines
+  - disconnectedplatforms
+  - mirrorimports
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
+  - clusterbootstraps/finalizers
+  - collectionpipelines/finalizers
+  - disconnectedplatforms/finalizers
+  - mirrorimports/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
+  - clusterbootstraps/status
+  - collectionpipelines/status
+  - disconnectedplatforms/status
+  - mirrorimports/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - operators.coreos.com
+  resources:
+  - catalogsources
+  - operatorgroups
+  - subscriptions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operators.coreos.com
+  resources:
+  - clusterserviceversions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - tekton.dev
+  resources:
+  - pipelineruns
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - tekton.dev
+  resources:
+  - pipelineruns/status
+  verbs:
+  - get

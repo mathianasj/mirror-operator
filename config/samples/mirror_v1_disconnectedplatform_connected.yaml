@@ -1,0 +1,25 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: disconnected-platform
+spec:
+  mode: connected
+  connected:
+    collectionSchedule: "0 2 * * 0"
+    mirrorRegistry: "quay.example.com/mirror"
+    artifactStorage:
+      size: 2Ti
+    triggerTypes:
+      - scheduled
+      - manual
+    operators:
+      openshiftPipelines: {}
+      rhtas:
+        disabled: true
+      rhtpa:
+        disabled: true
+  architect:
+    enabled: true

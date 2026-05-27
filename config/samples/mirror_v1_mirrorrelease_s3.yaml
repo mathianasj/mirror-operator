@@ -1,0 +1,32 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: MirrorRelease
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: release-v4-17-s3
+spec:
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v1alpha2
+    storageConfig:
+      s3:
+        bucket: oc-mirror-bundles
+        region: us-east-1
+        endpoint: https://s3.us-east-1.amazonaws.com
+    mirror:
+      platform:
+        channels:
+          - name: stable-4.17
+            type: ocp
+      operators:
+        - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17
+          full: true
+      additionalImages:
+        - name: registry.redhat.io/openshift4/ose-cli:v4.17
+  output:
+    s3:
+      bucket: oc-mirror-bundles
+      region: us-east-1
+      secretRef:
+        name: oc-mirror-s3-creds

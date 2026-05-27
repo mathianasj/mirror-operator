@@ -1,0 +1,10 @@
+## Append samples of your project ##
+resources:
+- mirror_v1_disconnectedplatform_connected.yaml
+- mirror_v1_disconnectedplatform_airgapped.yaml
+- mirror_v1_collectionpipeline.yaml
+- mirror_v1_collectionpipeline_incremental.yaml
+- mirror_v1_mirrorimport.yaml
+- mirror_v1_mirrorrelease_pvc.yaml
+- mirror_v1_clusterbootstrap.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

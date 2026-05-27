@@ -1,0 +1,35 @@
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS builder
+
+RUN microdnf install -y tar gzip && microdnf clean all
+
+ARG TARGETARCH=amd64
+ARG COSIGN_VERSION=v2.4.3
+ARG SYFT_VERSION=v1.21.0
+ARG OCP_VERSION=latest
+
+RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/openshift-client-linux.tar.gz \
+    | tar xz -C /usr/local/bin oc kubectl
+
+RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/oc-mirror.rhel9.tar.gz \
+    | tar xz -C /usr/local/bin oc-mirror && chmod +x /usr/local/bin/oc-mirror
+
+RUN curl -sL https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${TARGETARCH} \
+    -o /usr/local/bin/cosign && chmod +x /usr/local/bin/cosign
+
+RUN syft_ver=$(echo "${SYFT_VERSION}" | sed 's/^v//') && \
+    curl -sL "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${syft_ver}_linux_${TARGETARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin syft
+
+RUN chown root:root /usr/local/bin/* && chmod +x /usr/local/bin/*
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+RUN microdnf install -y tar gzip && microdnf clean all
+
+COPY --from=builder /usr/local/bin/oc /usr/local/bin/oc
+COPY --from=builder /usr/local/bin/kubectl /usr/local/bin/kubectl
+COPY --from=builder /usr/local/bin/oc-mirror /usr/local/bin/oc-mirror
+COPY --from=builder /usr/local/bin/cosign /usr/local/bin/cosign
+COPY --from=builder /usr/local/bin/syft /usr/local/bin/syft
+
+ENTRYPOINT ["oc-mirror"]

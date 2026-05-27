@@ -1,0 +1,14 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: disconnected-platform-airgapped
+spec:
+  mode: airgapped
+  airgapped:
+    managementCluster: true
+    mirrorRegistry: "quay.internal:8443/mirror"
+    bootstrapEnabled: true
+    importPath: /mnt/physical-media

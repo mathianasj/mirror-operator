@@ -1,0 +1,29 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: MirrorImport
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: mirrorimport-sample
+spec:
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v2alpha1
+    mirror:
+      operators:
+      - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17
+  bundle:
+    pvc: imported-bundles
+    filename: release-v4.17.tar
+  targetRegistry:
+    url: https://quay.airgap.local
+  publish:
+    catalogSource: true
+    imageContentSourcePolicy: true
+  collectionVersion: v2026.05.26.001-manual
+  verify:
+    publicKeySecretRef:
+      name: cosign-public-key
+    enterpriseContractPolicy:
+      configMapRef:
+        name: ec-policy

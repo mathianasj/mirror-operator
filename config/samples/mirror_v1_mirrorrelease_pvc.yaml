@@ -1,0 +1,27 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: MirrorRelease
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: release-v4-17-pvc
+spec:
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v1alpha2
+    storageConfig:
+      local:
+        path: /workspace/output
+    mirror:
+      platform:
+        channels:
+          - name: stable-4.17
+            type: ocp
+      operators:
+        - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17
+          full: true
+      additionalImages:
+        - name: registry.redhat.io/openshift4/ose-cli:v4.17
+  output:
+    pvc: mirror-bundles
+    filename: release-v4.17.tar

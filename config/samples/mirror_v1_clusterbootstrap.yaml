@@ -1,0 +1,19 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: ClusterBootstrap
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: production-cluster-01
+spec:
+  version: v2026.05.26.001-manual
+  platform: vsphere
+  installConfig:
+    name: cluster-install-config
+  mirrorRegistry: quay.internal:8443/mirror
+  pullSecret:
+    name: mirror-pull-secret
+  controlPlane:
+    replicas: 3
+  compute:
+    replicas: 3

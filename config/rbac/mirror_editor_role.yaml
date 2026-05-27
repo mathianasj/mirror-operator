@@ -1,0 +1,35 @@
+# permissions for end users to edit mirror-operator CRDs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: mirror-editor-role
+rules:
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
+  - disconnectedplatforms
+  - collectionpipelines
+  - mirrorimports
+  - mirrorreleases
+  - clusterbootstraps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
+  - disconnectedplatforms/status
+  - collectionpipelines/status
+  - mirrorimports/status
+  - mirrorreleases/status
+  - clusterbootstraps/status
+  verbs:
+  - get

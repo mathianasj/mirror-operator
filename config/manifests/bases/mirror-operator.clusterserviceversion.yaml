@@ -1,0 +1,69 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  annotations:
+    alm-examples: '[]'
+    capabilities: Basic Install
+  name: mirror-operator.v0.0.0
+  namespace: placeholder
+spec:
+  apiservicedefinitions: {}
+  customresourcedefinitions:
+    owned:
+    - displayName: Cluster Bootstrap
+      kind: ClusterBootstrap
+      name: clusterbootstraps.mirror.mirror.mathianasj.github.com
+      version: v1
+    - displayName: Collection Pipeline
+      kind: CollectionPipeline
+      name: collectionpipelines.mirror.mirror.mathianasj.github.com
+      version: v1
+    - displayName: Disconnected Platform
+      kind: DisconnectedPlatform
+      name: disconnectedplatforms.mirror.mirror.mathianasj.github.com
+      version: v1
+    - displayName: Mirror Import
+      kind: MirrorImport
+      name: mirrorimports.mirror.mirror.mathianasj.github.com
+      version: v1
+    - displayName: Mirror Release
+      kind: MirrorRelease
+      name: mirrorreleases.mirror.mirror.mathianasj.github.com
+      version: v1
+  description: |
+    Mirror Operator manages the disconnected OpenShift lifecycle. It provides four CRDs: DisconnectedPlatform (top-level orchestrator), CollectionPipeline (builds oc-mirror v2 bundles via Tekton), MirrorImport (imports bundles into airgapped registries), and ClusterBootstrap (bootstraps new clusters). The operator supports supply chain security via Syft SBOM generation, Cosign signing/verification, and Tekton Chains attestations.
+  displayName: Mirror Operator
+  icon:
+  - base64data: ""
+    mediatype: ""
+  install:
+    spec:
+      deployments: null
+    strategy: ""
+  installModes:
+  - supported: true
+    type: OwnNamespace
+  - supported: true
+    type: SingleNamespace
+  - supported: true
+    type: MultiNamespace
+  - supported: true
+    type: AllNamespaces
+  keywords:
+  - mirror-operator
+  - disconnected
+  - oc-mirror
+  - airgap
+  - openshift
+  links:
+  - name: Mirror Operator
+    url: https://github.com/mathianasj/mirror-operator
+  maintainers:
+  - email: mathianasj@users.noreply.github.com
+    name: Operator Maintainers
+  maturity: alpha
+  minKubeVersion: 1.30.0
+  provider:
+    name: Mathianasj
+    url: https://github.com/mathianasj
+  version: 0.0.0
