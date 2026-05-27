@@ -19,18 +19,21 @@ The operator uses [Red Hat Trusted Application Pipeline](https://docs.redhat.com
 ### CollectionPipeline (connected)
 After `oc-mirror` produces the bundle:
 1. **Syft** scans all mirrored images in `/workspace/output` → `sbom.cyclonedx.json`
-2. **Cosign** signs the bundle tarball → `<bundle>.sig` + `<bundle>.att` (SBOM embedded)
-3. **Tekton Chains** signs the PipelineRun attestation automatically
-4. All artifacts (tarball, .sig, .att, sbom) stored in the output PVC
+2. **Cosign** signs the bundle tarball → `<bundle>.sig`
+3. **Cosign** creates a signed **attestation file** (`attestation.json.sig`) linking the bundle SHA256 to the SBOM SHA256 — cryptographically proves the SBOM belongs to that specific bundle
+4. **Tekton Chains** signs the PipelineRun attestation automatically
+5. All artifacts (tarball, .sig, attestation.json, attestation.json.sig, sbom) stored in the output PVC
 
 Fields: `spec.signing.keySecretRef`, `spec.signing.passwordSecretRef` (both `LocalObjectReference`)
 
 ### MirrorImport (airgapped)
 Before extracting the bundle:
 1. **Cosign verify** — validates `<bundle>.sig` against a trusted public key
-2. **Enterprise Contract** — checks the `<bundle>.att` attestation against policies (stub — `ec` CLI not yet bundled)
-3. On failure → phase `"Failed"` with condition `SignatureVerification`
-4. On success → import proceeds; SBOM published to RHTPA
+2. **Cosign verify** — validates `attestation.json.sig` against the same public key
+3. **Hash comparison** — extracts bundle + SBOM SHA256 from `attestation.json` and compares against actual artifacts; mismatch fails the import
+4. **Enterprise Contract** — checks the attestation against policies (stub — `ec` CLI not yet bundled)
+5. On failure → phase `"Failed"` with condition `SignatureVerification`
+6. On success → import proceeds; SBOM published to RHTPA
 
 Fields: `spec.verify.publicKeySecretRef`, `spec.verify.enterpriseContractPolicy.configMapRef`
 
@@ -99,7 +102,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
   5. Creates inline Tekton PipelineRun with 3 tasks:
      - **Task 1 — oc-mirror**: `oc-mirror --config /workspace/config/imageset-config.yaml file:///workspace/output --v2`
      - **Task 2 — syft-sbom**: `syft dir:/workspace/output -o cyclonedx-json > /workspace/output/sbom.cyclonedx.json`
-     - **Task 3 — cosign-sign**: `cosign sign-blob --key /workspace/cosign/cosign.key ...` (key/password from secrets)
+      - **Task 3 — cosign-sign**: `cosign sign-blob --key /workspace/cosign/cosign.key ...` (key/password from secrets); creates signed attestation.json linking bundle hash to SBOM hash
      - S3 env vars injected from referenced Secret when configured.
   6. On completion, reads pod logs for SBOM and stores in ConfigMap, updates DisconnectedPlatform.status.collectionHistory.
 
@@ -118,7 +121,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
   2. `""` → if `collectionVersion` set, validates it's not already in platform import history; sets phase `Importing`.
   3. `"Importing"` — creates ConfigMap from `imageSetConfig`, creates Job:
      - Mounts bundle PVC at `/data`, ConfigMap at `/config`.
-     - If `verify.publicKeySecretRef` set: prepends `cosign verify-blob --key ...` before extraction.
+      - If `verify.publicKeySecretRef` set: prepends `cosign verify-blob --key ...` for bundle + attestation, then compares attested hashes against actual artifacts.
      - Main command: `tar -xvf /data/<bundle.tar> -C /workspace && oc-mirror --config /config/imageset-config.yaml --from file:///workspace docker://<registry> --v2`
      - Watches Job: `Complete` → phase `Publishing`, `Failed` → phase `Failed` (+ `SignatureVerification` condition on verify failure).
   4. `"Publishing"` — calls `ensureCatalogSource()` (creates CatalogSource in openshift-marketplace) and `ensureICSP()` (creates ImageDigestMirrorSet for registry.redhat.io + registry.connect.redhat.com), then sets phase `Complete`.

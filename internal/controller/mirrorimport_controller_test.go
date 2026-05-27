@@ -546,9 +546,14 @@ var _ = Describe("MirrorImportReconciler", func() {
 
 			job, err := r.buildImportJob(ctx, importCR, "import-config")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("cosign verify-blob"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--key /workspace/cosign-pub/cosign.pub"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("release-v4.17.tar"))
+			args := job.Spec.Template.Spec.Containers[0].Args[0]
+			Expect(args).To(ContainSubstring("cosign verify-blob"))
+			Expect(args).To(ContainSubstring("--key /workspace/cosign-pub/cosign.pub"))
+			Expect(args).To(ContainSubstring("release-v4.17.tar"))
+			Expect(args).To(ContainSubstring("attestation.json"))
+			Expect(args).To(ContainSubstring("jq -r '.bundle.sha256'"))
+			Expect(args).To(ContainSubstring("jq -r '.sbom.sha256'"))
+			Expect(args).To(ContainSubstring("sha256sum /data/sbom.cyclonedx.json"))
 			Expect(job.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
 				Name: "cosign-pub",
 				VolumeSource: corev1.VolumeSource{

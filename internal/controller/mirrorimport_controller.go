@@ -264,11 +264,18 @@ func (r *MirrorImportReconciler) buildImportJob(ctx context.Context, importCR *m
 
 	if importCR.Spec.Verify != nil && importCR.Spec.Verify.PublicKeySecretRef != nil {
 		pubKeyName := importCR.Spec.Verify.PublicKeySecretRef.Name
+		bundleFile := importCR.Spec.Bundle.Filename
 		verifyCmd := fmt.Sprintf(
-			"cosign verify-blob --key /workspace/cosign-pub/cosign.pub --signature /data/${bn}.sig /data/%s && ",
-			importCR.Spec.Bundle.Filename,
+			`cosign verify-blob --key /workspace/cosign-pub/cosign.pub --signature /data/${bn}.sig /data/%[1]s && `+
+				`cosign verify-blob --key /workspace/cosign-pub/cosign.pub --signature /data/attestation.json.sig /data/attestation.json && `+
+				`abh=$(jq -r '.bundle.sha256' /data/attestation.json) && `+
+				`ash=$(jq -r '.sbom.sha256' /data/attestation.json) && `+
+				`cbh=$(sha256sum /data/%[1]s | cut -d" " -f1) && `+
+				`csh=$(sha256sum /data/sbom.cyclonedx.json | cut -d" " -f1) && `+
+				`[ "$cbh" = "$abh" ] && [ "$csh" = "$ash" ] && `,
+			bundleFile,
 		)
-		bnCmd := fmt.Sprintf("bn=$(basename /data/%s .tar) && ", importCR.Spec.Bundle.Filename)
+		bnCmd := fmt.Sprintf("bn=$(basename /data/%s .tar) && ", bundleFile)
 		importArgs = bnCmd + verifyCmd + importArgs
 
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
