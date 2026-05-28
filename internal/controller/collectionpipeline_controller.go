@@ -541,8 +541,6 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		},
 	}
 
-	declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "output"})
-
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.KeySecretRef != nil {
 		cosignKeyBinding := pipelinev1.WorkspaceBinding{
 			Name: "cosign-key",
