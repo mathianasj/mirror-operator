@@ -69,6 +69,9 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -542,6 +545,109 @@ func getPullSecretReference(cfg *mirrorv1.AirgapArchitectConfig) (name, namespac
 	return defaultPullSecretName, defaultPullSecretNS
 }
 
+func (r *DisconnectedPlatformReconciler) ensureArchitectServiceAccount(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	saName := "airgap-architect-backend"
+
+	// Create ServiceAccount
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":       "airgap-architect",
+				"app.kubernetes.io/component":  "backend",
+				"app.kubernetes.io/part-of":    "mirror-operator",
+				"app.kubernetes.io/managed-by": "mirror-operator",
+			},
+		},
+	}
+
+	existing := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sa), existing); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, sa); err != nil {
+			return fmt.Errorf("failed to create ServiceAccount: %w", err)
+		}
+	}
+
+	// Create Role with permissions for CollectionPipeline and related resources
+	role := &unstructured.Unstructured{}
+	role.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "Role",
+	})
+	role.SetName(saName)
+	role.SetNamespace(architectNamespace)
+	role.SetLabels(sa.Labels)
+
+	unstructured.SetNestedSlice(role.Object, []interface{}{
+		map[string]interface{}{
+			"apiGroups": []interface{}{"mirror.mirror.mathianasj.github.com"},
+			"resources": []interface{}{"collectionpipelines", "mirrorimports", "disconnectedplatforms"},
+			"verbs":     []interface{}{"get", "list", "watch", "create", "update", "patch", "delete"},
+		},
+		map[string]interface{}{
+			"apiGroups": []interface{}{"mirror.mirror.mathianasj.github.com"},
+			"resources": []interface{}{"collectionpipelines/status", "mirrorimports/status", "disconnectedplatforms/status"},
+			"verbs":     []interface{}{"get", "list", "watch"},
+		},
+		map[string]interface{}{
+			"apiGroups": []interface{}{""},
+			"resources": []interface{}{"configmaps", "secrets"},
+			"verbs":     []interface{}{"get", "list", "watch"},
+		},
+	}, "rules")
+
+	existingRole := &unstructured.Unstructured{}
+	existingRole.SetGroupVersionKind(role.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(role), existingRole); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, role); err != nil {
+			return fmt.Errorf("failed to create Role: %w", err)
+		}
+	} else if err == nil {
+		// Update existing role
+		role.SetResourceVersion(existingRole.GetResourceVersion())
+		if err := r.Update(ctx, role); err != nil {
+			return fmt.Errorf("failed to update Role: %w", err)
+		}
+	}
+
+	// Create RoleBinding
+	rb := &unstructured.Unstructured{}
+	rb.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "RoleBinding",
+	})
+	rb.SetName(saName)
+	rb.SetNamespace(architectNamespace)
+	rb.SetLabels(sa.Labels)
+
+	unstructured.SetNestedSlice(rb.Object, []interface{}{
+		map[string]interface{}{
+			"kind":      "ServiceAccount",
+			"name":      saName,
+			"namespace": architectNamespace,
+		},
+	}, "subjects")
+
+	unstructured.SetNestedMap(rb.Object, map[string]interface{}{
+		"kind":     "Role",
+		"name":     saName,
+		"apiGroup": "rbac.authorization.k8s.io",
+	}, "roleRef")
+
+	existingRB := &unstructured.Unstructured{}
+	existingRB.SetGroupVersionKind(rb.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(rb), existingRB); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, rb); err != nil {
+			return fmt.Errorf("failed to create RoleBinding: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (r *DisconnectedPlatformReconciler) ensurePullSecret(ctx context.Context, secretName, sourceNamespace string) error {
 	// If using custom pull secret in operator namespace, assume it already exists
 	if sourceNamespace == architectNamespace {
@@ -647,6 +753,11 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 	// Determine pull secret to use and ensure it exists in operator namespace
 	pullSecretName, pullSecretNamespace := getPullSecretReference(cfg)
 	if err := r.ensurePullSecret(ctx, pullSecretName, pullSecretNamespace); err != nil {
+		return err
+	}
+
+	// Ensure ServiceAccount and RBAC for backend
+	if err := r.ensureArchitectServiceAccount(ctx, platform); err != nil {
 		return err
 	}
 
@@ -969,6 +1080,18 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 		})
 	}
 
+	podSpec := map[string]interface{}{
+		"containers": []interface{}{
+			buildContainer(name, image, labels),
+		},
+		"volumes": volumes,
+	}
+
+	// Add ServiceAccount for backend component
+	if component == "backend" {
+		podSpec["serviceAccountName"] = "airgap-architect-backend"
+	}
+
 	return map[string]interface{}{
 		"replicas": int64(replicas),
 		"selector": map[string]interface{}{
@@ -981,12 +1104,7 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"metadata": map[string]interface{}{
 				"labels": templateLabels,
 			},
-			"spec": map[string]interface{}{
-				"containers": []interface{}{
-					buildContainer(name, image, labels),
-				},
-				"volumes": volumes,
-			},
+			"spec": podSpec,
 		},
 	}
 }
