@@ -312,6 +312,15 @@ spec:
                         - password
                         - username
                         type: object
+                      oidc:
+                        properties:
+                          clientId:
+                            type: string
+                          clientSecret:
+                            type: string
+                          issuer:
+                            type: string
+                        type: object
                       storage:
                         properties:
                           accessKey:

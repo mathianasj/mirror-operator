@@ -90,6 +90,7 @@ type RHTASDatabaseConfig struct {
 type RHTPAInstallerConfig struct {
 	Storage  *RHTPAStorageConfig  `json:"storage,omitempty"`
 	Database *RHTPADatabaseConfig `json:"database,omitempty"`
+	OIDC     *RHTPAOIDCConfig     `json:"oidc,omitempty"`
 }
 
 type RHTPAStorageConfig struct {
@@ -106,6 +107,12 @@ type RHTPADatabaseConfig struct {
 	Name     string `json:"name"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type RHTPAOIDCConfig struct {
+	Issuer       string `json:"issuer,omitempty"`
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
 }
 
 type AirgappedConfig struct {

@@ -446,17 +446,29 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		return nil
 	}
 
-	tpa := &unstructured.Unstructured{}
-	tpa.SetGroupVersionKind(schema.GroupVersionKind{
+	existingTPA := &unstructured.Unstructured{}
+	existingTPA.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "rhtpa.io",
 		Version: "v1",
 		Kind:    "TrustedProfileAnalyzer",
 	})
-	tpa.SetName("mirror-operator-trusted-profile-analyzer")
-	tpa.SetNamespace(architectNamespace)
+	existingTPA.SetName("mirror-operator-trusted-profile-analyzer")
+	existingTPA.SetNamespace(architectNamespace)
 
-	if err := r.Get(ctx, client.ObjectKeyFromObject(tpa), tpa); err == nil {
-		return nil
+	if err := r.Get(ctx, client.ObjectKeyFromObject(existingTPA), existingTPA); err == nil {
+		// Check if authenticator is configured
+		auth, found, _ := unstructured.NestedMap(existingTPA.Object, "spec", "authenticator")
+		if found && len(auth) > 0 {
+			// TPA already has OIDC configured, nothing to do
+			return nil
+		}
+		// Delete existing TPA to recreate with OIDC
+		log.FromContext(ctx).Info("Deleting existing TPA to add OIDC configuration")
+		if err := r.Delete(ctx, existingTPA); err != nil {
+			return fmt.Errorf("failed to delete existing TPA for update: %w", err)
+		}
+		// Wait a moment for deletion to complete
+		time.Sleep(2 * time.Second)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -473,6 +485,23 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	}
 	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
 	appDomain := "rhtpa." + domain
+
+	// Configure OIDC for TPA using managed Keycloak if OIDC not explicitly provided
+	var issuerURL string
+	if cfg.OIDC != nil && cfg.OIDC.Issuer != "" {
+		// Use explicitly provided OIDC configuration
+		issuerURL = cfg.OIDC.Issuer
+	} else {
+		// Create trustify realm and OIDC client in managed Keycloak
+		keycloakHost := "keycloak." + domain
+		realmName := "trustify"
+
+		if err := r.ensureTrustifyRealmAndOIDC(ctx, keycloakHost, realmName, appDomain); err != nil {
+			return fmt.Errorf("failed to configure TPA OIDC in Keycloak: %w", err)
+		}
+
+		issuerURL = fmt.Sprintf("https://%s/realms/%s", keycloakHost, realmName)
+	}
 
 	spec := map[string]interface{}{
 		"appDomain": appDomain,
@@ -510,30 +539,47 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		},
 	}
 
-	st := map[string]interface{}{
-		"type": cfg.Storage.Type,
+	// Add OIDC authenticator configuration
+	// TPA Helm chart expects type: keycloak with url field
+	if issuerURL != "" {
+		spec["authenticator"] = map[string]interface{}{
+			"type": "keycloak",
+			"url":  issuerURL,
+		}
 	}
+
+	st := map[string]interface{}{}
+
+	// Map storage type: "local" -> "filesystem" for TPA Helm chart
+	storageType := cfg.Storage.Type
+	if storageType == "local" {
+		storageType = "filesystem"
+	}
+	st["type"] = storageType
+
 	if cfg.Storage.AccessKey != "" {
+		// S3 storage configuration
 		st["accessKey"] = cfg.Storage.AccessKey
 		st["secretKey"] = cfg.Storage.SecretKey
 		st["bucket"] = cfg.Storage.Bucket
 		st["region"] = cfg.Storage.Region
-	} else {
+	} else if cfg.Storage.Size != "" {
+		// Filesystem storage configuration requires size
 		st["size"] = cfg.Storage.Size
 	}
 	spec["storage"] = st
 
-	tpa = &unstructured.Unstructured{}
-	tpa.SetGroupVersionKind(schema.GroupVersionKind{
+	newTPA := &unstructured.Unstructured{}
+	newTPA.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "rhtpa.io",
 		Version: "v1",
 		Kind:    "TrustedProfileAnalyzer",
 	})
-	tpa.SetName("mirror-operator-trusted-profile-analyzer")
-	tpa.SetNamespace(architectNamespace)
-	tpa.Object["spec"] = spec
+	newTPA.SetName("mirror-operator-trusted-profile-analyzer")
+	newTPA.SetNamespace(architectNamespace)
+	newTPA.Object["spec"] = spec
 
-	return r.Create(ctx, tpa)
+	return r.Create(ctx, newTPA)
 }
 
 func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) {
@@ -548,6 +594,183 @@ func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) 
 	if err := r.Delete(ctx, tpa); err != nil && !apierrors.IsNotFound(err) {
 		log.FromContext(ctx).Error(err, "failed to delete RHTPA config")
 	}
+}
+
+func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.Context, keycloakHost, realmName, appDomain string) error {
+	logger := log.FromContext(ctx)
+
+	// Get Keycloak admin credentials
+	adminSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      "mirror-operator-keycloak-initial-admin",
+		Namespace: architectNamespace,
+	}, adminSecret); err != nil {
+		return fmt.Errorf("failed to get Keycloak admin credentials: %w", err)
+	}
+
+	adminUser := string(adminSecret.Data["username"])
+	adminPassword := string(adminSecret.Data["password"])
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	// Get admin access token
+	tokenURL := fmt.Sprintf("https://%s/realms/master/protocol/openid-connect/token", keycloakHost)
+	tokenData := url.Values{}
+	tokenData.Set("grant_type", "password")
+	tokenData.Set("client_id", "admin-cli")
+	tokenData.Set("username", adminUser)
+	tokenData.Set("password", adminPassword)
+
+	tokenResp, err := httpClient.PostForm(tokenURL, tokenData)
+	if err != nil {
+		return fmt.Errorf("failed to get admin token: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(tokenResp.Body)
+		return fmt.Errorf("failed to get admin token: status %d, body: %s", tokenResp.StatusCode, string(body))
+	}
+
+	var tokenResult map[string]interface{}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
+		return fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	adminToken, ok := tokenResult["access_token"].(string)
+	if !ok || adminToken == "" {
+		return fmt.Errorf("no access token in response")
+	}
+
+	// Check if trustify realm exists
+	realmURL := fmt.Sprintf("https://%s/admin/realms/%s", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", realmURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to check realm: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Create trustify realm
+		logger.Info("Creating trustify realm in Keycloak")
+
+		realmConfig := map[string]interface{}{
+			"realm":       realmName,
+			"enabled":     true,
+			"displayName": "Trusted Profile Analyzer",
+		}
+
+		realmJSON, _ := json.Marshal(realmConfig)
+		req, _ := http.NewRequest("POST", fmt.Sprintf("https://%s/admin/realms", keycloakHost), bytes.NewReader(realmJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create realm: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create realm: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		logger.Info("Successfully created trustify realm")
+	}
+
+	// Create frontend OIDC client
+	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "frontend", appDomain, adminToken, httpClient); err != nil {
+		return fmt.Errorf("failed to create frontend OIDC client: %w", err)
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Context, keycloakHost, realmName, clientID, appDomain, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Check if client exists
+	clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
+	req, _ := http.NewRequest("GET", clientsURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to check client: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var clients []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&clients); err != nil {
+		return fmt.Errorf("failed to decode clients response: %w", err)
+	}
+
+	if len(clients) > 0 {
+		// Client already exists
+		logger.Info("OIDC client already exists", "clientId", clientID)
+		return nil
+	}
+
+	// Create OIDC client
+	logger.Info("Creating TPA OIDC client", "clientId", clientID)
+
+	clientSecret := generateRandomString(32)
+
+	clientConfig := map[string]interface{}{
+		"clientId":                  clientID,
+		"enabled":                   true,
+		"protocol":                  "openid-connect",
+		"publicClient":              false,
+		"standardFlowEnabled":       true,
+		"directAccessGrantsEnabled": true,
+		"serviceAccountsEnabled":    true,
+		"redirectUris":              []string{fmt.Sprintf("https://%s/*", appDomain)},
+		"webOrigins":                []string{"*"},
+		"secret":                    clientSecret,
+	}
+
+	clientJSON, _ := json.Marshal(clientConfig)
+	req, _ = http.NewRequest("POST", fmt.Sprintf("https://%s/admin/realms/%s/clients", keycloakHost, realmName), bytes.NewReader(clientJSON))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create client: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create client: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully created TPA OIDC client")
+
+	// Store client secret in a Secret
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rhtpa-oidc-client-secret",
+			Namespace: architectNamespace,
+		},
+		StringData: map[string]string{
+			"clientSecret": clientSecret,
+		},
+	}
+
+	if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create client secret: %w", err)
+	}
+
+	return nil
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
