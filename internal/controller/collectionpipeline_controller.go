@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,7 +25,7 @@ import (
 
 const (
 	pipelineFinalizer  = "mirror.mathianasj.github.com/pipeline-finalizer"
-	defaultMirrorImage = "quay.io/mirror-operator/oc-mirror:v2"
+	defaultMirrorImage = "quay.io/mathianasj/oc-mirror:v2"
 	configMapKey       = "imageset-config.yaml"
 )
 
@@ -42,7 +43,7 @@ type CollectionPipelineReconciler struct {
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns/status,verbs=get
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
@@ -80,7 +81,63 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
+	// Check for trigger annotation to start a new collection
+	if triggerValue, exists := pipeline.Annotations["mirror.mathianasj.github.com/trigger"]; exists {
+		// If there's a completed/failed run, reset status to trigger new run
+		if pipeline.Status.PipelineRunRef != "" && (pipeline.Status.Phase == "Succeeded" || pipeline.Status.Phase == "Failed" || pipeline.Status.Phase == "Stale") {
+			logger.Info("Trigger annotation detected, starting new collection", "trigger", triggerValue, "previous-run", pipeline.Status.PipelineRunRef)
+			pipeline.Status.PipelineRunRef = ""
+			pipeline.Status.Version = ""
+			pipeline.Status.Phase = ""
+			pipeline.Status.StartTime = nil
+			pipeline.Status.CompletionTime = nil
+			return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+		}
+	}
+
 	if pipeline.Status.PipelineRunRef != "" {
+		// Check if signing config has changed since PipelineRun was created
+		// If it has and the run hasn't started yet, recreate it
+		pr := &pipelinev1.PipelineRun{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pipeline.Status.PipelineRunRef, Namespace: pipeline.Namespace}, pr); err == nil {
+			// Check if PipelineRun is still pending (not started)
+			if pr.Status.StartTime == nil {
+				// Check if signing config in spec matches what was used to create PipelineRun
+				signingConfigChanged := false
+
+				// Simple check: if pipeline has keyless signing but PipelineRun doesn't have Fulcio env vars
+				if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil {
+					// Check if the signing task has Fulcio URL environment variable
+					if len(pr.Spec.PipelineSpec.Tasks) >= 3 {
+						signTask := pr.Spec.PipelineSpec.Tasks[2]
+						hasFulcioURL := false
+						if signTask.TaskSpec != nil && len(signTask.TaskSpec.Steps) > 0 {
+							for _, env := range signTask.TaskSpec.Steps[0].Env {
+								if env.Name == "FULCIO_URL" {
+									hasFulcioURL = true
+									break
+								}
+							}
+						}
+						if !hasFulcioURL {
+							signingConfigChanged = true
+							logger.Info("Signing config changed to keyless, recreating PipelineRun", "pipelineRun", pr.Name)
+						}
+					}
+				}
+
+				if signingConfigChanged {
+					// Delete the PipelineRun and reset status to trigger recreation
+					if err := r.Delete(ctx, pr); err != nil {
+						logger.Error(err, "failed to delete outdated PipelineRun")
+						return ctrl.Result{}, err
+					}
+					pipeline.Status.PipelineRunRef = ""
+					pipeline.Status.Phase = ""
+					return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+				}
+			}
+		}
 		return r.trackPipelineRun(ctx, pipeline, req)
 	}
 
@@ -108,6 +165,36 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 		pipeline.Status.Version = generateVersion(pipeline.Spec.TriggerType)
 		if err := r.Status().Update(ctx, pipeline); err != nil {
 			return ctrl.Result{}, err
+		}
+	}
+
+	if err := r.ensurePVC(ctx, pipeline); err != nil {
+		logger.Error(err, "failed to ensure PVC")
+		return ctrl.Result{}, err
+	}
+
+	// Wait for signing configuration to be applied by DisconnectedPlatform controller
+	// Check if there's a DisconnectedPlatform with managed signing configured
+	platform, err := r.findPlatform(ctx)
+	if err != nil {
+		logger.Info("Could not find platform for signing config check", "error", err)
+	} else if platform == nil {
+		logger.Info("No platform found for signing config check")
+	} else {
+		logger.Info("Platform found", "hasConnected", platform.Spec.Connected != nil,
+			"hasRHTAS", platform.Spec.Connected != nil && platform.Spec.Connected.RHTAS != nil,
+			"hasOIDC", platform.Spec.Connected != nil && platform.Spec.Connected.RHTAS != nil && platform.Spec.Connected.RHTAS.OIDC != nil,
+			"hasManaged", platform.Spec.Connected != nil && platform.Spec.Connected.RHTAS != nil && platform.Spec.Connected.RHTAS.OIDC != nil && platform.Spec.Connected.RHTAS.OIDC.Managed != nil)
+
+		if platform.Spec.Connected != nil && platform.Spec.Connected.RHTAS != nil && platform.Spec.Connected.RHTAS.OIDC != nil && platform.Spec.Connected.RHTAS.OIDC.Managed != nil {
+			// If platform has managed signing configured, wait for it to be applied to this pipeline
+			// Check if signing config has been applied yet
+			if pipeline.Spec.Signing == nil || pipeline.Spec.Signing.Keyless == nil {
+				logger.Info("Waiting for signing configuration to be applied by DisconnectedPlatform controller")
+				// Requeue after a short delay to allow DisconnectedPlatform controller to update signing config
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			logger.Info("Signing configuration already applied, proceeding with PipelineRun creation")
 		}
 	}
 
@@ -389,6 +476,43 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 	return cm, r.Create(ctx, cm)
 }
 
+func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) error {
+	output := pipeline.Spec.Storage.Output
+	if output == nil || output.PVC == "" {
+		return nil
+	}
+
+	existing := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: output.PVC}, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      output.PVC,
+			Namespace: pipeline.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("100Gi"),
+				},
+			},
+		},
+	}
+	return r.Create(ctx, pvc)
+}
+
 func collectionPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 	if pr.Status.CompletionTime != nil {
 		for _, c := range pr.Status.Conditions {
@@ -405,12 +529,21 @@ func collectionPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 }
 
 func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, cm *corev1.ConfigMap) (*pipelinev1.PipelineRun, error) {
-	declaredWorkspaces := []pipelinev1.PipelineWorkspaceDeclaration{{Name: "config"}}
+	declaredWorkspaces := []pipelinev1.PipelineWorkspaceDeclaration{
+		{Name: "config"},
+		{Name: "pull-secret"},
+	}
 	bindings := []pipelinev1.WorkspaceBinding{
 		{
 			Name: "config",
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{Name: cm.Name},
+			},
+		},
+		{
+			Name: "pull-secret",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "pull-secret",
 			},
 		},
 	}
@@ -479,7 +612,10 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		mirrorImage = defaultMirrorImage
 	}
 
-	taskWorkspaceBindings := []pipelinev1.WorkspacePipelineTaskBinding{{Name: "config", Workspace: "config"}}
+	taskWorkspaceBindings := []pipelinev1.WorkspacePipelineTaskBinding{
+		{Name: "config", Workspace: "config"},
+		{Name: "pull-secret", Workspace: "pull-secret"},
+	}
 	outputWorkspaceBinding := pipelinev1.WorkspacePipelineTaskBinding{Name: "output", Workspace: "output"}
 	if output != nil && output.PVC != "" {
 		taskWorkspaceBindings = append(taskWorkspaceBindings, outputWorkspaceBinding)
@@ -491,6 +627,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Command: []string{"oc-mirror"},
 		Args: []string{
 			"--config=/workspace/config/" + configMapKey,
+			"--authfile=/workspace/pull-secret/.dockerconfigjson",
 			"file:///workspace/output",
 			"--v2",
 		},
@@ -504,11 +641,37 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Args:    []string{"syft dir:/workspace/output -o cyclonedx-json > /workspace/output/sbom.cyclonedx.json"},
 	}
 
-	cosignSignStep := pipelinev1.Step{
-		Name:    "sign",
-		Image:   mirrorImage,
-		Command: []string{"/bin/sh", "-c"},
-		Args:    []string{`for f in /workspace/output/*.tar; do [ -f "$f" ] || continue; bn=$(basename "$f" .tar); cosign sign-blob --key /workspace/cosign-key/cosign.key "$f" --output-signature "/workspace/output/${bn}.sig"; done; bh=$(sha256sum /workspace/output/*.tar 2>/dev/null | head -1 | cut -d' ' -f1); if [ -z "$bh" ]; then exit 0; fi; sh=$(sha256sum /workspace/output/sbom.cyclonedx.json 2>/dev/null | cut -d' ' -f1 || echo ""); if [ -z "$sh" ]; then exit 0; fi; printf '{"bundle":{"sha256":"%s"},"sbom":{"sha256":"%s"}}\n' "$bh" "$sh" > /workspace/output/attestation.json; cosign sign-blob --key /workspace/cosign-key/cosign.key /workspace/output/attestation.json --output-signature /workspace/output/attestation.json.sig`},
+	// Build signing step based on configuration
+	var cosignSignStep pipelinev1.Step
+	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil {
+		// Keyless signing with Fulcio using client credentials flow
+		// Initialize TUF root first, then sign blobs
+		tufURL := pipeline.Spec.Signing.Keyless.TUFURL
+		if tufURL == "" {
+			tufURL = "http://tuf.mirror-operator-system.svc"
+		}
+
+		cosignSignStep = pipelinev1.Step{
+			Name:    "sign",
+			Image:   mirrorImage,
+			Command: []string{"/bin/sh", "-c"},
+			Args:    []string{`echo "=== Initializing TUF root ==="; cosign initialize --mirror="$TUF_URL" --root="$TUF_URL/root.json"; echo "=== Signing bundles ==="; for f in /workspace/output/*.tar; do [ -f "$f" ] || continue; bn=$(basename "$f" .tar); cosign sign-blob --fulcio-url "$FULCIO_URL" --rekor-url "$REKOR_URL" --fulcio-auth-flow=client_credentials --oidc-issuer "$COSIGN_OIDC_ISSUER" --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" --oidc-client-secret-file /workspace/oidc-secret/clientSecret --yes "$f" --bundle "/workspace/output/${bn}.bundle"; done; echo "=== Generating attestation ==="; bh=$(sha256sum /workspace/output/*.tar 2>/dev/null | head -1 | cut -d' ' -f1); if [ -z "$bh" ]; then exit 0; fi; sh=$(sha256sum /workspace/output/sbom.cyclonedx.json 2>/dev/null | cut -d' ' -f1 || echo ""); if [ -z "$sh" ]; then exit 0; fi; printf '{"bundle":{"sha256":"%s"},"sbom":{"sha256":"%s"}}\n' "$bh" "$sh" > /workspace/output/attestation.json; echo "=== Signing attestation ==="; cosign sign-blob --fulcio-url "$FULCIO_URL" --rekor-url "$REKOR_URL" --fulcio-auth-flow=client_credentials --oidc-issuer "$COSIGN_OIDC_ISSUER" --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" --oidc-client-secret-file /workspace/oidc-secret/clientSecret --yes /workspace/output/attestation.json --bundle /workspace/output/attestation.bundle`},
+			Env: []corev1.EnvVar{
+				{Name: "COSIGN_OIDC_ISSUER", Value: pipeline.Spec.Signing.Keyless.OIDCIssuer},
+				{Name: "COSIGN_OIDC_CLIENT_ID", Value: pipeline.Spec.Signing.Keyless.OIDCClientID},
+				{Name: "FULCIO_URL", Value: pipeline.Spec.Signing.Keyless.FulcioURL},
+				{Name: "REKOR_URL", Value: pipeline.Spec.Signing.Keyless.RekorURL},
+				{Name: "TUF_URL", Value: tufURL},
+			},
+		}
+	} else {
+		// Legacy key-based signing
+		cosignSignStep = pipelinev1.Step{
+			Name:    "sign",
+			Image:   mirrorImage,
+			Command: []string{"/bin/sh", "-c"},
+			Args:    []string{`for f in /workspace/output/*.tar; do [ -f "$f" ] || continue; bn=$(basename "$f" .tar); cosign sign-blob --key /workspace/cosign-key/cosign.key "$f" --output-signature "/workspace/output/${bn}.sig"; done; bh=$(sha256sum /workspace/output/*.tar 2>/dev/null | head -1 | cut -d' ' -f1); if [ -z "$bh" ]; then exit 0; fi; sh=$(sha256sum /workspace/output/sbom.cyclonedx.json 2>/dev/null | cut -d' ' -f1 || echo ""); if [ -z "$sh" ]; then exit 0; fi; printf '{"bundle":{"sha256":"%s"},"sbom":{"sha256":"%s"}}\n' "$bh" "$sh" > /workspace/output/attestation.json; cosign sign-blob --key /workspace/cosign-key/cosign.key /workspace/output/attestation.json --output-signature /workspace/output/attestation.json.sig`},
+		}
 	}
 
 	cosignTasks := []pipelinev1.PipelineTask{
@@ -522,7 +685,8 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			Workspaces: taskWorkspaceBindings,
 		},
 		{
-			Name: "syft-sbom",
+			Name:     "syft-sbom",
+			RunAfter: []string{"oc-mirror"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{syftStep},
@@ -531,7 +695,8 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding},
 		},
 		{
-			Name: "cosign-sign",
+			Name:     "cosign-sign",
+			RunAfter: []string{"syft-sbom"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{cosignSignStep},
@@ -566,6 +731,20 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 				},
 			},
 		)
+	}
+
+	// Mount OIDC client secret as a workspace for keyless signing
+	// Cosign requires --oidc-client-secret-file flag pointing to a file, not an env var
+	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil && pipeline.Spec.Signing.Keyless.OIDCClientSecret != nil {
+		oidcSecretBinding := pipelinev1.WorkspaceBinding{
+			Name: "oidc-secret",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: pipeline.Spec.Signing.Keyless.OIDCClientSecret.Name,
+			},
+		}
+		bindings = append(bindings, oidcSecretBinding)
+		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "oidc-secret"})
+		cosignTasks[2].Workspaces = append(cosignTasks[2].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
 	}
 
 	pipelineRunName := fmt.Sprintf("collection-pipeline-%s", pipeline.Name)

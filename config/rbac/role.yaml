@@ -5,6 +5,15 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -29,6 +38,27 @@ rules:
   - update
   - watch
 - apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  - issuers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - clusterissuers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - config.openshift.io
   resources:
   - imagecontentsourcepolicies
@@ -44,6 +74,20 @@ rules:
   - ""
   resources:
   - configmaps
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
   verbs:
   - create
   - get
@@ -54,17 +98,16 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - persistentvolumeclaims
   - secrets
   verbs:
   - get
   - list
   - watch
 - apiGroups:
-  - ""
+  - k8s.keycloak.org
   resources:
-  - serviceaccounts
-  - services
+  - keycloakrealmimports
+  - keycloaks
   verbs:
   - create
   - delete
@@ -135,6 +178,18 @@ rules:
   resources:
   - rolebindings
   - roles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rhtas.redhat.com
+  resources:
+  - securesigns
   verbs:
   - create
   - delete

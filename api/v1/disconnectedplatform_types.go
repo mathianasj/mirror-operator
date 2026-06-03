@@ -31,6 +31,7 @@ type ConnectedConfig struct {
 	ArtifactStorage    ArtifactStorageConfig `json:"artifactStorage"`
 	TriggerTypes       []TriggerType         `json:"triggerTypes,omitempty"`
 	Operators          *OperatorConfig       `json:"operators,omitempty"`
+	RHTAS              *RHTASInstallerConfig `json:"rhtas,omitempty"`
 	RHTPA              *RHTPAInstallerConfig `json:"rhtpa,omitempty"`
 }
 
@@ -45,8 +46,45 @@ type OLMSubscriptionConfig struct {
 
 type OperatorConfig struct {
 	OpenShiftPipelines *OLMSubscriptionConfig `json:"openshiftPipelines,omitempty"`
+	Keycloak           *OLMSubscriptionConfig `json:"keycloak,omitempty"`
 	RHTAS              *OLMSubscriptionConfig `json:"rhtas,omitempty"`
 	RHTPA              *OLMSubscriptionConfig `json:"rhtpa,omitempty"`
+}
+
+type RHTASInstallerConfig struct {
+	OIDC            *RHTASOIDCConfig             `json:"oidc,omitempty"`
+	Database        *RHTASDatabaseConfig         `json:"database,omitempty"`
+	TrustedRootKeys *corev1.LocalObjectReference `json:"trustedRootKeys,omitempty"`
+}
+
+type RHTASOIDCConfig struct {
+	Issuer       string                 `json:"issuer,omitempty"`
+	ClientID     string                 `json:"clientId,omitempty"`
+	ClientSecret string                 `json:"clientSecret,omitempty"`
+	Type         string                 `json:"type,omitempty"`
+	Managed      *ManagedKeycloakConfig `json:"managed,omitempty"`
+}
+
+type ManagedKeycloakConfig struct {
+	Enabled       bool                         `json:"enabled"`
+	Realm         string                       `json:"realm,omitempty"`
+	AdminUser     string                       `json:"adminUser,omitempty"`
+	AdminPassword string                       `json:"adminPassword,omitempty"`
+	TLSSecret     *corev1.LocalObjectReference `json:"tlsSecret,omitempty"`
+	CertIssuer    *CertIssuerReference         `json:"certIssuer,omitempty"`
+}
+
+type CertIssuerReference struct {
+	Name string `json:"name"`
+	Kind string `json:"kind,omitempty"`
+}
+
+type RHTASDatabaseConfig struct {
+	Host     string `json:"host"`
+	Name     string `json:"name"`
+	Port     int32  `json:"port,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type RHTPAInstallerConfig struct {
@@ -76,6 +114,11 @@ type AirgappedConfig struct {
 	BootstrapEnabled    bool                         `json:"bootstrapEnabled"`
 	ImportPath          string                       `json:"importPath,omitempty"`
 	RegistryCredentials *corev1.LocalObjectReference `json:"registryCredentials,omitempty"`
+	RHTAS               *AirgappedRHTASConfig        `json:"rhtas,omitempty"`
+}
+
+type AirgappedRHTASConfig struct {
+	TrustedRootKeys *corev1.LocalObjectReference `json:"trustedRootKeys,omitempty"`
 }
 
 type TLSConfig struct {
@@ -149,6 +192,15 @@ type DisconnectedPlatformStatus struct {
 	LastImport        *ImportInfo        `json:"lastImport,omitempty"`
 	ImportHistory     []ImportInfo       `json:"importHistory,omitempty"`
 	Components        []ComponentStatus  `json:"components,omitempty"`
+	RHTASRootKeys     *RHTASRootKeysInfo `json:"rhtasRootKeys,omitempty"`
+}
+
+type RHTASRootKeysInfo struct {
+	ConfigMap        string      `json:"configMap"`
+	FulcioRootHash   string      `json:"fulcioRootHash"`
+	RekorKeyHash     string      `json:"rekorKeyHash"`
+	LastUpdated      metav1.Time `json:"lastUpdated"`
+	TUFRepositoryURL string      `json:"tufRepositoryUrl,omitempty"`
 }
 
 // +kubebuilder:object:root=true

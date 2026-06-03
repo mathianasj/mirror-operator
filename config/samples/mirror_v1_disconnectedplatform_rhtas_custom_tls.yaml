@@ -1,0 +1,57 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: disconnected-platform-custom-tls
+spec:
+  mode: connected
+  connected:
+    collectionSchedule: "0 2 * * 0"
+    mirrorRegistry: "quay.example.com/mirror"
+    artifactStorage:
+      size: 2Ti
+    triggerTypes:
+      - scheduled
+      - manual
+    operators:
+      openshiftPipelines: {}
+      keycloak: {}
+      rhtas: {}
+      rhtpa: {}
+    rhtas:
+      oidc:
+        managed:
+          enabled: true
+          realm: "trusted-artifact-signer"
+          # Use your own TLS secret instead of cert-manager
+          tlsSecret:
+            name: my-keycloak-tls  # Create this secret with tls.crt and tls.key
+        type: "email"
+      database:
+        host: "postgres.example.com"
+        name: "rhtas"
+        port: 5432
+    rhtpa:
+      storage:
+        type: local
+        size: 20Gi
+      database:
+        host: postgres.example.com
+        name: rhtpa
+        username: rhtpa
+        password: change-me
+  architect:
+    enabled: true
+---
+# Example of creating a custom TLS secret
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: my-keycloak-tls
+#   namespace: mirror-operator-system
+# type: kubernetes.io/tls
+# data:
+#   tls.crt: <base64-encoded-certificate>
+#   tls.key: <base64-encoded-private-key>

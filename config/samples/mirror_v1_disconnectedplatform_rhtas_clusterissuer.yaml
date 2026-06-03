@@ -4,7 +4,7 @@ metadata:
   labels:
     app.kubernetes.io/name: mirror-operator
     app.kubernetes.io/managed-by: kustomize
-  name: disconnected-platform
+  name: disconnected-platform-clusterissuer
 spec:
   mode: connected
   connected:
@@ -17,12 +17,23 @@ spec:
       - manual
     operators:
       openshiftPipelines: {}
-      rhtas:
-        oidc:
-          managed:
-            enabled: true
-            realm: trusted-artifact-signer
+      keycloak: {}
+      rhtas: {}
       rhtpa: {}
+    rhtas:
+      oidc:
+        managed:
+          enabled: true
+          realm: "trusted-artifact-signer"
+          # Use existing ClusterIssuer (e.g., Let's Encrypt)
+          certIssuer:
+            name: letsencrypt-prod
+            kind: ClusterIssuer
+        type: "email"
+      database:
+        host: "postgres.example.com"
+        name: "rhtas"
+        port: 5432
     rhtpa:
       storage:
         type: local
@@ -34,5 +45,3 @@ spec:
         password: change-me
   architect:
     enabled: true
-    frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:9fa8f29be04be2c87b35abbba921def9021c3b80
-    backendImage: quay.io/mathianasj/openshift-airgap-architect-backend:9fa8f29be04be2c87b35abbba921def9021c3b80

@@ -75,7 +75,7 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&mirrorImage, "mirror-image", "quay.io/mirror-operator/oc-mirror:v2",
+	flag.StringVar(&mirrorImage, "mirror-image", "quay.io/mathianasj/oc-mirror:v2",
 		"oc-mirror container image for CollectionPipeline and MirrorImport job steps")
 	flag.StringVar(&architectFrontendImage, "architect-frontend-image", "quay.io/mirror-operator/airgap-architect-frontend:latest",
 		"airgap-architect frontend UI container image")
@@ -192,6 +192,12 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterBootstrap")
+		os.Exit(1)
+	}
+	if err = (&controller.RHTASHealthCheckReconciler{
+		Client: mgr.GetClient(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "RHTASHealthCheck")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

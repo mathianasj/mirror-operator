@@ -12,6 +12,9 @@ spec:
     mirrorRegistry: "quay.internal:8443/mirror"
     bootstrapEnabled: true
     importPath: /mnt/physical-media
+    rhtas:
+      trustedRootKeys:
+        name: rhtas-trusted-root
   architect:
     enabled: true
     frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:df56c591ae4f12ce8c297695b69f6c264c5f257b

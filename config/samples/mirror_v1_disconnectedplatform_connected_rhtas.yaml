@@ -4,7 +4,7 @@ metadata:
   labels:
     app.kubernetes.io/name: mirror-operator
     app.kubernetes.io/managed-by: kustomize
-  name: disconnected-platform
+  name: disconnected-platform-rhtas
 spec:
   mode: connected
   connected:
@@ -17,12 +17,20 @@ spec:
       - manual
     operators:
       openshiftPipelines: {}
-      rhtas:
-        oidc:
-          managed:
-            enabled: true
-            realm: trusted-artifact-signer
+      rhtas: {}
       rhtpa: {}
+    rhtas:
+      oidc:
+        # External OIDC provider (existing Keycloak, GitHub, Google, etc.)
+        issuer: "https://keycloak.example.com/realms/trusted-artifact-signer"
+        clientId: "trusted-artifact-signer"
+        type: "email"  # or "github-workflow", "spiffe", "kubernetes", "uri"
+      database:
+        host: "postgres.example.com"
+        name: "rhtas"
+        port: 5432
+        username: "rhtas"
+        password: "change-me"
     rhtpa:
       storage:
         type: local

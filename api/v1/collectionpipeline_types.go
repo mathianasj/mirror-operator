@@ -23,8 +23,31 @@ type ArtifactOutput struct {
 }
 
 type CosignSigningConfig struct {
+	// Static key-based signing (legacy)
 	KeySecretRef      *corev1.LocalObjectReference `json:"keySecretRef,omitempty"`
 	PasswordSecretRef *corev1.LocalObjectReference `json:"passwordSecretRef,omitempty"`
+
+	// Keyless signing with Fulcio
+	Keyless *KeylessSigningConfig `json:"keyless,omitempty"`
+}
+
+type KeylessSigningConfig struct {
+	// Fulcio URL for certificate issuance
+	FulcioURL string `json:"fulcioURL"`
+
+	// Rekor URL for transparency log
+	RekorURL string `json:"rekorURL"`
+
+	// TUF URL for root of trust distribution
+	// +optional
+	TUFURL string `json:"tufURL,omitempty"`
+
+	// OIDC issuer URL
+	OIDCIssuer string `json:"oidcIssuer"`
+
+	// OIDC client credentials
+	OIDCClientID     string                       `json:"oidcClientID"`
+	OIDCClientSecret *corev1.LocalObjectReference `json:"oidcClientSecret,omitempty"`
 }
 
 type CollectionPipelineSpec struct {
