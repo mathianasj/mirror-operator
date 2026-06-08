@@ -703,11 +703,100 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Env: envVars,
 	}
 
+	// Generate SBOM from mirrored images using oc-mirror's mapping.txt
 	syftStep := pipelinev1.Step{
 		Name:    "sbom",
 		Image:   mirrorImage,
 		Command: []string{"/bin/sh", "-c"},
-		Args:    []string{"syft dir:/workspace/output -o cyclonedx-json > /workspace/output/sbom.cyclonedx.json"},
+		Args: []string{`
+set -e
+echo "Generating SBOM from mirrored images..."
+
+# Find the mapping.txt file from oc-mirror results
+MAPPING_FILE=$(find /workspace/output -name "mapping.txt" -type f | head -1)
+if [ -z "$MAPPING_FILE" ]; then
+  echo "Warning: mapping.txt not found, creating empty SBOM"
+  echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"metadata":{"component":{"type":"container","name":"mirror-collection"}},"components":[]}' > /workspace/output/sbom.cyclonedx.json
+  exit 0
+fi
+
+echo "Found mapping file: $MAPPING_FILE"
+
+# Create CycloneDX SBOM structure
+cat > /workspace/output/sbom.cyclonedx.json <<'SBOM_HEADER'
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "version": 1,
+  "metadata": {
+    "timestamp": "TIMESTAMP_PLACEHOLDER",
+    "component": {
+      "type": "container",
+      "name": "mirror-collection",
+      "version": "VERSION_PLACEHOLDER"
+    }
+  },
+  "components": [
+SBOM_HEADER
+
+# Parse mapping.txt and extract source images (left side of =)
+# Format: source-image=dest-image
+first=true
+while IFS='=' read -r source dest; do
+  # Skip empty lines and comments
+  if [ -z "$source" ] || [[ "$source" =~ ^# ]]; then
+    continue
+  fi
+
+  # Extract image name and digest/tag
+  image_full="$source"
+
+  # Parse registry/repo/name:tag or @sha256:digest
+  if [[ "$image_full" =~ @sha256: ]]; then
+    # Has digest
+    image_ref="${image_full##*/}"  # Get last part after /
+    image_name="${image_ref%%@*}"  # Get name before @
+    digest="${image_full##*@}"     # Get digest after @
+    version="$digest"
+  else
+    # Has tag
+    image_ref="${image_full##*/}"  # Get last part after /
+    image_name="${image_ref%%:*}"  # Get name before :
+    tag="${image_ref##*:}"         # Get tag after :
+    version="${tag:-latest}"
+  fi
+
+  # Add comma if not first component
+  if [ "$first" = false ]; then
+    echo "," >> /workspace/output/sbom.cyclonedx.json
+  fi
+  first=false
+
+  # Add component entry
+  cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
+    {
+      "type": "container",
+      "name": "$image_name",
+      "version": "$version",
+      "purl": "pkg:oci/$image_full"
+    }
+COMPONENT
+
+done < "$MAPPING_FILE"
+
+# Close JSON structure
+cat >> /workspace/output/sbom.cyclonedx.json <<'SBOM_FOOTER'
+  ]
+}
+SBOM_FOOTER
+
+# Replace placeholders
+sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/" /workspace/output/sbom.cyclonedx.json
+sed -i "s/VERSION_PLACEHOLDER/$(basename /workspace/output)/" /workspace/output/sbom.cyclonedx.json
+
+echo "SBOM generated successfully with $(grep -c '"type": "container"' /workspace/output/sbom.cyclonedx.json) components"
+cat /workspace/output/sbom.cyclonedx.json | head -50
+		`},
 	}
 
 	// Build signing step based on configuration
