@@ -548,8 +548,13 @@ for tar_file in /workspace/output/mirror_*.tar; do
   tar_name=$(basename "$tar_file" .tar)
   echo "Scanning $tar_name..."
 
-  # Scan tar archive with Syft
-  syft "oci-archive:$tar_file" -o cyclonedx-json > "/tmp/scans/${tar_name}.json" 2>/dev/null && scan_count=$((scan_count + 1)) || echo "  Syft scan failed for $tar_name"
+  # Try scanning as docker-archive (oc-mirror v2 uses Docker save format)
+  if syft "docker-archive:$tar_file" -o cyclonedx-json > "/tmp/scans/${tar_name}.json" 2>&1; then
+    scan_count=$((scan_count + 1))
+    echo "  Successfully scanned $tar_name"
+  else
+    echo "  Syft scan failed for $tar_name"
+  fi
 done
 
 echo "Scanned $scan_count tar archives"
