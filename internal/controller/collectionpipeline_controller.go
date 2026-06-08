@@ -241,227 +241,12 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 	}
 
 	if phase == "Complete" {
-		if !pipeline.Status.SbomUploaded {
-			if pipeline.Status.SbomUploaderRef != "" {
-				return r.trackSbomUploader(ctx, pipeline, req)
-			}
-			return r.startSbomUploader(ctx, pipeline, req)
-		}
 		r.updatePlatformCollectionHistory(ctx, pipeline)
 	}
 
 	if !pr.IsDone() {
 		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, nil
-}
-
-func (r *CollectionPipelineReconciler) startSbomUploader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	output := pipeline.Spec.Storage.Output
-	if output == nil || output.PVC == "" {
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	// Find TPA instance to get the API URL
-	tpaList := &unstructured.UnstructuredList{}
-	tpaList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "rhtpa.io",
-		Version: "v1",
-		Kind:    "TrustedProfileAnalyzerList",
-	})
-	if err := r.List(ctx, tpaList); err != nil {
-		logger.Error(err, "failed to list TPA instances")
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	if len(tpaList.Items) == 0 {
-		logger.Info("No TPA instance found, skipping SBOM upload")
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	// Find the TPA Ingress to get the hostname
-	tpa := tpaList.Items[0]
-	tpaUID := tpa.GetUID()
-
-	ingressList := &unstructured.UnstructuredList{}
-	ingressList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "networking.k8s.io",
-		Version: "v1",
-		Kind:    "IngressList",
-	})
-	if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err != nil {
-		logger.Error(err, "failed to list Ingresses")
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	var tpaHostname string
-	for _, ingress := range ingressList.Items {
-		owners := ingress.GetOwnerReferences()
-		for _, owner := range owners {
-			if owner.UID == tpaUID {
-				rules, found, _ := unstructured.NestedSlice(ingress.Object, "spec", "rules")
-				if found && len(rules) > 0 {
-					if rule, ok := rules[0].(map[string]interface{}); ok {
-						if host, ok := rule["host"].(string); ok {
-							tpaHostname = host
-							break
-						}
-					}
-				}
-			}
-		}
-		if tpaHostname != "" {
-			break
-		}
-	}
-
-	if tpaHostname == "" {
-		logger.Info("TPA hostname not found, skipping SBOM upload")
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	// Get Keycloak hostname
-	ingress := &unstructured.Unstructured{}
-	ingress.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "config.openshift.io",
-		Version: "v1",
-		Kind:    "Ingress",
-	})
-	ingress.SetName("cluster")
-	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
-		logger.Error(err, "failed to get cluster ingress")
-		return r.finalizeSbomUpload(ctx, pipeline)
-	}
-
-	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
-	keycloakHost := "keycloak." + domain
-
-	jobName := "sbom-uploader-" + pipeline.Name
-	tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
-	tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
-
-	// Create Job that uploads SBOM to TPA
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: req.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "upload-sbom",
-							Image:   "quay.io/mathianasj/oc-mirror:v2-dev",
-							Command: []string{"/bin/sh", "-c"},
-							Args: []string{fmt.Sprintf(`
-set -e
-
-echo "Getting OIDC token..."
-TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
-  -d "grant_type=client_credentials" \
-  -d "client_id=cli" \
-  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)")
-
-ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
-if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-  echo "Failed to get access token: $TOKEN_RESPONSE"
-  exit 1
-fi
-
-echo "Uploading SBOM to TPA..."
-if [ ! -f /workspace/output/sbom.cyclonedx.json ]; then
-  echo "SBOM file not found, skipping upload"
-  exit 0
-fi
-
-curl -k -v -X POST "%s" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/workspace/output/sbom.cyclonedx.json
-
-echo "SBOM uploaded successfully"
-							`, tokenURL, tpaURL)},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "output", MountPath: "/workspace/output"},
-								{Name: "oidc-secret", MountPath: "/workspace/oidc-secret"},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "output",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: output.PVC,
-								},
-							},
-						},
-						{
-							Name: "oidc-secret",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: "rhtpa-oidc-cli-secret",
-								},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyNever,
-				},
-			},
-		},
-	}
-
-	if err := r.Create(ctx, job); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create SBOM uploader Job")
-			return r.finalizeSbomUpload(ctx, pipeline)
-		}
-	}
-
-	pipeline.Status.SbomUploaderRef = jobName
-	return ctrl.Result{}, r.Status().Update(ctx, pipeline)
-}
-
-func (r *CollectionPipelineReconciler) trackSbomUploader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: pipeline.Status.SbomUploaderRef}, job)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			pipeline.Status.SbomUploaderRef = ""
-			return ctrl.Result{}, r.Status().Update(ctx, pipeline)
-		}
-		return ctrl.Result{}, err
-	}
-
-	for _, cond := range job.Status.Conditions {
-		if cond.Type == batchv1.JobComplete {
-			logger.Info("SBOM uploader Job completed successfully")
-			return r.finalizeSbomUpload(ctx, pipeline)
-		}
-		if cond.Type == batchv1.JobFailed {
-			logger.Info("SBOM uploader Job failed, proceeding without SBOM upload")
-			return r.finalizeSbomUpload(ctx, pipeline)
-		}
-	}
-
-	return ctrl.Result{}, nil
-}
-
-func (r *CollectionPipelineReconciler) finalizeSbomUpload(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) (ctrl.Result, error) {
-	pipeline.Status.SbomUploaded = true
-	pipeline.Status.SbomUploaderRef = ""
-	if err := r.Status().Update(ctx, pipeline); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	r.updatePlatformCollectionHistory(ctx, pipeline)
 	return ctrl.Result{}, nil
 }
 
@@ -895,6 +680,48 @@ rm -rf /tmp/scans
 		}
 	}
 
+	// SBOM upload step - get TPA URL
+	var uploadSbomStep *pipelinev1.Step
+	tpaHostname, keycloakHost := r.getTPAAndKeycloakHosts(ctx)
+	if tpaHostname != "" && keycloakHost != "" {
+		tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
+		tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
+
+		uploadSbomStep = &pipelinev1.Step{
+			Name:    "upload-sbom",
+			Image:   mirrorImage,
+			Command: []string{"/bin/sh", "-c"},
+			Args: []string{fmt.Sprintf(`
+set -e
+
+if [ ! -f /workspace/output/sbom.cyclonedx.json ]; then
+  echo "SBOM file not found, skipping upload"
+  exit 0
+fi
+
+echo "Getting OIDC token..."
+TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=cli" \
+  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)")
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+  echo "Failed to get access token: $TOKEN_RESPONSE"
+  exit 1
+fi
+
+echo "Uploading SBOM to TPA..."
+curl -k -v -X POST "%s" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @/workspace/output/sbom.cyclonedx.json
+
+echo "SBOM uploaded successfully"
+			`, tokenURL, tpaURL)},
+		}
+	}
+
 	cosignTasks := []pipelinev1.PipelineTask{
 		{
 			Name: "dry-run",
@@ -935,6 +762,24 @@ rm -rf /tmp/scans
 			},
 			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding},
 		},
+	}
+
+	// Add SBOM upload task if TPA is available
+	if uploadSbomStep != nil {
+		uploadTask := pipelinev1.PipelineTask{
+			Name:     "upload-sbom",
+			RunAfter: []string{"cosign-sign"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{*uploadSbomStep},
+				},
+			},
+			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{
+				outputWorkspaceBinding,
+				{Name: "oidc-secret", Workspace: "oidc-secret"},
+			},
+		}
+		cosignTasks = append(cosignTasks, uploadTask)
 	}
 
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.KeySecretRef != nil {
@@ -997,6 +842,85 @@ rm -rf /tmp/scans
 	}
 
 	return pr, nil
+}
+
+// getTPAAndKeycloakHosts retrieves the TPA and Keycloak hostnames from Ingresses
+func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Context) (string, string) {
+	logger := log.FromContext(ctx)
+
+	// Find TPA instance
+	tpaList := &unstructured.UnstructuredList{}
+	tpaList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rhtpa.io",
+		Version: "v1",
+		Kind:    "TrustedProfileAnalyzerList",
+	})
+	if err := r.List(ctx, tpaList); err != nil {
+		logger.Error(err, "failed to list TPA instances")
+		return "", ""
+	}
+
+	if len(tpaList.Items) == 0 {
+		return "", ""
+	}
+
+	tpa := tpaList.Items[0]
+	tpaUID := tpa.GetUID()
+
+	// Find TPA Ingress
+	ingressList := &unstructured.UnstructuredList{}
+	ingressList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.k8s.io",
+		Version: "v1",
+		Kind:    "IngressList",
+	})
+	if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err != nil {
+		logger.Error(err, "failed to list Ingresses")
+		return "", ""
+	}
+
+	var tpaHostname string
+	for _, ingress := range ingressList.Items {
+		owners := ingress.GetOwnerReferences()
+		for _, owner := range owners {
+			if owner.UID == tpaUID {
+				rules, found, _ := unstructured.NestedSlice(ingress.Object, "spec", "rules")
+				if found && len(rules) > 0 {
+					if rule, ok := rules[0].(map[string]interface{}); ok {
+						if host, ok := rule["host"].(string); ok {
+							tpaHostname = host
+							break
+						}
+					}
+				}
+			}
+		}
+		if tpaHostname != "" {
+			break
+		}
+	}
+
+	if tpaHostname == "" {
+		return "", ""
+	}
+
+	// Get Keycloak hostname
+	ingress := &unstructured.Unstructured{}
+	ingress.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Ingress",
+	})
+	ingress.SetName("cluster")
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
+		logger.Error(err, "failed to get cluster ingress")
+		return tpaHostname, ""
+	}
+
+	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
+	keycloakHost := "keycloak." + domain
+
+	return tpaHostname, keycloakHost
 }
 
 func (r *CollectionPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
