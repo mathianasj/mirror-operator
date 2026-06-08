@@ -267,8 +267,8 @@ func (r *CollectionPipelineReconciler) startSbomUploader(ctx context.Context, pi
 	// Find TPA instance to get the API URL
 	tpaList := &unstructured.UnstructuredList{}
 	tpaList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "charts.trustification.dev",
-		Version: "v1alpha1",
+		Group:   "rhtpa.io",
+		Version: "v1",
 		Kind:    "TrustedProfileAnalyzerList",
 	})
 	if err := r.List(ctx, tpaList); err != nil {
@@ -357,12 +357,10 @@ func (r *CollectionPipelineReconciler) startSbomUploader(ctx context.Context, pi
 					Containers: []corev1.Container{
 						{
 							Name:    "upload-sbom",
-							Image:   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+							Image:   "quay.io/mathianasj/oc-mirror:v2-dev",
 							Command: []string{"/bin/sh", "-c"},
 							Args: []string{fmt.Sprintf(`
 set -e
-echo "Installing curl and jq..."
-microdnf install -y curl jq
 
 echo "Getting OIDC token..."
 TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
@@ -908,8 +906,8 @@ rm -rf /tmp/scans
 			Workspaces: taskWorkspaceBindings,
 		},
 		{
-			Name:       "oc-mirror",
-			RunAfter:   []string{"dry-run"},
+			Name:     "oc-mirror",
+			RunAfter: []string{"dry-run"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{ocMirrorStep},
