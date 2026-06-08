@@ -835,6 +835,10 @@ echo "SBOM uploaded successfully"
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: pipelineRunNamePrefix,
 			Namespace:    pipeline.Namespace,
+			Annotations: map[string]string{
+				"results.tekton.dev/log":    "false", // Don't store logs in Results database
+				"results.tekton.dev/result": "false", // Don't store results in Results database
+			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
 			},
