@@ -359,9 +359,8 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      output.PVC,
 			Namespace: pipeline.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
-			},
+			// Do NOT set owner references - PVCs may be shared across multiple CollectionPipelines
+			// Setting an owner reference would cause the PVC to be deleted when one pipeline is deleted
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{
