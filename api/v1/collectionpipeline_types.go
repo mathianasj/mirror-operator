@@ -69,15 +69,15 @@ const (
 )
 
 type CollectionPipelineStatus struct {
-	Conditions     []metav1.Condition `json:"conditions,omitempty"`
-	Phase          string             `json:"phase,omitempty"`
-	Version        string             `json:"version,omitempty"`
-	PipelineRunRef string             `json:"pipelineRunRef,omitempty"`
-	ConfigMapRef   string             `json:"configMapRef,omitempty"`
-	SbomRef        string             `json:"sbomRef,omitempty"`
-	SbomReaderRef  string             `json:"sbomReaderRef,omitempty"`
-	StartTime      *metav1.Time       `json:"startTime,omitempty"`
-	CompletionTime *metav1.Time       `json:"completionTime,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty"`
+	Phase           string             `json:"phase,omitempty"`
+	Version         string             `json:"version,omitempty"`
+	PipelineRunRef  string             `json:"pipelineRunRef,omitempty"`
+	ConfigMapRef    string             `json:"configMapRef,omitempty"`
+	SbomUploaded    bool               `json:"sbomUploaded,omitempty"`
+	SbomUploaderRef string             `json:"sbomUploaderRef,omitempty"`
+	StartTime       *metav1.Time       `json:"startTime,omitempty"`
+	CompletionTime  *metav1.Time       `json:"completionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

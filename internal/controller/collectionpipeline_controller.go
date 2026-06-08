@@ -1,14 +1,8 @@
 package controller
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,7 +10,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -248,11 +241,11 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 	}
 
 	if phase == "Complete" {
-		if pipeline.Status.SbomRef == "" {
-			if pipeline.Status.SbomReaderRef != "" {
-				return r.trackSbomReader(ctx, pipeline, req)
+		if !pipeline.Status.SbomUploaded {
+			if pipeline.Status.SbomUploaderRef != "" {
+				return r.trackSbomUploader(ctx, pipeline, req)
 			}
-			return r.startSbomReader(ctx, pipeline, req)
+			return r.startSbomUploader(ctx, pipeline, req)
 		}
 		r.updatePlatformCollectionHistory(ctx, pipeline)
 	}
@@ -263,171 +256,12 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 	return ctrl.Result{}, nil
 }
 
-func (r *CollectionPipelineReconciler) startSbomReader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
-	output := pipeline.Spec.Storage.Output
-	if output == nil || output.PVC == "" {
-		return r.finalizeSbomExtraction(ctx, pipeline, "")
-	}
-
-	mirrorImage := r.MirrorImage
-	if mirrorImage == "" {
-		mirrorImage = defaultMirrorImage
-	}
-
-	jobName := "sbom-reader-" + pipeline.Name
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: req.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "read-sbom",
-							Image:   mirrorImage,
-							Command: []string{"cat", "/workspace/output/sbom.cyclonedx.json"},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "output", MountPath: "/workspace/output"},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "output",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: output.PVC,
-								},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyNever,
-				},
-			},
-		},
-	}
-
-	if err := r.Create(ctx, job); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			log.FromContext(ctx).Error(err, "failed to create SBOM reader Job")
-			return ctrl.Result{}, err
-		}
-	}
-
-	pipeline.Status.SbomReaderRef = jobName
-	return ctrl.Result{}, r.Status().Update(ctx, pipeline)
-}
-
-func (r *CollectionPipelineReconciler) trackSbomReader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
-	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: pipeline.Status.SbomReaderRef}, job)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			pipeline.Status.SbomReaderRef = ""
-			return ctrl.Result{}, r.Status().Update(ctx, pipeline)
-		}
-		return ctrl.Result{}, err
-	}
-
-	for _, cond := range job.Status.Conditions {
-		if cond.Type == batchv1.JobComplete {
-			return r.readSbomLogs(ctx, pipeline, req)
-		}
-		if cond.Type == batchv1.JobFailed {
-			log.FromContext(ctx).Info("SBOM reader Job failed, proceeding without SBOM")
-			return r.finalizeSbomExtraction(ctx, pipeline, "")
-		}
-	}
-
-	return ctrl.Result{}, nil
-}
-
-func (r *CollectionPipelineReconciler) readSbomLogs(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
-	pods, err := r.ClientSet.CoreV1().Pods(req.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.Set{"job-name": pipeline.Status.SbomReaderRef}.String(),
-	})
-	if err != nil || len(pods.Items) == 0 {
-		log.FromContext(ctx).Error(err, "failed to find SBOM reader pod, proceeding without SBOM")
-		return r.finalizeSbomExtraction(ctx, pipeline, "")
-	}
-
-	logStream, err := r.ClientSet.CoreV1().Pods(req.Namespace).GetLogs(
-		pods.Items[0].Name,
-		&corev1.PodLogOptions{},
-	).Stream(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to read SBOM reader logs, proceeding without SBOM")
-		return r.finalizeSbomExtraction(ctx, pipeline, "")
-	}
-	defer logStream.Close()
-
-	data, err := io.ReadAll(logStream)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to read SBOM data, proceeding without SBOM")
-		return r.finalizeSbomExtraction(ctx, pipeline, "")
-	}
-
-	sbomConfigMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      pipeline.Name + "-sbom",
-			Namespace: req.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
-			},
-		},
-		Data: map[string]string{
-			"sbom.cyclonedx.json": string(data),
-		},
-	}
-
-	if err := r.Create(ctx, sbomConfigMap); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
-	}
-
-	return r.finalizeSbomExtraction(ctx, pipeline, sbomConfigMap.Name)
-}
-
-func (r *CollectionPipelineReconciler) finalizeSbomExtraction(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, sbomConfigMapName string) (ctrl.Result, error) {
-	pipeline.Status.SbomRef = sbomConfigMapName
-	pipeline.Status.SbomReaderRef = ""
-	if err := r.Status().Update(ctx, pipeline); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Upload SBOM to TPA if available
-	if sbomConfigMapName != "" {
-		if err := r.uploadSbomToTPA(ctx, pipeline, sbomConfigMapName); err != nil {
-			log.FromContext(ctx).Error(err, "failed to upload SBOM to TPA", "configMap", sbomConfigMapName)
-			// Don't fail the pipeline if SBOM upload fails, just log it
-		}
-	}
-
-	r.updatePlatformCollectionHistory(ctx, pipeline)
-	return ctrl.Result{}, nil
-}
-
-func (r *CollectionPipelineReconciler) uploadSbomToTPA(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, sbomConfigMapName string) error {
+func (r *CollectionPipelineReconciler) startSbomUploader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Get the SBOM from the ConfigMap
-	sbomConfigMap := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      sbomConfigMapName,
-		Namespace: pipeline.Namespace,
-	}, sbomConfigMap); err != nil {
-		return fmt.Errorf("failed to get SBOM ConfigMap: %w", err)
-	}
-
-	sbomData, ok := sbomConfigMap.Data["sbom.cyclonedx.json"]
-	if !ok || sbomData == "" {
-		return fmt.Errorf("SBOM data not found in ConfigMap")
+	output := pipeline.Spec.Storage.Output
+	if output == nil || output.PVC == "" {
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
 	// Find TPA instance to get the API URL
@@ -438,12 +272,13 @@ func (r *CollectionPipelineReconciler) uploadSbomToTPA(ctx context.Context, pipe
 		Kind:    "TrustedProfileAnalyzerList",
 	})
 	if err := r.List(ctx, tpaList); err != nil {
-		return fmt.Errorf("failed to list TPA instances: %w", err)
+		logger.Error(err, "failed to list TPA instances")
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
 	if len(tpaList.Items) == 0 {
 		logger.Info("No TPA instance found, skipping SBOM upload")
-		return nil
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
 	// Find the TPA Ingress to get the hostname
@@ -457,7 +292,8 @@ func (r *CollectionPipelineReconciler) uploadSbomToTPA(ctx context.Context, pipe
 		Kind:    "IngressList",
 	})
 	if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err != nil {
-		return fmt.Errorf("failed to list Ingresses: %w", err)
+		logger.Error(err, "failed to list Ingresses")
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
 	var tpaHostname string
@@ -482,49 +318,11 @@ func (r *CollectionPipelineReconciler) uploadSbomToTPA(ctx context.Context, pipe
 	}
 
 	if tpaHostname == "" {
-		return fmt.Errorf("TPA hostname not found in Ingress resources")
+		logger.Info("TPA hostname not found, skipping SBOM upload")
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
-	// Get OIDC token using CLI client credentials
-	token, err := r.getTPAOIDCToken(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get OIDC token: %w", err)
-	}
-
-	// Upload SBOM to TPA
-	tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 30 * time.Second,
-	}
-
-	req, err := http.NewRequest("POST", tpaURL, bytes.NewBufferString(sbomData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to upload SBOM: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("TPA API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	logger.Info("Successfully uploaded SBOM to TPA", "url", tpaURL, "configMap", sbomConfigMapName)
-	return nil
-}
-
-func (r *CollectionPipelineReconciler) getTPAOIDCToken(ctx context.Context) (string, error) {
-	// Get Keycloak hostname from cluster ingress
+	// Get Keycloak hostname
 	ingress := &unstructured.Unstructured{}
 	ingress.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "config.openshift.io",
@@ -533,62 +331,140 @@ func (r *CollectionPipelineReconciler) getTPAOIDCToken(ctx context.Context) (str
 	})
 	ingress.SetName("cluster")
 	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
-		return "", fmt.Errorf("failed to get cluster ingress: %w", err)
+		logger.Error(err, "failed to get cluster ingress")
+		return r.finalizeSbomUpload(ctx, pipeline)
 	}
 
 	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
 	keycloakHost := "keycloak." + domain
+
+	jobName := "sbom-uploader-" + pipeline.Name
+	tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
 	tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
 
-	// Get CLI client secret
-	cliSecret := &corev1.Secret{}
-	if err := r.Get(ctx, client.ObjectKey{
-		Name:      "rhtpa-oidc-cli-secret",
-		Namespace: architectNamespace,
-	}, cliSecret); err != nil {
-		return "", fmt.Errorf("failed to get CLI client secret: %w", err)
-	}
-
-	clientSecret := string(cliSecret.Data["clientSecret"])
-	if clientSecret == "" {
-		return "", fmt.Errorf("CLI client secret is empty")
-	}
-
-	// Request token using client credentials flow
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	// Create Job that uploads SBOM to TPA
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: req.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
+			},
 		},
-		Timeout: 30 * time.Second,
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:    "upload-sbom",
+							Image:   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{fmt.Sprintf(`
+set -e
+echo "Installing curl and jq..."
+microdnf install -y curl jq
+
+echo "Getting OIDC token..."
+TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=cli" \
+  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)")
+
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+  echo "Failed to get access token: $TOKEN_RESPONSE"
+  exit 1
+fi
+
+echo "Uploading SBOM to TPA..."
+if [ ! -f /workspace/output/sbom.cyclonedx.json ]; then
+  echo "SBOM file not found, skipping upload"
+  exit 0
+fi
+
+curl -k -v -X POST "%s" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @/workspace/output/sbom.cyclonedx.json
+
+echo "SBOM uploaded successfully"
+							`, tokenURL, tpaURL)},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "output", MountPath: "/workspace/output"},
+								{Name: "oidc-secret", MountPath: "/workspace/oidc-secret"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "output",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: output.PVC,
+								},
+							},
+						},
+						{
+							Name: "oidc-secret",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "rhtpa-oidc-cli-secret",
+								},
+							},
+						},
+					},
+					RestartPolicy: corev1.RestartPolicyNever,
+				},
+			},
+		},
 	}
 
-	tokenData := url.Values{}
-	tokenData.Set("grant_type", "client_credentials")
-	tokenData.Set("client_id", "cli")
-	tokenData.Set("client_secret", clientSecret)
+	if err := r.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			logger.Error(err, "failed to create SBOM uploader Job")
+			return r.finalizeSbomUpload(ctx, pipeline)
+		}
+	}
 
-	resp, err := httpClient.PostForm(tokenURL, tokenData)
+	pipeline.Status.SbomUploaderRef = jobName
+	return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+}
+
+func (r *CollectionPipelineReconciler) trackSbomUploader(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	job := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: pipeline.Status.SbomUploaderRef}, job)
 	if err != nil {
-		return "", fmt.Errorf("failed to request token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
+		if apierrors.IsNotFound(err) {
+			pipeline.Status.SbomUploaderRef = ""
+			return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+		}
+		return ctrl.Result{}, err
 	}
 
-	var tokenResult map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResult); err != nil {
-		return "", fmt.Errorf("failed to decode token response: %w", err)
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobComplete {
+			logger.Info("SBOM uploader Job completed successfully")
+			return r.finalizeSbomUpload(ctx, pipeline)
+		}
+		if cond.Type == batchv1.JobFailed {
+			logger.Info("SBOM uploader Job failed, proceeding without SBOM upload")
+			return r.finalizeSbomUpload(ctx, pipeline)
+		}
 	}
 
-	accessToken, ok := tokenResult["access_token"].(string)
-	if !ok || accessToken == "" {
-		return "", fmt.Errorf("no access token in response")
+	return ctrl.Result{}, nil
+}
+
+func (r *CollectionPipelineReconciler) finalizeSbomUpload(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) (ctrl.Result, error) {
+	pipeline.Status.SbomUploaded = true
+	pipeline.Status.SbomUploaderRef = ""
+	if err := r.Status().Update(ctx, pipeline); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	return accessToken, nil
+	r.updatePlatformCollectionHistory(ctx, pipeline)
+	return ctrl.Result{}, nil
 }
 
 func (r *CollectionPipelineReconciler) updatePlatformCollectionHistory(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) {

@@ -229,9 +229,9 @@ spec:
                 type: string
               pipelineRunRef:
                 type: string
-              sbomReaderRef:
-                type: string
-              sbomRef:
+              sbomUploaded:
+                type: boolean
+              sbomUploaderRef:
                 type: string
               startTime:
                 format: date-time
