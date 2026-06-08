@@ -798,12 +798,12 @@ echo "SBOM uploaded successfully"
 		}
 		bindings = append(bindings, cosignKeyBinding)
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "cosign-key"})
-		cosignTasks[2].Workspaces = append(cosignTasks[2].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "cosign-key", Workspace: "cosign-key"})
+		cosignTasks[3].Workspaces = append(cosignTasks[3].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "cosign-key", Workspace: "cosign-key"})
 	}
 
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.PasswordSecretRef != nil {
-		cosignTasks[2].TaskSpec.TaskSpec.Steps[0].Env = append(
-			cosignTasks[2].TaskSpec.TaskSpec.Steps[0].Env,
+		cosignTasks[3].TaskSpec.TaskSpec.Steps[0].Env = append(
+			cosignTasks[3].TaskSpec.TaskSpec.Steps[0].Env,
 			corev1.EnvVar{
 				Name: "COSIGN_PASSWORD",
 				ValueFrom: &corev1.EnvVarSource{
@@ -827,7 +827,7 @@ echo "SBOM uploaded successfully"
 		}
 		bindings = append(bindings, oidcSecretBinding)
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "oidc-secret"})
-		cosignTasks[2].Workspaces = append(cosignTasks[2].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
+		cosignTasks[3].Workspaces = append(cosignTasks[3].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
 	}
 
 	pipelineRunName := fmt.Sprintf("collection-pipeline-%s", pipeline.Name)
