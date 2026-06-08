@@ -710,7 +710,7 @@ echo "Getting OIDC token..."
 TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
   -d "grant_type=client_credentials" \
   -d "client_id=cli" \
-  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)")
+  -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)")
 
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
 if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
@@ -783,10 +783,20 @@ echo "SBOM uploaded successfully"
 			},
 			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{
 				outputWorkspaceBinding,
-				{Name: "oidc-secret", Workspace: "oidc-secret"},
+				{Name: "tpa-oidc-secret", Workspace: "tpa-oidc-secret"},
 			},
 		}
 		cosignTasks = append(cosignTasks, uploadTask)
+
+		// Add TPA OIDC secret workspace binding
+		tpaOidcSecretBinding := pipelinev1.WorkspaceBinding{
+			Name: "tpa-oidc-secret",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "rhtpa-oidc-cli-secret",
+			},
+		}
+		bindings = append(bindings, tpaOidcSecretBinding)
+		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "tpa-oidc-secret"})
 	}
 
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.KeySecretRef != nil {
