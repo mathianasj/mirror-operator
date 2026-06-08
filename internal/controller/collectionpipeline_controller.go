@@ -690,6 +690,22 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		taskWorkspaceBindings = append(taskWorkspaceBindings, outputWorkspaceBinding)
 	}
 
+	// Dry-run step to generate mapping.txt quickly
+	dryRunStep := pipelinev1.Step{
+		Name:    "dry-run",
+		Image:   mirrorImage,
+		Command: []string{"oc-mirror"},
+		Args: []string{
+			"--config=/workspace/config/" + configMapKey,
+			"--authfile=/workspace/pull-secret/.dockerconfigjson",
+			"file:///workspace/output",
+			"--v2",
+			"--dry-run",
+		},
+		Env: envVars,
+	}
+
+	// Actual mirror step
 	ocMirrorStep := pipelinev1.Step{
 		Name:    "mirror",
 		Image:   mirrorImage,
@@ -703,30 +719,54 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Env: envVars,
 	}
 
-	// Generate SBOM from mirrored images using oc-mirror's mapping.txt
-	// Extract embedded SBOMs from images when available
+	// Generate SBOM using mapping.txt from dry-run and scan images with Syft
 	syftStep := pipelinev1.Step{
 		Name:    "sbom",
 		Image:   mirrorImage,
 		Command: []string{"/bin/sh", "-c"},
 		Args: []string{`
 set -e
-echo "Generating SBOM from mirrored images..."
+echo "=== Generating comprehensive SBOM from mirrored images ==="
 
-# Find the mapping.txt file from oc-mirror results
-MAPPING_FILE=$(find /workspace/output -name "mapping.txt" -type f | head -1)
-if [ -z "$MAPPING_FILE" ]; then
-  echo "Warning: mapping.txt not found, creating empty SBOM"
-  echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"metadata":{"component":{"type":"container","name":"mirror-collection"}},"components":[]}' > /workspace/output/sbom.cyclonedx.json
-  exit 0
+# Find mapping.txt from dry-run output
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  echo "ERROR: mapping.txt not found at expected location"
+  echo "Searching for mapping.txt..."
+  find /workspace/output -name "mapping.txt" -type f
+  MAPPING_FILE=$(find /workspace/output -name "mapping.txt" -type f 2>/dev/null | head -1)
+  if [ -z "$MAPPING_FILE" ]; then
+    echo "No mapping.txt found, creating empty SBOM"
+    echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"metadata":{"component":{"type":"container","name":"mirror-collection"}},"components":[]}' > /workspace/output/sbom.cyclonedx.json
+    exit 0
+  fi
 fi
 
 echo "Found mapping file: $MAPPING_FILE"
+echo "Total images in mapping: $(wc -l < $MAPPING_FILE)"
 
-# Create temporary directory for extracting embedded SBOMs
-mkdir -p /tmp/sboms
+# Scan all tar archives with Syft to extract SBOMs
+mkdir -p /tmp/scans
 
-# Create CycloneDX SBOM structure
+echo "Step 1: Scanning tar archives with Syft..."
+scan_count=0
+for tar_file in /workspace/output/mirror_*.tar; do
+  if [ ! -f "$tar_file" ]; then
+    continue
+  fi
+
+  tar_name=$(basename "$tar_file" .tar)
+  echo "Scanning $tar_name..."
+
+  # Scan tar archive with Syft
+  syft "oci-archive:$tar_file" -o cyclonedx-json > "/tmp/scans/${tar_name}.json" 2>/dev/null && scan_count=$((scan_count + 1)) || echo "  Syft scan failed for $tar_name"
+done
+
+echo "Scanned $scan_count tar archives"
+
+# Step 2: Build SBOM from mapping.txt and scanned data
+echo "Step 2: Building comprehensive SBOM..."
+
 cat > /workspace/output/sbom.cyclonedx.json <<'SBOM_HEADER'
 {
   "bomFormat": "CycloneDX",
@@ -743,162 +783,84 @@ cat > /workspace/output/sbom.cyclonedx.json <<'SBOM_HEADER'
   "components": [
 SBOM_HEADER
 
-# Parse mapping.txt and extract source images (left side of =)
-# Format: source-image=dest-image
 first=true
 component_count=0
-embedded_count=0
+scanned_packages=0
 
+# Parse mapping.txt (format: source=dest)
 while IFS='=' read -r source dest; do
   # Skip empty lines and comments
-  if [ -z "$source" ] || [[ "$source" =~ ^# ]]; then
-    continue
-  fi
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
 
-  # Extract image name and digest/tag
+  # Extract image details
   image_full="$source"
-
-  # Parse registry/repo/name:tag or @sha256:digest
   if [[ "$image_full" =~ @sha256: ]]; then
-    # Has digest
-    image_ref="${image_full##*/}"  # Get last part after /
-    image_name="${image_ref%%@*}"  # Get name before @
-    digest="${image_full##*@}"     # Get digest after @
-    version="$digest"
+    image_ref="${image_full##*/}"
+    image_name="${image_ref%%@*}"
+    version="${image_full##*@}"
   else
-    # Has tag
-    image_ref="${image_full##*/}"  # Get last part after /
-    image_name="${image_ref%%:*}"  # Get name before :
-    tag="${image_ref##*:}"         # Get tag after :
-    version="${tag:-latest}"
+    image_ref="${image_full##*/}"
+    image_name="${image_ref%%:*}"
+    version="${image_ref##*:}"
+    version="${version:-latest}"
   fi
 
-  # Add comma if not first component
-  if [ "$first" = false ]; then
-    echo "," >> /workspace/output/sbom.cyclonedx.json
-  fi
+  # Add comma separator
+  [ "$first" = false ] && echo "," >> /workspace/output/sbom.cyclonedx.json
   first=false
 
-  # Try to find embedded SBOM in tar archives
-  # Look for tar file that might contain this image
-  embedded_sbom=""
-  for tar_file in /workspace/output/*.tar; do
-    if [ ! -f "$tar_file" ]; then
-      continue
-    fi
-
-    # Try to extract SBOM from tar using skopeo
-    # First check if tar contains SBOM attestation or common SBOM paths
-    if tar -tf "$tar_file" 2>/dev/null | grep -q "sbom\|SBOM" 2>/dev/null; then
-      echo "Found potential SBOM in $tar_file for $image_name"
-
-      # Extract any SBOM files
-      sbom_files=$(tar -tf "$tar_file" 2>/dev/null | grep -i "sbom.*\.json\|sbom.*cyclonedx" | head -5)
-      if [ -n "$sbom_files" ]; then
-        for sbom_file in $sbom_files; do
-          tar -xf "$tar_file" -C /tmp/sboms/ "$sbom_file" 2>/dev/null || true
-          if [ -f "/tmp/sboms/$sbom_file" ]; then
-            # Validate it's JSON and has components
-            if jq -e '.components | length > 0' "/tmp/sboms/$sbom_file" >/dev/null 2>&1; then
-              embedded_sbom="/tmp/sboms/$sbom_file"
-              embedded_count=$((embedded_count + 1))
-              echo "Extracted embedded SBOM for $image_name from $sbom_file"
-              break
-            fi
-          fi
-        done
+  # Try to find package data from Syft scans
+  packages="[]"
+  for scan_file in /tmp/scans/*.json; do
+    [ -f "$scan_file" ] || continue
+    # Check if this scan contains our image
+    if grep -q "$image_name" "$scan_file" 2>/dev/null; then
+      packages=$(jq '.components // []' "$scan_file" 2>/dev/null || echo "[]")
+      pkg_count=$(echo "$packages" | jq 'length')
+      if [ "$pkg_count" -gt 0 ]; then
+        scanned_packages=$((scanned_packages + pkg_count))
+        echo "  Found $pkg_count packages for $image_name"
+        break
       fi
     fi
   done
 
-  # Add component entry with embedded SBOM or scan with Syft
-  if [ -n "$embedded_sbom" ]; then
-    # Extract components from embedded SBOM and add as nested components
-    cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
+  # Write component entry
+  cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
     {
       "type": "container",
       "name": "$image_name",
       "version": "$version",
       "purl": "pkg:oci/$image_full",
-      "components": $(jq '.components // []' "$embedded_sbom")
+      "components": $packages
     }
 COMPONENT
-  else
-    # No embedded SBOM - try to scan with Syft
-    echo "No embedded SBOM for $image_name, attempting Syft scan..."
-    scanned_sbom=""
-
-    # Find tar file containing this image and scan it
-    for tar_file in /workspace/output/*.tar; do
-      if [ ! -f "$tar_file" ]; then
-        continue
-      fi
-
-      # Try to scan the tar archive as OCI archive
-      syft_output="/tmp/sboms/${image_name//\//_}_syft.json"
-      if syft "oci-archive:$tar_file" -o cyclonedx-json > "$syft_output" 2>/dev/null; then
-        # Validate the output
-        if jq -e '.components | length > 0' "$syft_output" >/dev/null 2>&1; then
-          scanned_sbom="$syft_output"
-          embedded_count=$((embedded_count + 1))
-          echo "Successfully scanned $image_name with Syft ($(jq '.components | length' "$syft_output") packages)"
-          break
-        fi
-      fi
-    done
-
-    if [ -n "$scanned_sbom" ]; then
-      # Add Syft-scanned components
-      cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
-    {
-      "type": "container",
-      "name": "$image_name",
-      "version": "$version",
-      "purl": "pkg:oci/$image_full",
-      "components": $(jq '.components // []' "$scanned_sbom")
-    }
-COMPONENT
-    else
-      # No SBOM available, just list the image
-      cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
-    {
-      "type": "container",
-      "name": "$image_name",
-      "version": "$version",
-      "purl": "pkg:oci/$image_full"
-    }
-COMPONENT
-    fi
-  fi
 
   component_count=$((component_count + 1))
-
 done < "$MAPPING_FILE"
 
-# Close JSON structure
+# Close JSON
 cat >> /workspace/output/sbom.cyclonedx.json <<'SBOM_FOOTER'
   ]
 }
 SBOM_FOOTER
 
-# Replace placeholders
+# Update placeholders
 sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/" /workspace/output/sbom.cyclonedx.json
 sed -i "s/VERSION_PLACEHOLDER/$(basename /workspace/output)/" /workspace/output/sbom.cyclonedx.json
 
-echo "SBOM generated successfully:"
-echo "  - Total images: $component_count"
-echo "  - Images with package details (embedded + scanned): $embedded_count"
-echo "  - Validating JSON..."
+# Validate and report
+echo "=== SBOM Generation Complete ==="
+echo "  Total images: $component_count"
+echo "  Total packages discovered: $scanned_packages"
 if jq empty /workspace/output/sbom.cyclonedx.json 2>/dev/null; then
-  echo "  - SBOM JSON is valid"
-  total_packages=$(jq '[.components[].components // [] | length] | add // 0' /workspace/output/sbom.cyclonedx.json)
-  echo "  - Total packages across all images: $total_packages"
+  echo "  SBOM JSON is valid"
 else
-  echo "  - WARNING: SBOM JSON may be invalid"
+  echo "  ERROR: SBOM JSON is invalid!"
+  exit 1
 fi
 
-# Cleanup
-rm -rf /tmp/sboms
+rm -rf /tmp/scans
 		`},
 	}
 
@@ -937,7 +899,17 @@ rm -rf /tmp/sboms
 
 	cosignTasks := []pipelinev1.PipelineTask{
 		{
-			Name: "oc-mirror",
+			Name: "dry-run",
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{dryRunStep},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		},
+		{
+			Name:       "oc-mirror",
+			RunAfter:   []string{"dry-run"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{ocMirrorStep},
