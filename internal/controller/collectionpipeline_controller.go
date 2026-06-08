@@ -213,9 +213,14 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	if err := r.Create(ctx, pr); err != nil {
 		logger.Error(err, "failed to create PipelineRun")
+		// If another reconcile already created a PipelineRun, requeue to pick it up
+		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
+	// After Create, pr.Name has the generated name with random suffix
 	now := metav1.Now()
 	pipeline.Status.PipelineRunRef = pr.Name
 	pipeline.Status.Phase = "Pending"
