@@ -1,10 +1,11 @@
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS builder
 
-RUN microdnf install -y tar gzip jq && microdnf clean all
+RUN microdnf install -y tar gzip jq skopeo && microdnf clean all
 
 ARG TARGETARCH=amd64
 ARG COSIGN_VERSION=v2.4.3
 ARG SYFT_VERSION=v1.21.0
+ARG SKOPEO_VERSION=v1.17.0
 ARG OCP_VERSION=latest
 
 RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/openshift-client-linux.tar.gz \
@@ -24,7 +25,7 @@ RUN chown root:root /usr/local/bin/* && chmod +x /usr/local/bin/*
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
-RUN microdnf install -y tar gzip jq && microdnf clean all
+RUN microdnf install -y tar gzip jq skopeo && microdnf clean all
 
 COPY --from=builder /usr/local/bin/oc /usr/local/bin/oc
 COPY --from=builder /usr/local/bin/kubectl /usr/local/bin/kubectl

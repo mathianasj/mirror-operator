@@ -84,8 +84,16 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Check for trigger annotation to start a new collection
 	if triggerValue, exists := pipeline.Annotations["mirror.mathianasj.github.com/trigger"]; exists {
 		// If there's a completed/failed run, reset status to trigger new run
-		if pipeline.Status.PipelineRunRef != "" && (pipeline.Status.Phase == "Succeeded" || pipeline.Status.Phase == "Failed" || pipeline.Status.Phase == "Stale") {
+		if pipeline.Status.PipelineRunRef != "" && (pipeline.Status.Phase == "Succeeded" || pipeline.Status.Phase == "Complete" || pipeline.Status.Phase == "Failed" || pipeline.Status.Phase == "Stale") {
 			logger.Info("Trigger annotation detected, starting new collection", "trigger", triggerValue, "previous-run", pipeline.Status.PipelineRunRef)
+
+			// Remove trigger annotation to prevent continuous re-triggering
+			delete(pipeline.Annotations, "mirror.mathianasj.github.com/trigger")
+			if err := r.Update(ctx, pipeline); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Reset status to allow new run creation
 			pipeline.Status.PipelineRunRef = ""
 			pipeline.Status.Version = ""
 			pipeline.Status.Phase = ""
@@ -221,11 +229,26 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// After Create, pr.Name has the generated name with random suffix
+	// Refetch to ensure no other reconcile set PipelineRunRef
+	latest := &mirrorv1.CollectionPipeline{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pipeline.Name, Namespace: pipeline.Namespace}, latest); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// If another reconcile already set PipelineRunRef, delete our PipelineRun and requeue
+	if latest.Status.PipelineRunRef != "" && latest.Status.PipelineRunRef != pr.Name {
+		logger.Info("Another reconcile already created PipelineRun, cleaning up duplicate", "ours", pr.Name, "theirs", latest.Status.PipelineRunRef)
+		if err := r.Delete(ctx, pr); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete duplicate PipelineRun")
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	now := metav1.Now()
-	pipeline.Status.PipelineRunRef = pr.Name
-	pipeline.Status.Phase = "Pending"
-	pipeline.Status.StartTime = &now
-	return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+	latest.Status.PipelineRunRef = pr.Name
+	latest.Status.Phase = "Pending"
+	latest.Status.StartTime = &now
+	return ctrl.Result{}, r.Status().Update(ctx, latest)
 }
 
 func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
@@ -346,17 +369,16 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 		return nil
 	}
 
-	// Determine PVC name: use explicit name if provided, otherwise generate from pipeline name
-	pvcName := output.PVC
-	if pvcName == "" {
-		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
-	}
-
-	// For incremental collections, check if we should reuse the base version's PVC
-	// This allows oc-mirror to calculate deltas from previous collections
+	// Determine PVC name with 1:1 mapping to pipeline
+	// For incremental collections, reuse the base version's PVC
+	var pvcName string
 	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
 		// Use the base version's PVC name for incremental builds
 		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+	} else {
+		// Each CollectionPipeline gets its own PVC (1:1 mapping)
+		// Always append pipeline name to ensure uniqueness, even if user provides a base name
+		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
 	}
 
 	existing := &corev1.PersistentVolumeClaim{}
@@ -379,7 +401,7 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 			Name:      pvcName,
 			Namespace: pipeline.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "mirror-operator",
+				"app.kubernetes.io/managed-by":            "mirror-operator",
 				"mirror.mathianasj.github.com/collection": pipeline.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -439,13 +461,14 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 
 	output := pipeline.Spec.Storage.Output
 	if output != nil {
-		// Determine PVC name: explicit name, generated name, or base version's PVC for incremental
-		pvcName := output.PVC
-		if pvcName == "" {
-			pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
-		}
+		// Determine PVC name with 1:1 mapping to pipeline
+		var pvcName string
 		if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+			// Use the base version's PVC name for incremental builds
 			pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+		} else {
+			// Each CollectionPipeline gets its own PVC (1:1 mapping)
+			pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
 		}
 
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "output"})
@@ -524,6 +547,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			"--v2",
 			"--config=/workspace/config/" + configMapKey,
 			"--authfile=/workspace/pull-secret/.dockerconfigjson",
+			"--cache-dir=/workspace/output/.cache",
 			"--dry-run",
 			"file:///workspace/output",
 		},
@@ -539,12 +563,14 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			"--v2",
 			"--config=/workspace/config/" + configMapKey,
 			"--authfile=/workspace/pull-secret/.dockerconfigjson",
+			"--cache-dir=/workspace/output/.cache",
 			"file:///workspace/output",
 		},
 		Env: envVars,
 	}
 
-	// Generate SBOM using mapping.txt from dry-run and scan images with Syft
+	// Generate SBOM by scanning images from the oc-mirror cache during mirror operation
+	// Prefer embedded SBOMs when available, fall back to Syft scanning
 	syftStep := pipelinev1.Step{
 		Name:    "sbom",
 		Image:   mirrorImage,
@@ -553,13 +579,11 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 set -e
 echo "=== Generating comprehensive SBOM from mirrored images ==="
 
-# Find mapping.txt from dry-run output
+# Use mapping.txt from dry-run step (it contains the complete list of images that were mirrored)
 MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
 if [ ! -f "$MAPPING_FILE" ]; then
-  echo "ERROR: mapping.txt not found at expected location"
   echo "Searching for mapping.txt..."
-  find /workspace/output -name "mapping.txt" -type f
-  MAPPING_FILE=$(find /workspace/output -name "mapping.txt" -type f 2>/dev/null | head -1)
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
   if [ -z "$MAPPING_FILE" ]; then
     echo "No mapping.txt found, creating empty SBOM"
     echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"metadata":{"component":{"type":"container","name":"mirror-collection"}},"components":[]}' > /workspace/output/sbom.cyclonedx.json
@@ -568,31 +592,128 @@ if [ ! -f "$MAPPING_FILE" ]; then
 fi
 
 echo "Found mapping file: $MAPPING_FILE"
-echo "Total images in mapping: $(wc -l < $MAPPING_FILE)"
+image_count=$(wc -l < "$MAPPING_FILE")
+echo "Total images in mapping: $image_count"
 
-# Scan all tar archives with Syft to extract SBOMs
-mkdir -p /tmp/scans
+# Scan images from the persistent cache directory in the output workspace
+# oc-mirror stores images in cache-dir/.oc-mirror/.cache with docker/registry/v2 structure
+CACHE_DIR="/workspace/output/.cache/.oc-mirror/.cache"
+echo "Using cache directory: $CACHE_DIR"
 
-echo "Step 1: Scanning tar archives with Syft..."
-scan_count=0
-for tar_file in /workspace/output/mirror_*.tar; do
-  if [ ! -f "$tar_file" ]; then
-    continue
+# Create SBOM cache directory for storing per-image SBOMs (keyed by digest)
+SBOM_CACHE_DIR="/workspace/output/sbom-cache"
+mkdir -p "$SBOM_CACHE_DIR"
+mkdir -p /tmp/sboms
+
+echo "Step 1: Extracting SBOMs from images using local registry sidecar..."
+echo "SBOM cache directory: $SBOM_CACHE_DIR"
+
+# Wait for registry sidecar to be ready
+echo "Waiting for local registry to start..."
+for i in {1..30}; do
+  if curl -s http://localhost:5000/v2/ >/dev/null 2>&1; then
+    echo "Registry is ready"
+    break
   fi
-
-  tar_name=$(basename "$tar_file" .tar)
-  echo "Scanning $tar_name..."
-
-  # Try scanning as docker-archive (oc-mirror v2 uses Docker save format)
-  if syft "docker-archive:$tar_file" -o cyclonedx-json > "/tmp/scans/${tar_name}.json" 2>&1; then
-    scan_count=$((scan_count + 1))
-    echo "  Successfully scanned $tar_name"
-  else
-    echo "  Syft scan failed for $tar_name"
-  fi
+  echo "  Waiting for registry... ($i/30)"
+  sleep 2
 done
 
-echo "Scanned $scan_count tar archives"
+scan_count=0
+embedded_count=0
+scanned_packages=0
+current_image=0
+
+mkdir -p /tmp/sboms
+
+# Read mapping.txt and process each unique image from the local registry
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  current_image=$((current_image + 1))
+
+  # The dest format is: docker://localhost:55000/openshift/release@sha256:xxx
+  # Strip docker:// and change to registry: transport, port 55000 -> 5000
+  dest_no_proto="${dest#docker://}"
+  local_image="registry:${dest_no_proto//localhost:55000/localhost:5000}"
+
+  echo "  [$current_image/$image_count] Processing: $source"
+
+  # Extract digest from dest (format: docker://localhost:55000/repo/path@sha256:digest)
+  image_digest=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+
+  sbom_file="/tmp/sboms/$(echo "$dest_no_proto" | tr '/:@' '_').json"
+  found_sbom=false
+
+  # Check cache first if we have a digest
+  if [ -n "$image_digest" ]; then
+    cached_sbom="$SBOM_CACHE_DIR/$(echo "$image_digest" | tr ':' '_').json"
+    if [ -f "$cached_sbom" ]; then
+      cp "$cached_sbom" "$sbom_file"
+      pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
+      if [ "$pkg_count" -gt 0 ]; then
+        echo "    ✓ Using cached SBOM ($pkg_count packages)"
+        scan_count=$((scan_count + 1))
+        scanned_packages=$((scanned_packages + pkg_count))
+        found_sbom=true
+      fi
+    fi
+  fi
+
+  # Try to extract embedded SBOM using cosign (try modern attestations first, then deprecated attachments)
+  # (cosign doesn't use protocol prefix, just registry:port/path)
+  cosign_ref="${dest_no_proto//localhost:55000/localhost:5000}"
+
+  # Try attestations (modern approach)
+  if cosign download attestation "$cosign_ref" --predicate-type=https://spdx.dev/Document > "$sbom_file" 2>/dev/null; then
+    pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
+    if [ "$pkg_count" -gt 0 ]; then
+      embedded_count=$((embedded_count + 1))
+      scanned_packages=$((scanned_packages + pkg_count))
+      echo "    ✓ Extracted SBOM attestation ($pkg_count packages)"
+      found_sbom=true
+    fi
+  fi
+
+  # Try deprecated SBOM attachments if attestation not found
+  if [ "$found_sbom" = false ] && cosign download sbom "$cosign_ref" > "$sbom_file" 2>/dev/null; then
+    pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
+    if [ "$pkg_count" -gt 0 ]; then
+      embedded_count=$((embedded_count + 1))
+      scanned_packages=$((scanned_packages + pkg_count))
+      echo "    ✓ Extracted SBOM attachment ($pkg_count packages)"
+      found_sbom=true
+    fi
+  fi
+
+  # If no embedded SBOM, scan with Syft using registry: transport
+  if [ "$found_sbom" = false ]; then
+    if syft "$local_image" -o cyclonedx-json > "$sbom_file" 2>&1; then
+      pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
+      if [ "$pkg_count" -gt 0 ]; then
+        scan_count=$((scan_count + 1))
+        scanned_packages=$((scanned_packages + pkg_count))
+        echo "    ✓ Scanned with Syft ($pkg_count packages)"
+        found_sbom=true
+      fi
+    else
+      echo "    ✗ Syft scan failed"
+    fi
+  fi
+
+  # Cache the SBOM if we successfully generated/extracted one
+  if [ "$found_sbom" = true ] && [ -n "$image_digest" ] && [ -f "$sbom_file" ]; then
+    cached_sbom="$SBOM_CACHE_DIR/$(echo "$image_digest" | tr ':' '_').json"
+    cp "$sbom_file" "$cached_sbom" 2>/dev/null || true
+  fi
+
+  if [ "$found_sbom" = false ]; then
+    echo "    ✗ Could not scan image, will include metadata only"
+    rm -f "$sbom_file"
+  fi
+done < "$MAPPING_FILE"
+
+echo "Processed images: $embedded_count embedded SBOMs, $scan_count Syft scans, $scanned_packages total packages"
 
 # Step 2: Build SBOM from mapping.txt and scanned data
 echo "Step 2: Building comprehensive SBOM..."
@@ -639,21 +760,17 @@ while IFS='=' read -r source dest; do
   [ "$first" = false ] && echo "," >> /workspace/output/sbom.cyclonedx.json
   first=false
 
-  # Try to find package data from Syft scans
+  # Try to find package data from extracted/scanned SBOMs
   packages="[]"
-  for scan_file in /tmp/scans/*.json; do
-    [ -f "$scan_file" ] || continue
-    # Check if this scan contains our image
-    if grep -q "$image_name" "$scan_file" 2>/dev/null; then
-      packages=$(jq '.components // []' "$scan_file" 2>/dev/null || echo "[]")
-      pkg_count=$(echo "$packages" | jq 'length')
-      if [ "$pkg_count" -gt 0 ]; then
-        scanned_packages=$((scanned_packages + pkg_count))
-        echo "  Found $pkg_count packages for $image_name"
-        break
-      fi
+  sbom_file="/tmp/sboms/$(echo "$dest" | tr '/:@' '_').json"
+  if [ -f "$sbom_file" ]; then
+    packages=$(jq '.components // []' "$sbom_file" 2>/dev/null || echo "[]")
+    pkg_count=$(echo "$packages" | jq 'length // 0')
+    if [ "$pkg_count" -gt 0 ]; then
+      scanned_packages=$((scanned_packages + pkg_count))
+      echo "  Found $pkg_count packages for $image_name"
     fi
-  done
+  fi
 
   # Write component entry
   cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
@@ -690,8 +807,14 @@ else
   exit 1
 fi
 
-rm -rf /tmp/scans
+rm -rf /tmp/sboms
 		`},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "SYFT_CACHE_DIR",
+				Value: "/workspace/output/syft-cache",
+			},
+		},
 	}
 
 	// Build signing step based on configuration
@@ -731,7 +854,7 @@ rm -rf /tmp/scans
 	var uploadSbomStep *pipelinev1.Step
 	tpaHostname, keycloakHost := r.getTPAAndKeycloakHosts(ctx)
 	if tpaHostname != "" && keycloakHost != "" {
-		tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
+		tpaURL := fmt.Sprintf("https://%s/api/v2/sbom", tpaHostname)
 		tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
 
 		uploadSbomStep = &pipelinev1.Step{
@@ -749,7 +872,7 @@ fi
 echo "Getting OIDC token..."
 TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
   -d "grant_type=client_credentials" \
-  -d "client_id=cli" \
+  -d "client_id=sbom-uploader" \
   -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)")
 
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
@@ -759,12 +882,20 @@ if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
 fi
 
 echo "Uploading SBOM to TPA..."
-curl -k -v -X POST "%s" \
+UPLOAD_URL="%s?format=cyclonedx&labels="
+HTTP_CODE=$(curl -k -s -w "%%{http_code}" -o /tmp/upload_response.txt -X POST "$UPLOAD_URL" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @/workspace/output/sbom.cyclonedx.json
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @/workspace/output/sbom.cyclonedx.json)
 
-echo "SBOM uploaded successfully"
+if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+  echo "SBOM uploaded successfully (HTTP $HTTP_CODE)"
+  cat /tmp/upload_response.txt
+else
+  echo "SBOM upload failed with HTTP $HTTP_CODE"
+  cat /tmp/upload_response.txt
+  exit 1
+fi
 			`, tokenURL, tpaURL)},
 		}
 	}
@@ -795,9 +926,25 @@ echo "SBOM uploaded successfully"
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{syftStep},
+					Sidecars: []pipelinev1.Sidecar{
+						{
+							Name:  "registry",
+							Image: "registry:2",
+							Env: []corev1.EnvVar{
+								{
+									Name:  "REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY",
+									Value: "/workspace/output/.cache/.oc-mirror/.cache",
+								},
+								{
+									Name:  "REGISTRY_HTTP_ADDR",
+									Value: "0.0.0.0:5000",
+								},
+							},
+						},
+					},
 				},
 			},
-			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding},
+			Workspaces: taskWorkspaceBindings,
 		},
 		{
 			Name:     "cosign-sign",
@@ -828,11 +975,11 @@ echo "SBOM uploaded successfully"
 		}
 		cosignTasks = append(cosignTasks, uploadTask)
 
-		// Add TPA OIDC secret workspace binding
+		// Add TPA OIDC secret workspace binding (using dedicated sbom-uploader client)
 		tpaOidcSecretBinding := pipelinev1.WorkspaceBinding{
 			Name: "tpa-oidc-secret",
 			Secret: &corev1.SecretVolumeSource{
-				SecretName: "rhtpa-oidc-cli-secret",
+				SecretName: "sbom-uploader-secret",
 			},
 		}
 		bindings = append(bindings, tpaOidcSecretBinding)

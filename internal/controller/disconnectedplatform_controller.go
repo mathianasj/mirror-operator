@@ -533,12 +533,28 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 								var tokenResult map[string]interface{}
 								if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil {
 									if adminToken, ok := tokenResult["access_token"].(string); ok && adminToken != "" {
-										// Ensure read-only scope exists
+										// Ensure read-only and create scopes exist
 										if err := r.ensureTrustifyReadOnlyScope(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
 											log.FromContext(ctx).Error(err, "Failed to ensure read-only scope")
 										}
+										if err := r.ensureTrustifyCreateScope(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to ensure create scope")
+										}
 
-										// Assign scope to frontend and CLI clients
+										appDomain := "rhtpa." + domain
+
+										// Ensure all OIDC clients exist (frontend, cli, sbom-uploader)
+										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "frontend", appDomain, adminToken, httpClient, true); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to ensure frontend OIDC client")
+										}
+										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "cli", appDomain, adminToken, httpClient, false); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to ensure CLI OIDC client")
+										}
+										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "sbom-uploader", appDomain, adminToken, httpClient, false); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to ensure SBOM uploader OIDC client")
+										}
+
+										// Assign scope to frontend, CLI, and sbom-uploader clients
 										if err := r.assignScopeToTrustifyClients(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
 											log.FromContext(ctx).Error(err, "Failed to assign scope to clients")
 										}
@@ -995,9 +1011,13 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.
 		logger.Info("Successfully created trustify realm")
 	}
 
-	// Create read-only client scope for Trustify authorization (read:document only, no write access)
+	// Create read-only and create client scopes for Trustify authorization
 	if err := r.ensureTrustifyReadOnlyScope(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
 		logger.Error(err, "failed to create read-only client scope", "realm", realmName)
+		// Continue even if scope creation fails - it might already exist
+	}
+	if err := r.ensureTrustifyCreateScope(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
+		logger.Error(err, "failed to create create:document client scope", "realm", realmName)
 		// Continue even if scope creation fails - it might already exist
 	}
 
@@ -1009,6 +1029,11 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.
 	// Create CLI confidential OIDC client
 	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "cli", appDomain, adminToken, httpClient, false); err != nil {
 		return fmt.Errorf("failed to create CLI OIDC client: %w", err)
+	}
+
+	// Create SBOM uploader confidential OIDC client for CollectionPipeline SBOM uploads
+	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "sbom-uploader", appDomain, adminToken, httpClient, false); err != nil {
+		return fmt.Errorf("failed to create SBOM uploader OIDC client: %w", err)
 	}
 
 	return nil
@@ -1075,6 +1100,72 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyReadOnlyScope(ctx context
 		}
 
 		logger.Info("Created read-only client scope", "scope", scopeName, "realm", realmName)
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureTrustifyCreateScope(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Create the create:document client scope for write access to Trustify APIs (SBOM uploads)
+	scopeName := "create:document"
+
+	// Check if scope already exists
+	scopesURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", scopesURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to list client scopes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var scopes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&scopes); err != nil {
+		return fmt.Errorf("failed to decode client scopes: %w", err)
+	}
+
+	// Check if scope already exists
+	scopeExists := false
+	for _, scope := range scopes {
+		if name, ok := scope["name"].(string); ok && name == scopeName {
+			scopeExists = true
+			logger.Info("Client scope already exists", "scope", scopeName, "realm", realmName)
+			break
+		}
+	}
+
+	if !scopeExists {
+		// Create the client scope
+		scopeConfig := map[string]interface{}{
+			"name":        scopeName,
+			"description": "Write access to Trustify documents (create SBOMs, advisories, etc.)",
+			"protocol":    "openid-connect",
+			"attributes": map[string]interface{}{
+				"include.in.token.scope":    "true",
+				"display.on.consent.screen": "false",
+			},
+		}
+
+		scopeJSON, _ := json.Marshal(scopeConfig)
+		req, _ = http.NewRequest("POST", scopesURL, bytes.NewReader(scopeJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create client scope: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create client scope: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		logger.Info("Created create:document client scope", "scope", scopeName, "realm", realmName)
 	}
 
 	return nil
@@ -1261,11 +1352,22 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 		}
 	}
 
-	// Store CLI client secret if this is the CLI client
-	if !isPublic && clientSecret != "" && clientID == "cli" {
+	// Store client secret if this is a confidential client (CLI or SBOM uploader)
+	if !isPublic && clientSecret != "" {
+		var secretName string
+		switch clientID {
+		case "cli":
+			secretName = "rhtpa-oidc-cli-secret"
+		case "sbom-uploader":
+			secretName = "sbom-uploader-secret"
+		default:
+			// Don't store secrets for other clients
+			return nil
+		}
+
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "rhtpa-oidc-cli-secret",
+				Name:      secretName,
 				Namespace: architectNamespace,
 			},
 			StringData: map[string]string{
@@ -1276,16 +1378,16 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 		existingSecret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(secret), existingSecret); apierrors.IsNotFound(err) {
 			if err := r.Create(ctx, secret); err != nil {
-				return fmt.Errorf("failed to create CLI client secret: %w", err)
+				return fmt.Errorf("failed to create %s client secret: %w", clientID, err)
 			}
-			logger.Info("Created CLI client secret", "secretName", secret.Name)
+			logger.Info("Created client secret", "clientId", clientID, "secretName", secret.Name)
 		} else if err == nil {
 			// Update existing secret
 			existingSecret.StringData = secret.StringData
 			if err := r.Update(ctx, existingSecret); err != nil {
-				return fmt.Errorf("failed to update CLI client secret: %w", err)
+				return fmt.Errorf("failed to update %s client secret: %w", clientID, err)
 			}
-			logger.Info("Updated CLI client secret", "secretName", secret.Name)
+			logger.Info("Updated client secret", "clientId", clientID, "secretName", secret.Name)
 		}
 	}
 
@@ -1295,8 +1397,9 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
 	logger := log.FromContext(ctx)
 
-	// Assign read:document scope to both frontend and CLI clients
-	for _, clientID := range []string{"frontend", "cli"} {
+	// Assign read:document scope to frontend and CLI clients
+	// Assign both read:document and create:document to sbom-uploader for pipeline uploads
+	for _, clientID := range []string{"frontend", "cli", "sbom-uploader"} {
 		// Get client UUID
 		clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
 		req, _ := http.NewRequest("GET", clientsURL, nil)
@@ -1322,11 +1425,20 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 
 		clientUUID := clients[0]["id"].(string)
 
-		// Assign scope to client
+		// Assign read:document scope to all clients
 		if err := r.assignReadScopeToClient(ctx, keycloakHost, realmName, clientUUID, adminToken, httpClient); err != nil {
 			logger.Error(err, "failed to assign read scope", "clientId", clientID)
 		} else {
 			logger.Info("Assigned read:document scope to client", "clientId", clientID)
+		}
+
+		// Additionally assign create:document scope to sbom-uploader for SBOM uploads
+		if clientID == "sbom-uploader" {
+			if err := r.assignScopeToClient(ctx, keycloakHost, realmName, clientUUID, "create:document", adminToken, httpClient); err != nil {
+				logger.Error(err, "failed to assign create scope", "clientId", clientID)
+			} else {
+				logger.Info("Assigned create:document scope to client", "clientId", clientID)
+			}
 		}
 	}
 
@@ -1334,9 +1446,13 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 }
 
 func (r *DisconnectedPlatformReconciler) assignReadScopeToClient(ctx context.Context, keycloakHost, realmName, clientUUID, adminToken string, httpClient *http.Client) error {
+	return r.assignScopeToClient(ctx, keycloakHost, realmName, clientUUID, "read:document", adminToken, httpClient)
+}
+
+func (r *DisconnectedPlatformReconciler) assignScopeToClient(ctx context.Context, keycloakHost, realmName, clientUUID, scopeName, adminToken string, httpClient *http.Client) error {
 	logger := log.FromContext(ctx)
 
-	// Get the read:document scope UUID
+	// Get the scope UUID
 	scopeListURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes", keycloakHost, realmName)
 	scopeReq, _ := http.NewRequest("GET", scopeListURL, nil)
 	scopeReq.Header.Set("Authorization", "Bearer "+adminToken)
@@ -1358,21 +1474,21 @@ func (r *DisconnectedPlatformReconciler) assignReadScopeToClient(ctx context.Con
 		return fmt.Errorf("failed to decode client scopes response: %w", err)
 	}
 
-	// Find read:document scope UUID
-	var readScopeUUID string
+	// Find scope UUID
+	var scopeUUID string
 	for _, scope := range scopes {
-		if scope["name"] == "read:document" {
-			readScopeUUID = scope["id"].(string)
+		if scope["name"] == scopeName {
+			scopeUUID = scope["id"].(string)
 			break
 		}
 	}
 
-	if readScopeUUID == "" {
-		return fmt.Errorf("read:document scope not found")
+	if scopeUUID == "" {
+		return fmt.Errorf("%s scope not found", scopeName)
 	}
 
 	// Assign scope as default client scope
-	assignURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/default-client-scopes/%s", keycloakHost, realmName, clientUUID, readScopeUUID)
+	assignURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/default-client-scopes/%s", keycloakHost, realmName, clientUUID, scopeUUID)
 	assignReq, _ := http.NewRequest("PUT", assignURL, nil)
 	assignReq.Header.Set("Authorization", "Bearer "+adminToken)
 	assignReq.Header.Set("Content-Type", "application/json")
