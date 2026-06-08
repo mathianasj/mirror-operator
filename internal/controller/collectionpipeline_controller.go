@@ -1,17 +1,24 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -394,8 +401,194 @@ func (r *CollectionPipelineReconciler) finalizeSbomExtraction(ctx context.Contex
 		return ctrl.Result{}, err
 	}
 
+	// Upload SBOM to TPA if available
+	if sbomConfigMapName != "" {
+		if err := r.uploadSbomToTPA(ctx, pipeline, sbomConfigMapName); err != nil {
+			log.FromContext(ctx).Error(err, "failed to upload SBOM to TPA", "configMap", sbomConfigMapName)
+			// Don't fail the pipeline if SBOM upload fails, just log it
+		}
+	}
+
 	r.updatePlatformCollectionHistory(ctx, pipeline)
 	return ctrl.Result{}, nil
+}
+
+func (r *CollectionPipelineReconciler) uploadSbomToTPA(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, sbomConfigMapName string) error {
+	logger := log.FromContext(ctx)
+
+	// Get the SBOM from the ConfigMap
+	sbomConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      sbomConfigMapName,
+		Namespace: pipeline.Namespace,
+	}, sbomConfigMap); err != nil {
+		return fmt.Errorf("failed to get SBOM ConfigMap: %w", err)
+	}
+
+	sbomData, ok := sbomConfigMap.Data["sbom.cyclonedx.json"]
+	if !ok || sbomData == "" {
+		return fmt.Errorf("SBOM data not found in ConfigMap")
+	}
+
+	// Find TPA instance to get the API URL
+	tpaList := &unstructured.UnstructuredList{}
+	tpaList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "charts.trustification.dev",
+		Version: "v1alpha1",
+		Kind:    "TrustedProfileAnalyzerList",
+	})
+	if err := r.List(ctx, tpaList); err != nil {
+		return fmt.Errorf("failed to list TPA instances: %w", err)
+	}
+
+	if len(tpaList.Items) == 0 {
+		logger.Info("No TPA instance found, skipping SBOM upload")
+		return nil
+	}
+
+	// Find the TPA Ingress to get the hostname
+	tpa := tpaList.Items[0]
+	tpaUID := tpa.GetUID()
+
+	ingressList := &unstructured.UnstructuredList{}
+	ingressList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.k8s.io",
+		Version: "v1",
+		Kind:    "IngressList",
+	})
+	if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err != nil {
+		return fmt.Errorf("failed to list Ingresses: %w", err)
+	}
+
+	var tpaHostname string
+	for _, ingress := range ingressList.Items {
+		owners := ingress.GetOwnerReferences()
+		for _, owner := range owners {
+			if owner.UID == tpaUID {
+				rules, found, _ := unstructured.NestedSlice(ingress.Object, "spec", "rules")
+				if found && len(rules) > 0 {
+					if rule, ok := rules[0].(map[string]interface{}); ok {
+						if host, ok := rule["host"].(string); ok {
+							tpaHostname = host
+							break
+						}
+					}
+				}
+			}
+		}
+		if tpaHostname != "" {
+			break
+		}
+	}
+
+	if tpaHostname == "" {
+		return fmt.Errorf("TPA hostname not found in Ingress resources")
+	}
+
+	// Get OIDC token using CLI client credentials
+	token, err := r.getTPAOIDCToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get OIDC token: %w", err)
+	}
+
+	// Upload SBOM to TPA
+	tpaURL := fmt.Sprintf("https://%s/api/v1/sbom", tpaHostname)
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequest("POST", tpaURL, bytes.NewBufferString(sbomData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to upload SBOM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("TPA API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully uploaded SBOM to TPA", "url", tpaURL, "configMap", sbomConfigMapName)
+	return nil
+}
+
+func (r *CollectionPipelineReconciler) getTPAOIDCToken(ctx context.Context) (string, error) {
+	// Get Keycloak hostname from cluster ingress
+	ingress := &unstructured.Unstructured{}
+	ingress.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Ingress",
+	})
+	ingress.SetName("cluster")
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
+		return "", fmt.Errorf("failed to get cluster ingress: %w", err)
+	}
+
+	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
+	keycloakHost := "keycloak." + domain
+	tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
+
+	// Get CLI client secret
+	cliSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      "rhtpa-oidc-cli-secret",
+		Namespace: architectNamespace,
+	}, cliSecret); err != nil {
+		return "", fmt.Errorf("failed to get CLI client secret: %w", err)
+	}
+
+	clientSecret := string(cliSecret.Data["clientSecret"])
+	if clientSecret == "" {
+		return "", fmt.Errorf("CLI client secret is empty")
+	}
+
+	// Request token using client credentials flow
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	tokenData := url.Values{}
+	tokenData.Set("grant_type", "client_credentials")
+	tokenData.Set("client_id", "cli")
+	tokenData.Set("client_secret", clientSecret)
+
+	resp, err := httpClient.PostForm(tokenURL, tokenData)
+	if err != nil {
+		return "", fmt.Errorf("failed to request token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResult map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResult); err != nil {
+		return "", fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	accessToken, ok := tokenResult["access_token"].(string)
+	if !ok || accessToken == "" {
+		return "", fmt.Errorf("no access token in response")
+	}
+
+	return accessToken, nil
 }
 
 func (r *CollectionPipelineReconciler) updatePlatformCollectionHistory(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) {
