@@ -479,11 +479,11 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Image:   mirrorImage,
 		Command: []string{"oc-mirror"},
 		Args: []string{
+			"--v2",
 			"--config=/workspace/config/" + configMapKey,
 			"--authfile=/workspace/pull-secret/.dockerconfigjson",
-			"file:///workspace/output",
-			"--v2",
 			"--dry-run",
+			"file:///workspace/output",
 		},
 		Env: envVars,
 	}
@@ -494,10 +494,10 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Image:   mirrorImage,
 		Command: []string{"oc-mirror"},
 		Args: []string{
+			"--v2",
 			"--config=/workspace/config/" + configMapKey,
 			"--authfile=/workspace/pull-secret/.dockerconfigjson",
 			"file:///workspace/output",
-			"--v2",
 		},
 		Env: envVars,
 	}
