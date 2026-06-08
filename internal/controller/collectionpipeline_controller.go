@@ -830,11 +830,11 @@ echo "SBOM uploaded successfully"
 		cosignTasks[3].Workspaces = append(cosignTasks[3].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
 	}
 
-	pipelineRunName := fmt.Sprintf("collection-pipeline-%s", pipeline.Name)
+	pipelineRunNamePrefix := fmt.Sprintf("collection-pipeline-%s-", pipeline.Name)
 	pr := &pipelinev1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      pipelineRunName,
-			Namespace: pipeline.Namespace,
+			GenerateName: pipelineRunNamePrefix,
+			Namespace:    pipeline.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
 			},
