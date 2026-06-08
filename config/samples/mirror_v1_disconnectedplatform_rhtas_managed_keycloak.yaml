@@ -28,8 +28,8 @@ spec:
           realm: "trusted-artifact-signer"  # Optional, defaults to "trusted-artifact-signer"
           # REQUIRED (unless using tlsSecret): Specify cert-manager issuer for TLS certificates
           certIssuer:
-            name: letsencrypt-prod     # Name of your ClusterIssuer or Issuer
-            kind: ClusterIssuer        # or "Issuer" for namespace-scoped
+            name: letsencrypt-production-ec2     # Name of your ClusterIssuer or Issuer
+            kind: ClusterIssuer                  # or "Issuer" for namespace-scoped
           # tlsSecret:  # Alternative - use custom TLS secret instead of cert-manager
           #   name: my-keycloak-tls
         type: "email"       # Optional, defaults to "email" for managed

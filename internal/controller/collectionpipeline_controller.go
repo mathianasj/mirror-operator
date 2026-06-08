@@ -771,6 +771,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 func (r *CollectionPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mirrorv1.CollectionPipeline{}).
+		Owns(&pipelinev1.PipelineRun{}).
 		Owns(&batchv1.Job{}).
 		Complete(r)
 }

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -173,6 +174,16 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	if keycloakReady {
 		if err := r.reconcileManagedKeycloak(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile managed Keycloak")
+			platform.Status.Phase = mirrorv1.PlatformPhaseError
+			r.setErrorCondition(platform, "ManagedKeycloakFailed", err.Error())
+			return ctrl.Result{}, r.Status().Update(ctx, platform)
+		}
+		// Check if Keycloak instance is actually ready
+		if err := r.checkKeycloakHealth(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "Keycloak instance not healthy")
+			platform.Status.Phase = mirrorv1.PlatformPhaseError
+			r.setErrorCondition(platform, "KeycloakNotHealthy", err.Error())
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, platform)
 		}
 	}
 	if signingImages {
@@ -208,6 +219,7 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	if err := r.reconcileArchitect(ctx, platform); err != nil {
 		log.FromContext(ctx).Error(err, "failed to reconcile airgap-architect")
 		platform.Status.Phase = mirrorv1.PlatformPhaseError
+		r.setErrorCondition(platform, "ArchitectReconcileFailed", err.Error())
 		return ctrl.Result{}, r.Status().Update(ctx, platform)
 	}
 
@@ -259,7 +271,18 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		Name: "disconnected-platform", Status: "Running",
 	})
 
-	return ctrl.Result{}, r.Status().Update(ctx, platform)
+	// Set Ready condition to true if no errors
+	r.setReadyCondition(platform, "ReconciliationSucceeded", "All components reconciled successfully")
+
+	// Only update status if it changed
+	if err := r.Status().Update(ctx, platform); err != nil {
+		// Ignore conflict errors - another reconciliation already updated it
+		if !apierrors.IsConflict(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
 }
 
 func collectionVersionComplete(phase string) bool {
@@ -442,7 +465,7 @@ func (r *DisconnectedPlatformReconciler) csvStatus(ctx context.Context, op opera
 
 func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	cfg := platform.Spec.Connected.RHTPA
-	if cfg == nil || cfg.Storage == nil || cfg.Database == nil {
+	if cfg == nil || cfg.Storage == nil {
 		return nil
 	}
 
@@ -456,14 +479,84 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	existingTPA.SetNamespace(architectNamespace)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(existingTPA), existingTPA); err == nil {
-		// Check if authenticator is configured
-		auth, found, _ := unstructured.NestedMap(existingTPA.Object, "spec", "authenticator")
-		if found && len(auth) > 0 {
-			// TPA already has OIDC configured, nothing to do
-			return nil
+		// Check if OIDC is configured
+		oidc, found, _ := unstructured.NestedMap(existingTPA.Object, "spec", "oidc")
+		if found && len(oidc) > 0 {
+			// Check if modules.createDatabase and modules.migrateDatabase are enabled
+			modules, found, _ := unstructured.NestedMap(existingTPA.Object, "spec", "modules")
+			if found {
+				createDB, found, _ := unstructured.NestedMap(modules, "createDatabase")
+				migrateDB, found2, _ := unstructured.NestedMap(modules, "migrateDatabase")
+
+				createDBEnabled, _, _ := unstructured.NestedBool(createDB, "enabled")
+				migrateDBEnabled, _, _ := unstructured.NestedBool(migrateDB, "enabled")
+
+				if found && found2 && createDBEnabled && migrateDBEnabled {
+					// TPA already has OIDC and database modules configured
+					// Update redirect URIs in case route hostname changed
+					ingress := &unstructured.Unstructured{}
+					ingress.SetGroupVersionKind(schema.GroupVersionKind{
+						Group:   "config.openshift.io",
+						Version: "v1",
+						Kind:    "Ingress",
+					})
+					ingress.SetName("cluster")
+					if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err == nil {
+						domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
+						keycloakHost := "keycloak." + domain
+
+						// Get Keycloak admin credentials to ensure read-only scope
+						adminSecret := &corev1.Secret{}
+						if err := r.Get(ctx, client.ObjectKey{
+							Name:      "mirror-operator-keycloak-initial-admin",
+							Namespace: architectNamespace,
+						}, adminSecret); err == nil {
+							adminUser := string(adminSecret.Data["username"])
+							adminPassword := string(adminSecret.Data["password"])
+
+							httpClient := &http.Client{
+								Transport: &http.Transport{
+									TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+								},
+							}
+
+							// Get admin token
+							tokenURL := fmt.Sprintf("https://%s/realms/master/protocol/openid-connect/token", keycloakHost)
+							tokenData := url.Values{}
+							tokenData.Set("grant_type", "password")
+							tokenData.Set("client_id", "admin-cli")
+							tokenData.Set("username", adminUser)
+							tokenData.Set("password", adminPassword)
+
+							if tokenResp, err := httpClient.PostForm(tokenURL, tokenData); err == nil {
+								defer tokenResp.Body.Close()
+								var tokenResult map[string]interface{}
+								if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil {
+									if adminToken, ok := tokenResult["access_token"].(string); ok && adminToken != "" {
+										// Ensure read-only scope exists
+										if err := r.ensureTrustifyReadOnlyScope(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to ensure read-only scope")
+										}
+
+										// Assign scope to frontend and CLI clients
+										if err := r.assignScopeToTrustifyClients(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
+											log.FromContext(ctx).Error(err, "Failed to assign scope to clients")
+										}
+									}
+								}
+							}
+						}
+
+						if err := r.updateTrustifyRedirectURIs(ctx, keycloakHost, "trustify", "frontend"); err != nil {
+							log.FromContext(ctx).Error(err, "Failed to update Keycloak redirect URIs for RHTPA")
+						}
+					}
+					return nil
+				}
+			}
 		}
-		// Delete existing TPA to recreate with OIDC
-		log.FromContext(ctx).Info("Deleting existing TPA to add OIDC configuration")
+		// Delete existing TPA to recreate with OIDC and database modules
+		log.FromContext(ctx).Info("Deleting existing TPA to update configuration")
 		if err := r.Delete(ctx, existingTPA); err != nil {
 			return fmt.Errorf("failed to delete existing TPA for update: %w", err)
 		}
@@ -487,12 +580,13 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	appDomain := "rhtpa." + domain
 
 	// Configure OIDC for TPA using managed Keycloak if OIDC not explicitly provided
+	// Note: We'll update the redirect URIs after TPA creates its route
 	var issuerURL string
 	if cfg.OIDC != nil && cfg.OIDC.Issuer != "" {
 		// Use explicitly provided OIDC configuration
 		issuerURL = cfg.OIDC.Issuer
 	} else {
-		// Create trustify realm and OIDC client in managed Keycloak
+		// Create trustify realm (OIDC client redirect URIs will be updated later)
 		keycloakHost := "keycloak." + domain
 		realmName := "trustify"
 
@@ -503,18 +597,55 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		issuerURL = fmt.Sprintf("https://%s/realms/%s", keycloakHost, realmName)
 	}
 
+	// Configure database - use managed PostgreSQL if not explicitly provided
+	var dbHost, dbName, dbUser, dbPassword string
+	if cfg.Database != nil && cfg.Database.Host != "" && cfg.Database.Host != "postgres.example.com" {
+		// Use explicitly provided database
+		dbHost = cfg.Database.Host
+		dbName = cfg.Database.Name
+		dbUser = cfg.Database.Username
+		dbPassword = cfg.Database.Password
+	} else {
+		// Create managed PostgreSQL for TPA
+		var err error
+		dbHost, dbName, dbUser, dbPassword, err = r.ensureRHTPAPostgreSQL(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create managed PostgreSQL for TPA: %w", err)
+		}
+		log.FromContext(ctx).Info("Using managed PostgreSQL for TPA", "host", dbHost)
+	}
+
 	spec := map[string]interface{}{
 		"appDomain": appDomain,
 		"openshift": map[string]interface{}{
 			"useServiceCa": true,
 		},
 		"database": map[string]interface{}{
-			"host":     cfg.Database.Host,
-			"name":     cfg.Database.Name,
-			"username": cfg.Database.Username,
-			"password": cfg.Database.Password,
+			"host":     dbHost,
+			"name":     dbName,
+			"username": dbUser,
+			"password": dbPassword,
+		},
+		"createDatabase": map[string]interface{}{
+			"enabled":  true,
+			"image":    map[string]interface{}{},
+			"name":     dbName,
+			"username": "postgres",
+			"password": "postgres",
+		},
+		"migrateDatabase": map[string]interface{}{
+			"enabled": true,
+			"image":   map[string]interface{}{},
 		},
 		"modules": map[string]interface{}{
+			"createDatabase": map[string]interface{}{
+				"enabled": true,
+				"image":   map[string]interface{}{},
+			},
+			"migrateDatabase": map[string]interface{}{
+				"enabled": true,
+				"image":   map[string]interface{}{},
+			},
 			"importer": map[string]interface{}{
 				"enabled":     true,
 				"concurrency": 1,
@@ -539,12 +670,29 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		},
 	}
 
-	// Add OIDC authenticator configuration
-	// TPA Helm chart expects type: keycloak with url field
+	// Add OIDC configuration per TPA Helm chart schema
 	if issuerURL != "" {
-		spec["authenticator"] = map[string]interface{}{
-			"type": "keycloak",
-			"url":  issuerURL,
+		spec["oidc"] = map[string]interface{}{
+			"clients": map[string]interface{}{
+				"frontend": map[string]interface{}{
+					"clientId": "frontend",
+					// frontend is a public client (no clientSecret field)
+				},
+				"cli": map[string]interface{}{
+					"clientId": "cli",
+					"clientSecret": map[string]interface{}{
+						"valueFrom": map[string]interface{}{
+							"secretKeyRef": map[string]interface{}{
+								"name": "rhtpa-oidc-cli-secret",
+								"key":  "clientSecret",
+							},
+						},
+					},
+				},
+			},
+			"insecure":  false,
+			"loadUser":  true,
+			"issuerUrl": issuerURL,
 		}
 	}
 
@@ -579,7 +727,20 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	newTPA.SetNamespace(architectNamespace)
 	newTPA.Object["spec"] = spec
 
-	return r.Create(ctx, newTPA)
+	if err := r.Create(ctx, newTPA); err != nil {
+		return err
+	}
+
+	// Update Keycloak frontend client redirect URIs with actual RHTPA route hostname
+	// Only if using managed Keycloak
+	if cfg.OIDC == nil || cfg.OIDC.Issuer == "" {
+		keycloakHost := "keycloak." + domain
+		if err := r.updateTrustifyRedirectURIs(ctx, keycloakHost, "trustify", "frontend"); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to update Keycloak redirect URIs for RHTPA, OAuth may not work")
+		}
+	}
+
+	return nil
 }
 
 func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) {
@@ -594,6 +755,154 @@ func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) 
 	if err := r.Delete(ctx, tpa); err != nil && !apierrors.IsNotFound(err) {
 		log.FromContext(ctx).Error(err, "failed to delete RHTPA config")
 	}
+}
+
+func (r *DisconnectedPlatformReconciler) updateTrustifyRedirectURIs(ctx context.Context, keycloakHost, realmName, clientID string) error {
+	logger := log.FromContext(ctx)
+
+	// Get the TPA resource to check ownership
+	tpa := &unstructured.Unstructured{}
+	tpa.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rhtpa.io",
+		Version: "v1",
+		Kind:    "TrustedProfileAnalyzer",
+	})
+	tpa.SetName("mirror-operator-trusted-profile-analyzer")
+	tpa.SetNamespace(architectNamespace)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(tpa), tpa); err != nil {
+		return fmt.Errorf("failed to get TPA resource: %w", err)
+	}
+	tpaUID := tpa.GetUID()
+
+	// Find Ingress resources owned by the TPA
+	ingressList := &unstructured.UnstructuredList{}
+	ingressList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.k8s.io",
+		Version: "v1",
+		Kind:    "Ingress",
+	})
+	if err := r.List(ctx, ingressList, client.InNamespace(architectNamespace)); err != nil {
+		return fmt.Errorf("failed to list ingresses: %w", err)
+	}
+
+	var rhtpaServerURL string
+	for _, ingress := range ingressList.Items {
+		// Check if this ingress is owned by the TPA
+		ownerRefs := ingress.GetOwnerReferences()
+		for _, owner := range ownerRefs {
+			if owner.UID == tpaUID && owner.Kind == "TrustedProfileAnalyzer" {
+				// This is an ingress owned by TPA - check if it's the server ingress
+				ingressName := ingress.GetName()
+				if strings.Contains(ingressName, "server") {
+					// Get hostname from ingress status
+					rules, found, _ := unstructured.NestedSlice(ingress.Object, "spec", "rules")
+					if found && len(rules) > 0 {
+						if ruleMap, ok := rules[0].(map[string]interface{}); ok {
+							if host, found, _ := unstructured.NestedString(ruleMap, "host"); found && host != "" {
+								rhtpaServerURL = "https://" + host
+								logger.Info("Found RHTPA server hostname from Ingress", "hostname", host, "ingress", ingressName)
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+		if rhtpaServerURL != "" {
+			break
+		}
+	}
+
+	if rhtpaServerURL == "" {
+		return fmt.Errorf("RHTPA server ingress not found yet or hostname not set")
+	}
+
+	// Get Keycloak admin token
+	adminSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      "mirror-operator-keycloak-initial-admin",
+		Namespace: architectNamespace,
+	}, adminSecret); err != nil {
+		return fmt.Errorf("failed to get Keycloak admin credentials: %w", err)
+	}
+	adminPassword := string(adminSecret.Data["password"])
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	// Get admin token
+	tokenURL := fmt.Sprintf("https://%s/realms/master/protocol/openid-connect/token", keycloakHost)
+	tokenData := url.Values{}
+	tokenData.Set("client_id", "admin-cli")
+	tokenData.Set("username", "admin")
+	tokenData.Set("password", adminPassword)
+	tokenData.Set("grant_type", "password")
+
+	tokenResp, err := httpClient.PostForm(tokenURL, tokenData)
+	if err != nil {
+		return fmt.Errorf("failed to get admin token: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	var tokenResult map[string]interface{}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
+		return fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	adminToken, ok := tokenResult["access_token"].(string)
+	if !ok {
+		return fmt.Errorf("no access token in response")
+	}
+
+	// Find the client by clientId
+	clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
+	req, _ := http.NewRequest("GET", clientsURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to check client: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var clients []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&clients); err != nil {
+		return fmt.Errorf("failed to decode clients: %w", err)
+	}
+
+	if len(clients) == 0 {
+		return fmt.Errorf("client %s not found in realm %s", clientID, realmName)
+	}
+
+	// Update redirect URIs
+	clientUUID := clients[0]["id"].(string)
+	updateURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s", keycloakHost, realmName, clientUUID)
+	updateData := map[string]interface{}{
+		"redirectUris": []string{rhtpaServerURL + "/*"},
+		"webOrigins":   []string{"*"},
+	}
+	updateJSON, _ := json.Marshal(updateData)
+	req, _ = http.NewRequest("PUT", updateURL, bytes.NewReader(updateJSON))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to update client: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to update client redirect URIs: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Updated OIDC client redirect URIs", "clientId", clientID, "rhtpaURL", rhtpaServerURL)
+	return nil
 }
 
 func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.Context, keycloakHost, realmName, appDomain string) error {
@@ -686,16 +995,141 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.
 		logger.Info("Successfully created trustify realm")
 	}
 
-	// Create frontend OIDC client
-	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "frontend", appDomain, adminToken, httpClient); err != nil {
+	// Create read-only client scope for Trustify authorization (read:document only, no write access)
+	if err := r.ensureTrustifyReadOnlyScope(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
+		logger.Error(err, "failed to create read-only client scope", "realm", realmName)
+		// Continue even if scope creation fails - it might already exist
+	}
+
+	// Create frontend public OIDC client
+	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "frontend", appDomain, adminToken, httpClient, true); err != nil {
 		return fmt.Errorf("failed to create frontend OIDC client: %w", err)
+	}
+
+	// Create CLI confidential OIDC client
+	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "cli", appDomain, adminToken, httpClient, false); err != nil {
+		return fmt.Errorf("failed to create CLI OIDC client: %w", err)
 	}
 
 	return nil
 }
 
-func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Context, keycloakHost, realmName, clientID, appDomain, adminToken string, httpClient *http.Client) error {
+func (r *DisconnectedPlatformReconciler) ensureTrustifyReadOnlyScope(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
 	logger := log.FromContext(ctx)
+
+	// Create the read:document client scope for read-only access to Trustify APIs
+	scopeName := "read:document"
+
+	// Check if scope already exists
+	scopesURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", scopesURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to list client scopes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var scopes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&scopes); err != nil {
+		return fmt.Errorf("failed to decode client scopes: %w", err)
+	}
+
+	// Check if scope already exists
+	scopeExists := false
+	for _, scope := range scopes {
+		if name, ok := scope["name"].(string); ok && name == scopeName {
+			scopeExists = true
+			logger.Info("Client scope already exists", "scope", scopeName, "realm", realmName)
+			break
+		}
+	}
+
+	if !scopeExists {
+		// Create the client scope
+		scopeConfig := map[string]interface{}{
+			"name":        scopeName,
+			"description": "Read-only access to Trustify documents (advisories, SBOMs, etc.)",
+			"protocol":    "openid-connect",
+			"attributes": map[string]interface{}{
+				"include.in.token.scope":    "true",
+				"display.on.consent.screen": "false",
+			},
+		}
+
+		scopeJSON, _ := json.Marshal(scopeConfig)
+		req, _ = http.NewRequest("POST", scopesURL, bytes.NewReader(scopeJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create client scope: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create client scope: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		logger.Info("Created read-only client scope", "scope", scopeName, "realm", realmName)
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Context, keycloakHost, realmName, clientID, appDomain, adminToken string, httpClient *http.Client, isPublic bool) error {
+	logger := log.FromContext(ctx)
+
+	// Find RHTPA server hostname by looking for Ingress owned by TrustedProfileAnalyzer
+	var actualAppDomain string
+	tpaList := &unstructured.UnstructuredList{}
+	tpaList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "charts.trustification.dev",
+		Version: "v1alpha1",
+		Kind:    "TrustedProfileAnalyzerList",
+	})
+	if err := r.List(ctx, tpaList); err == nil && len(tpaList.Items) > 0 {
+		tpa := tpaList.Items[0]
+		tpaUID := tpa.GetUID()
+
+		// Find Ingresses owned by this TPA
+		ingressList := &unstructured.UnstructuredList{}
+		ingressList.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.k8s.io",
+			Version: "v1",
+			Kind:    "IngressList",
+		})
+		if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err == nil {
+			for _, ingress := range ingressList.Items {
+				for _, owner := range ingress.GetOwnerReferences() {
+					if owner.UID == tpaUID {
+						// Found the Ingress owned by TPA
+						if rules, found, _ := unstructured.NestedSlice(ingress.Object, "spec", "rules"); found && len(rules) > 0 {
+							if rule, ok := rules[0].(map[string]interface{}); ok {
+								if host, ok := rule["host"].(string); ok && host != "" {
+									actualAppDomain = host
+									logger.Info("Found RHTPA server hostname from Ingress", "hostname", actualAppDomain, "client", clientID)
+									break
+								}
+							}
+						}
+					}
+				}
+				if actualAppDomain != "" {
+					break
+				}
+			}
+		}
+	}
+
+	// Fall back to the passed appDomain if we couldn't find the Ingress
+	if actualAppDomain == "" {
+		actualAppDomain = appDomain
+		logger.Info("Using fallback appDomain for RHTPA", "appDomain", actualAppDomain, "client", clientID)
+	}
 
 	// Check if client exists
 	clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
@@ -713,64 +1147,451 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 		return fmt.Errorf("failed to decode clients response: %w", err)
 	}
 
+	var clientUUID string
+	var clientSecret string
+
 	if len(clients) > 0 {
-		// Client already exists
-		logger.Info("OIDC client already exists", "clientId", clientID)
-		return nil
+		// Client already exists - update its configuration
+		logger.Info("OIDC client already exists, updating configuration", "clientId", clientID, "public", isPublic)
+		clientUUID = clients[0]["id"].(string)
+
+		// Update redirect URIs and client type
+		updateURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s", keycloakHost, realmName, clientUUID)
+		updateData := map[string]interface{}{
+			"redirectUris": []string{fmt.Sprintf("https://%s/*", actualAppDomain)},
+			"webOrigins":   []string{"*"},
+			"publicClient": isPublic,
+		}
+		updateJSON, _ := json.Marshal(updateData)
+		req, _ = http.NewRequest("PUT", updateURL, bytes.NewReader(updateJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to update client: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(resp.Body)
+			logger.Error(fmt.Errorf("unexpected status"), "failed to update client configuration", "status", resp.StatusCode, "body", string(body))
+		}
+
+		// For confidential clients, get the client secret
+		if !isPublic {
+			secretURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/client-secret", keycloakHost, realmName, clientUUID)
+			secretReq, _ := http.NewRequest("GET", secretURL, nil)
+			secretReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+			secretResp, err := httpClient.Do(secretReq)
+			if err == nil {
+				defer secretResp.Body.Close()
+				var secretData map[string]interface{}
+				if json.NewDecoder(secretResp.Body).Decode(&secretData) == nil {
+					if secret, ok := secretData["value"].(string); ok {
+						clientSecret = secret
+					}
+				}
+			}
+		}
+	} else {
+		// Create OIDC client
+		logger.Info("Creating TPA OIDC client", "clientId", clientID, "public", isPublic)
+
+		clientConfig := map[string]interface{}{
+			"clientId":                  clientID,
+			"enabled":                   true,
+			"protocol":                  "openid-connect",
+			"publicClient":              isPublic,
+			"standardFlowEnabled":       true,
+			"directAccessGrantsEnabled": !isPublic, // Only confidential clients need this
+			"serviceAccountsEnabled":    !isPublic, // Only confidential clients can be service accounts
+			"redirectUris":              []string{fmt.Sprintf("https://%s/*", actualAppDomain)},
+			"webOrigins":                []string{"*"},
+		}
+
+		// Generate secret for confidential clients
+		if !isPublic {
+			clientSecret = generateRandomString(32)
+			clientConfig["secret"] = clientSecret
+		}
+
+		clientJSON, _ := json.Marshal(clientConfig)
+		req, _ = http.NewRequest("POST", fmt.Sprintf("https://%s/admin/realms/%s/clients", keycloakHost, realmName), bytes.NewReader(clientJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create client: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		if isPublic {
+			logger.Info("Successfully created TPA OIDC public client", "clientId", clientID)
+		} else {
+			logger.Info("Successfully created TPA OIDC confidential client", "clientId", clientID)
+		}
+
+		// Get the client UUID for newly created client
+		clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
+		req, _ = http.NewRequest("GET", clientsURL, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			var clients []map[string]interface{}
+			if json.NewDecoder(resp.Body).Decode(&clients) == nil && len(clients) > 0 {
+				clientUUID = clients[0]["id"].(string)
+			}
+		}
 	}
 
-	// Create OIDC client
-	logger.Info("Creating TPA OIDC client", "clientId", clientID)
-
-	clientSecret := generateRandomString(32)
-
-	clientConfig := map[string]interface{}{
-		"clientId":                  clientID,
-		"enabled":                   true,
-		"protocol":                  "openid-connect",
-		"publicClient":              false,
-		"standardFlowEnabled":       true,
-		"directAccessGrantsEnabled": true,
-		"serviceAccountsEnabled":    true,
-		"redirectUris":              []string{fmt.Sprintf("https://%s/*", appDomain)},
-		"webOrigins":                []string{"*"},
-		"secret":                    clientSecret,
+	// Assign read:document scope to the client
+	if clientUUID != "" {
+		if err := r.assignReadScopeToClient(ctx, keycloakHost, realmName, clientUUID, adminToken, httpClient); err != nil {
+			logger.Error(err, "failed to assign read scope to client", "clientId", clientID)
+		}
 	}
 
-	clientJSON, _ := json.Marshal(clientConfig)
-	req, _ = http.NewRequest("POST", fmt.Sprintf("https://%s/admin/realms/%s/clients", keycloakHost, realmName), bytes.NewReader(clientJSON))
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	req.Header.Set("Content-Type", "application/json")
+	// Store CLI client secret if this is the CLI client
+	if !isPublic && clientSecret != "" && clientID == "cli" {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rhtpa-oidc-cli-secret",
+				Namespace: architectNamespace,
+			},
+			StringData: map[string]string{
+				"clientSecret": clientSecret,
+			},
+		}
 
-	resp, err = httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to create client: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create client: status %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	logger.Info("Successfully created TPA OIDC client")
-
-	// Store client secret in a Secret
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "rhtpa-oidc-client-secret",
-			Namespace: architectNamespace,
-		},
-		StringData: map[string]string{
-			"clientSecret": clientSecret,
-		},
-	}
-
-	if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create client secret: %w", err)
+		existingSecret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(secret), existingSecret); apierrors.IsNotFound(err) {
+			if err := r.Create(ctx, secret); err != nil {
+				return fmt.Errorf("failed to create CLI client secret: %w", err)
+			}
+			logger.Info("Created CLI client secret", "secretName", secret.Name)
+		} else if err == nil {
+			// Update existing secret
+			existingSecret.StringData = secret.StringData
+			if err := r.Update(ctx, existingSecret); err != nil {
+				return fmt.Errorf("failed to update CLI client secret: %w", err)
+			}
+			logger.Info("Updated CLI client secret", "secretName", secret.Name)
+		}
 	}
 
 	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Assign read:document scope to both frontend and CLI clients
+	for _, clientID := range []string{"frontend", "cli"} {
+		// Get client UUID
+		clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
+		req, _ := http.NewRequest("GET", clientsURL, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			logger.Error(err, "failed to get client UUID", "clientId", clientID)
+			continue
+		}
+		defer resp.Body.Close()
+
+		var clients []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&clients); err != nil {
+			logger.Error(err, "failed to decode clients response", "clientId", clientID)
+			continue
+		}
+
+		if len(clients) == 0 {
+			logger.Info("Client not found", "clientId", clientID)
+			continue
+		}
+
+		clientUUID := clients[0]["id"].(string)
+
+		// Assign scope to client
+		if err := r.assignReadScopeToClient(ctx, keycloakHost, realmName, clientUUID, adminToken, httpClient); err != nil {
+			logger.Error(err, "failed to assign read scope", "clientId", clientID)
+		} else {
+			logger.Info("Assigned read:document scope to client", "clientId", clientID)
+		}
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) assignReadScopeToClient(ctx context.Context, keycloakHost, realmName, clientUUID, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Get the read:document scope UUID
+	scopeListURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes", keycloakHost, realmName)
+	scopeReq, _ := http.NewRequest("GET", scopeListURL, nil)
+	scopeReq.Header.Set("Authorization", "Bearer "+adminToken)
+	scopeReq.Header.Set("Content-Type", "application/json")
+
+	scopeResp, err := httpClient.Do(scopeReq)
+	if err != nil {
+		return fmt.Errorf("failed to list client scopes: %w", err)
+	}
+	defer scopeResp.Body.Close()
+
+	if scopeResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(scopeResp.Body)
+		return fmt.Errorf("failed to list client scopes: %s - %s", scopeResp.Status, string(body))
+	}
+
+	var scopes []map[string]interface{}
+	if err := json.NewDecoder(scopeResp.Body).Decode(&scopes); err != nil {
+		return fmt.Errorf("failed to decode client scopes response: %w", err)
+	}
+
+	// Find read:document scope UUID
+	var readScopeUUID string
+	for _, scope := range scopes {
+		if scope["name"] == "read:document" {
+			readScopeUUID = scope["id"].(string)
+			break
+		}
+	}
+
+	if readScopeUUID == "" {
+		return fmt.Errorf("read:document scope not found")
+	}
+
+	// Assign scope as default client scope
+	assignURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/default-client-scopes/%s", keycloakHost, realmName, clientUUID, readScopeUUID)
+	assignReq, _ := http.NewRequest("PUT", assignURL, nil)
+	assignReq.Header.Set("Authorization", "Bearer "+adminToken)
+	assignReq.Header.Set("Content-Type", "application/json")
+
+	assignResp, err := httpClient.Do(assignReq)
+	if err != nil {
+		return fmt.Errorf("failed to assign scope to client: %w", err)
+	}
+	defer assignResp.Body.Close()
+
+	if assignResp.StatusCode != http.StatusNoContent && assignResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(assignResp.Body)
+		return fmt.Errorf("failed to assign scope to client: %s - %s", assignResp.Status, string(body))
+	}
+
+	logger.Info("Assigned read:document scope to client", "clientUUID", clientUUID)
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Context) (string, string, string, string, error) {
+	// Create PostgreSQL StatefulSet for TPA persistence
+	// Returns: host, dbname, username, password, error
+
+	dbName := "rhtpadb"
+	dbUser := "rhtpa"
+	dbPassword := "rhtpa-db-password-" + generateRandomString(16)
+	serviceName := "rhtpa-postgresql"
+	pvcName := "rhtpa-postgresql-data"
+
+	// Create database credentials secret
+	dbSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rhtpa-db-credentials",
+			Namespace: architectNamespace,
+		},
+		StringData: map[string]string{
+			"username": dbUser,
+			"password": dbPassword,
+			"database": dbName,
+		},
+	}
+	existingSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dbSecret), existingSecret); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, dbSecret); err != nil {
+			return "", "", "", "", fmt.Errorf("failed to create TPA database secret: %w", err)
+		}
+	} else if err == nil {
+		// Secret exists, read password from it
+		dbPassword = string(existingSecret.Data["password"])
+	}
+
+	// Create PVC
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"app": "rhtpa-postgresql",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	existingPVC := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existingPVC); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, pvc); err != nil {
+			return "", "", "", "", fmt.Errorf("failed to create TPA PostgreSQL PVC: %w", err)
+		}
+	}
+
+	// Create PostgreSQL StatefulSet
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rhtpa-postgresql",
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"app": "rhtpa-postgresql",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: serviceName,
+			Replicas:    func() *int32 { r := int32(1); return &r }(),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "rhtpa-postgresql",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": "rhtpa-postgresql",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "postgresql",
+							Image: "registry.redhat.io/rhel9/postgresql-15:latest",
+							Env: []corev1.EnvVar{
+								{Name: "POSTGRESQL_USER", Value: dbUser},
+								{Name: "POSTGRESQL_PASSWORD", Value: dbPassword},
+								{Name: "POSTGRESQL_DATABASE", Value: dbName},
+								{Name: "POSTGRESQL_ADMIN_PASSWORD", Value: "postgres"},
+							},
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 5432, Name: "postgresql"},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "data", MountPath: "/var/lib/pgsql/data"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	existingSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), existingSts); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, sts); err != nil {
+			return "", "", "", "", fmt.Errorf("failed to create TPA PostgreSQL StatefulSet: %w", err)
+		}
+		log.FromContext(ctx).Info("Created TPA PostgreSQL StatefulSet")
+	}
+
+	// Create PostgreSQL Service
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"app": "rhtpa-postgresql",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app": "rhtpa-postgresql",
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "postgresql",
+					Port:       5432,
+					TargetPort: intstr.FromInt(5432),
+				},
+			},
+			ClusterIP: "None",
+		},
+	}
+	existingSvc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(svc), existingSvc); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, svc); err != nil {
+			return "", "", "", "", fmt.Errorf("failed to create TPA PostgreSQL Service: %w", err)
+		}
+	}
+
+	dbHost := fmt.Sprintf("%s.%s.svc", serviceName, architectNamespace)
+	return dbHost, dbName, dbUser, dbPassword, nil
+}
+
+func (r *DisconnectedPlatformReconciler) checkKeycloakHealth(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	cfg := platform.Spec.Connected.RHTAS
+	if cfg == nil || cfg.OIDC == nil || cfg.OIDC.Managed == nil || !cfg.OIDC.Managed.Enabled {
+		return nil
+	}
+
+	// Check if Keycloak resource exists and is ready
+	kc := &unstructured.Unstructured{}
+	kc.SetGroupVersionKind(keycloakGVK)
+	kc.SetName("mirror-operator-keycloak")
+	kc.SetNamespace(architectNamespace)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(kc), kc); err != nil {
+		return fmt.Errorf("Keycloak resource not found: %w", err)
+	}
+
+	// Check Keycloak status conditions
+	status, found, _ := unstructured.NestedMap(kc.Object, "status")
+	if !found {
+		return fmt.Errorf("Keycloak status not available yet")
+	}
+
+	conditions, found, _ := unstructured.NestedSlice(status, "conditions")
+	if !found {
+		return fmt.Errorf("Keycloak conditions not available yet")
+	}
+
+	// Look for Ready condition
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		condType, _, _ := unstructured.NestedString(condMap, "type")
+		condStatus, _, _ := unstructured.NestedString(condMap, "status")
+		if condType == "Ready" {
+			if condStatus == "True" {
+				return nil
+			}
+			message, _, _ := unstructured.NestedString(condMap, "message")
+			return fmt.Errorf("Keycloak not ready: %s", message)
+		}
+	}
+
+	return fmt.Errorf("Keycloak Ready condition not found")
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
@@ -801,35 +1622,21 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 		}
 	}
 
-	// Determine database configuration
+	// Determine database configuration for Keycloak
+	// Note: cfg.Database is for RHTAS/Securesign, not Keycloak
+	// Keycloak always uses managed PostgreSQL unless a separate database config is added to the API
 	var dbHost, dbName, dbUsername, dbPassword string
 	var dbPort int
-	useExternalDB := cfg.Database != nil && cfg.Database.Host != "" && cfg.Database.Username != "" && cfg.Database.Password != ""
 
-	if useExternalDB {
-		// Use provided external database
-		dbHost = cfg.Database.Host
-		dbName = cfg.Database.Name
-		if dbName == "" {
-			dbName = "keycloak"
-		}
-		dbPort = int(cfg.Database.Port)
-		if dbPort == 0 {
-			dbPort = 5432
-		}
-		dbUsername = cfg.Database.Username
-		dbPassword = cfg.Database.Password
-	} else {
-		// Deploy managed PostgreSQL StatefulSet
-		if err := r.ensureManagedPostgreSQL(ctx, platform); err != nil {
-			return fmt.Errorf("failed to ensure managed PostgreSQL: %w", err)
-		}
-		dbHost = "keycloak-postgresql.mirror-operator-system.svc"
-		dbName = "keycloak"
-		dbPort = 5432
-		dbUsername = "keycloak"
-		dbPassword = "keycloak-admin-password" // Generated password stored in secret
+	// Deploy managed PostgreSQL StatefulSet for Keycloak
+	if err := r.ensureManagedPostgreSQL(ctx, platform); err != nil {
+		return fmt.Errorf("failed to ensure managed PostgreSQL: %w", err)
 	}
+	dbHost = "keycloak-postgresql.mirror-operator-system.svc"
+	dbName = "keycloak"
+	dbPort = 5432
+	dbUsername = "keycloak"
+	dbPassword = "keycloak-admin-password" // Generated password stored in secret
 
 	// Create database credentials secret
 	dbSecret := &corev1.Secret{
@@ -901,13 +1708,10 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 			return fmt.Errorf("failed to create Keycloak: %w", err)
 		}
 	} else {
-		// Update existing Keycloak with database config if not present
-		currentSpec, _, _ := unstructured.NestedMap(kc.Object, "spec")
-		if _, hasDB := currentSpec["db"]; !hasDB {
-			kc.Object["spec"] = kcSpec
-			if err := r.Update(ctx, kc); err != nil {
-				return fmt.Errorf("failed to update Keycloak: %w", err)
-			}
+		// Update existing Keycloak to ensure correct database config
+		kc.Object["spec"] = kcSpec
+		if err := r.Update(ctx, kc); err != nil {
+			return fmt.Errorf("failed to update Keycloak: %w", err)
 		}
 	}
 
@@ -945,6 +1749,12 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 	// Configure realm and client via API instead of KeycloakRealmImport
 	if err := r.configureKeycloakRealmAndClient(ctx, hostname, realmName, "trusted-artifact-signer"); err != nil {
 		return fmt.Errorf("failed to configure Keycloak realm and client: %w", err)
+	}
+
+	// Configure OpenShift OAuth as identity provider for all realms
+	if err := r.configureOpenShiftOAuth(ctx, hostname); err != nil {
+		log.FromContext(ctx).Error(err, "failed to configure OpenShift OAuth")
+		// Don't fail reconciliation, just log the error
 	}
 
 	// Skip KeycloakRealmImport - we manage directly via API
@@ -2266,12 +3076,24 @@ func (r *DisconnectedPlatformReconciler) extractRHTASRootKeys(ctx context.Contex
 		return err
 	}
 
-	platform.Status.RHTASRootKeys = &mirrorv1.RHTASRootKeysInfo{
-		ConfigMap:        "rhtas-trusted-root",
-		FulcioRootHash:   hashString(fulcioRootPEM),
-		RekorKeyHash:     hashString(rekorPubKeyPEM),
-		LastUpdated:      metav1.Now(),
-		TUFRepositoryURL: tufURL,
+	// Only update RHTASRootKeys if the keys changed
+	newFulcioHash := hashString(fulcioRootPEM)
+	newRekorHash := hashString(rekorPubKeyPEM)
+
+	// Check if keys changed
+	keysChanged := platform.Status.RHTASRootKeys == nil ||
+		platform.Status.RHTASRootKeys.FulcioRootHash != newFulcioHash ||
+		platform.Status.RHTASRootKeys.RekorKeyHash != newRekorHash ||
+		platform.Status.RHTASRootKeys.TUFRepositoryURL != tufURL
+
+	if keysChanged {
+		platform.Status.RHTASRootKeys = &mirrorv1.RHTASRootKeysInfo{
+			ConfigMap:        "rhtas-trusted-root",
+			FulcioRootHash:   newFulcioHash,
+			RekorKeyHash:     newRekorHash,
+			LastUpdated:      metav1.Now(),
+			TUFRepositoryURL: tufURL,
+		}
 	}
 
 	return nil
@@ -2678,7 +3500,20 @@ func (r *DisconnectedPlatformReconciler) restartBackendPods(ctx context.Context)
 }
 
 func architectResourceName(platform *mirrorv1.DisconnectedPlatform, component string) string {
-	return "mirror-operator-" + platform.Name + "-" + component
+	// Kubernetes resource names must be <= 63 characters
+	// Use a shorter prefix and hash long platform names
+	prefix := "mo" // mirror-operator shortened
+	maxLen := 63
+
+	baseName := prefix + "-" + platform.Name + "-" + component
+	if len(baseName) <= maxLen {
+		return baseName
+	}
+
+	// Name is too long, use hash of platform name
+	h := sha256.Sum256([]byte(platform.Name))
+	hash := hex.EncodeToString(h[:4]) // 8 character hash
+	return prefix + "-" + hash + "-" + component
 }
 
 func architectComponentLabels(component string) map[string]string {
@@ -2700,6 +3535,25 @@ func setOwnerReference(obj *unstructured.Unstructured, owner *mirrorv1.Disconnec
 			Controller: func() *bool { b := true; return &b }(),
 		},
 	})
+}
+
+func (r *DisconnectedPlatformReconciler) getRouteHostname(route *unstructured.Unstructured) string {
+	// First try spec.host (custom hostname)
+	if host, found, _ := unstructured.NestedString(route.Object, "spec", "host"); found && host != "" {
+		return host
+	}
+
+	// Fall back to status.ingress[0].host (auto-generated hostname)
+	ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress")
+	if found && len(ingress) > 0 {
+		if ingressMap, ok := ingress[0].(map[string]interface{}); ok {
+			if host, found, _ := unstructured.NestedString(ingressMap, "host"); found && host != "" {
+				return host
+			}
+		}
+	}
+
+	return ""
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
@@ -2744,50 +3598,45 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 	}
 
 	// Routes (create routes first to get hostnames)
+	// Always create routes with default edge termination if not explicitly disabled
 	var frontendRouteHostname, backendRouteHostname string
-	if cfg.Route != nil {
-		// Frontend route
-		frontendRouteName := "airgap-architect"
-		if err := r.ensureArchitectRoute(ctx, platform, frontendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-frontend")); err != nil {
-			return err
-		}
-		// Get frontend route hostname for VITE_ALLOWED_HOSTS
-		frontendRoute := &unstructured.Unstructured{}
-		frontendRoute.SetGroupVersionKind(routeGVK)
-		frontendRoute.SetName(frontendRouteName)
-		frontendRoute.SetNamespace(architectNamespace)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(frontendRoute), frontendRoute); err == nil {
-			if cfg.Route.Host != "" {
-				frontendRouteHostname = cfg.Route.Host
-			} else {
-				frontendRouteHostname, _, _ = unstructured.NestedString(frontendRoute.Object, "spec", "host")
-			}
-		}
 
-		// Backend API route
-		backendRouteName := "airgap-architect-api"
-		if err := r.ensureArchitectRoute(ctx, platform, backendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-backend")); err != nil {
-			return err
+	// Frontend route
+	frontendRouteName := "airgap-architect"
+	if err := r.ensureArchitectRoute(ctx, platform, frontendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-frontend")); err != nil {
+		return err
+	}
+	// Get frontend route hostname for VITE_ALLOWED_HOSTS
+	frontendRoute := &unstructured.Unstructured{}
+	frontendRoute.SetGroupVersionKind(routeGVK)
+	frontendRoute.SetName(frontendRouteName)
+	frontendRoute.SetNamespace(architectNamespace)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(frontendRoute), frontendRoute); err == nil {
+		if cfg.Route != nil && cfg.Route.Host != "" {
+			frontendRouteHostname = cfg.Route.Host
+		} else {
+			// Get auto-generated hostname from route status
+			frontendRouteHostname = r.getRouteHostname(frontendRoute)
 		}
-		// Get backend route hostname for VITE_API_BASE
-		backendRoute := &unstructured.Unstructured{}
-		backendRoute.SetGroupVersionKind(routeGVK)
-		backendRoute.SetName(backendRouteName)
-		backendRoute.SetNamespace(architectNamespace)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(backendRoute), backendRoute); err == nil {
-			if cfg.Route.Host != "" {
-				// If custom host specified, use subdomain pattern
-				backendRouteHostname = "api-" + cfg.Route.Host
-			} else {
-				backendRouteHostname, _, _ = unstructured.NestedString(backendRoute.Object, "spec", "host")
-			}
-		}
-	} else {
-		if err := r.deleteResource(ctx, routeGVK, "airgap-architect"); err != nil {
-			return err
-		}
-		if err := r.deleteResource(ctx, routeGVK, "airgap-architect-api"); err != nil {
-			return err
+	}
+
+	// Backend API route
+	backendRouteName := "airgap-architect-api"
+	if err := r.ensureArchitectRoute(ctx, platform, backendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-backend")); err != nil {
+		return err
+	}
+	// Get backend route hostname for VITE_API_BASE
+	backendRoute := &unstructured.Unstructured{}
+	backendRoute.SetGroupVersionKind(routeGVK)
+	backendRoute.SetName(backendRouteName)
+	backendRoute.SetNamespace(architectNamespace)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(backendRoute), backendRoute); err == nil {
+		if cfg.Route != nil && cfg.Route.Host != "" {
+			// If custom host specified, use subdomain pattern
+			backendRouteHostname = "api-" + cfg.Route.Host
+		} else {
+			// Get auto-generated hostname from route status
+			backendRouteHostname = r.getRouteHostname(backendRoute)
 		}
 	}
 
@@ -3144,16 +3993,20 @@ func architectRoute(routeName string, routeCfg *mirrorv1.RouteConfig, frontendSe
 	unstructured.SetNestedField(route.Object, "Service", "spec", "to", "kind")
 	unstructured.SetNestedField(route.Object, frontendServiceName, "spec", "to", "name")
 	unstructured.SetNestedField(route.Object, "http", "spec", "port", "targetPort")
-	if routeCfg.Host != "" {
+
+	// Handle custom host if specified
+	if routeCfg != nil && routeCfg.Host != "" {
 		unstructured.SetNestedField(route.Object, routeCfg.Host, "spec", "host")
 	}
-	if routeCfg.TLS != nil {
-		termination := routeCfg.TLS.Termination
-		if termination == "" {
-			termination = "edge"
-		}
-		unstructured.SetNestedField(route.Object, termination, "spec", "tls", "termination")
+
+	// Set TLS termination (default to edge if not specified)
+	termination := "edge"
+	if routeCfg != nil && routeCfg.TLS != nil && routeCfg.TLS.Termination != "" {
+		termination = routeCfg.TLS.Termination
 	}
+	unstructured.SetNestedField(route.Object, termination, "spec", "tls", "termination")
+	unstructured.SetNestedField(route.Object, "Redirect", "spec", "tls", "insecureEdgeTerminationPolicy")
+
 	return route
 }
 
@@ -3471,6 +4324,437 @@ func (r *DisconnectedPlatformReconciler) checkFulcioKeycloakConnectivity(ctx con
 					}
 				}
 			}
+		}
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) setErrorCondition(platform *mirrorv1.DisconnectedPlatform, reason, message string) {
+	// Check if condition already exists with same status
+	for i, c := range platform.Status.Conditions {
+		if c.Type == "Ready" {
+			// Condition exists - only update if status, reason, or message changed
+			if c.Status == metav1.ConditionFalse && c.Reason == reason && c.Message == message {
+				// No change needed
+				return
+			}
+			// Update with new values, preserve LastTransitionTime if status didn't change
+			lastTransition := c.LastTransitionTime
+			if c.Status != metav1.ConditionFalse {
+				lastTransition = metav1.Now()
+			}
+			platform.Status.Conditions[i] = metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: platform.Generation,
+				LastTransitionTime: lastTransition,
+				Reason:             reason,
+				Message:            message,
+			}
+			return
+		}
+	}
+
+	// Condition doesn't exist, add it
+	platform.Status.Conditions = append(platform.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: platform.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func (r *DisconnectedPlatformReconciler) setReadyCondition(platform *mirrorv1.DisconnectedPlatform, reason, message string) {
+	// Check if condition already exists with same status
+	for i, c := range platform.Status.Conditions {
+		if c.Type == "Ready" {
+			// Condition exists - only update if status, reason, or message changed
+			if c.Status == metav1.ConditionTrue && c.Reason == reason && c.Message == message {
+				// No change needed
+				return
+			}
+			// Update with new values, preserve LastTransitionTime if status didn't change
+			lastTransition := c.LastTransitionTime
+			if c.Status != metav1.ConditionTrue {
+				lastTransition = metav1.Now()
+			}
+			platform.Status.Conditions[i] = metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: platform.Generation,
+				LastTransitionTime: lastTransition,
+				Reason:             reason,
+				Message:            message,
+			}
+			return
+		}
+	}
+
+	// Condition doesn't exist, add it
+	platform.Status.Conditions = append(platform.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: platform.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func (r *DisconnectedPlatformReconciler) configureOpenShiftOAuth(ctx context.Context, keycloakHost string) error {
+	logger := log.FromContext(ctx)
+
+	// Get Keycloak admin credentials
+	adminSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      "mirror-operator-keycloak-initial-admin",
+		Namespace: architectNamespace,
+	}, adminSecret); err != nil {
+		return fmt.Errorf("failed to get Keycloak admin credentials: %w", err)
+	}
+
+	adminUser := string(adminSecret.Data["username"])
+	adminPassword := string(adminSecret.Data["password"])
+
+	// Get OpenShift API server URL for Keycloak openshift-v4 provider baseUrl
+	infrastructure := &unstructured.Unstructured{}
+	infrastructure.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Infrastructure",
+	})
+	infrastructure.SetName("cluster")
+	if err := r.Get(ctx, client.ObjectKeyFromObject(infrastructure), infrastructure); err != nil {
+		return fmt.Errorf("failed to get cluster infrastructure: %w", err)
+	}
+	apiServerURL, _, _ := unstructured.NestedString(infrastructure.Object, "status", "apiServerURL")
+	if apiServerURL == "" {
+		return fmt.Errorf("apiServerURL not found in cluster infrastructure")
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	// Get admin access token
+	tokenURL := fmt.Sprintf("https://%s/realms/master/protocol/openid-connect/token", keycloakHost)
+	tokenData := url.Values{}
+	tokenData.Set("grant_type", "password")
+	tokenData.Set("client_id", "admin-cli")
+	tokenData.Set("username", adminUser)
+	tokenData.Set("password", adminPassword)
+
+	tokenResp, err := httpClient.PostForm(tokenURL, tokenData)
+	if err != nil {
+		return fmt.Errorf("failed to get admin token: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(tokenResp.Body)
+		return fmt.Errorf("failed to get admin token: status %d, body: %s", tokenResp.StatusCode, string(body))
+	}
+
+	var tokenResult map[string]interface{}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
+		return fmt.Errorf("failed to decode token response: %w", err)
+	}
+
+	adminToken, ok := tokenResult["access_token"].(string)
+	if !ok || adminToken == "" {
+		return fmt.Errorf("no access token in response")
+	}
+
+	// Configure OpenShift OAuth for both realms
+	realms := []string{"trusted-artifact-signer", "trustify"}
+	for _, realmName := range realms {
+		if err := r.addOpenShiftIdentityProvider(ctx, keycloakHost, realmName, apiServerURL, adminToken, httpClient); err != nil {
+			logger.Error(err, "failed to add OpenShift IdP to realm", "realm", realmName)
+			// Continue with other realms
+		} else {
+			logger.Info("Configured OpenShift OAuth for realm", "realm", realmName)
+		}
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) addOpenShiftIdentityProvider(ctx context.Context, keycloakHost, realmName, apiServerURL, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Check if OpenShift identity provider already exists
+	idpURL := fmt.Sprintf("https://%s/admin/realms/%s/identity-provider/instances", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", idpURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to list identity providers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var idps []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&idps); err != nil {
+		return fmt.Errorf("failed to decode identity providers: %w", err)
+	}
+
+	// Check if OpenShift IdP already exists
+	idpExists := false
+	for _, idp := range idps {
+		if alias, ok := idp["alias"].(string); ok && alias == "openshift" {
+			idpExists = true
+			break
+		}
+	}
+
+	// Get or create OpenShift OAuth client in OpenShift
+	oauthClient := &unstructured.Unstructured{}
+	oauthClient.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "oauth.openshift.io",
+		Version: "v1",
+		Kind:    "OAuthClient",
+	})
+	oauthClient.SetName("keycloak-" + realmName)
+
+	redirectURL := fmt.Sprintf("https://%s/realms/%s/broker/openshift/endpoint", keycloakHost, realmName)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(oauthClient), oauthClient); apierrors.IsNotFound(err) {
+		// Generate a random client secret
+		clientSecret := generateRandomString(32)
+
+		unstructured.SetNestedField(oauthClient.Object, clientSecret, "secret")
+		unstructured.SetNestedField(oauthClient.Object, "prompt", "grantMethod")
+		unstructured.SetNestedStringSlice(oauthClient.Object, []string{redirectURL}, "redirectURIs")
+
+		if err := r.Create(ctx, oauthClient); err != nil {
+			return fmt.Errorf("failed to create OAuthClient: %w", err)
+		}
+		logger.Info("Created OpenShift OAuthClient", "name", oauthClient.GetName())
+	} else if err != nil {
+		return fmt.Errorf("failed to check OAuthClient: %w", err)
+	}
+
+	// Get the client secret
+	clientSecret, _, _ := unstructured.NestedString(oauthClient.Object, "secret")
+	if clientSecret == "" {
+		return fmt.Errorf("OAuthClient secret is empty")
+	}
+
+	// If IdP already exists, update its client secret
+	if idpExists {
+		// Get the full IdP configuration first
+		getURL := fmt.Sprintf("https://%s/admin/realms/%s/identity-provider/instances/openshift", keycloakHost, realmName)
+		req, _ = http.NewRequest("GET", getURL, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to get identity provider: %w", err)
+		}
+		defer resp.Body.Close()
+
+		var existingIdP map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&existingIdP); err != nil {
+			return fmt.Errorf("failed to decode identity provider: %w", err)
+		}
+
+		// Update the client secret and profile settings in the config
+		if config, ok := existingIdP["config"].(map[string]interface{}); ok {
+			config["clientSecret"] = clientSecret
+			config["baseUrl"] = apiServerURL
+		}
+
+		// Set updateProfileFirstLoginMode to "off" to prevent profile update prompts
+		// Set username template to use preferred_username from OpenShift
+		existingIdP["updateProfileFirstLoginMode"] = "off"
+		existingIdP["config"].(map[string]interface{})["userInfoUrl"] = apiServerURL + "/apis/user.openshift.io/v1/users/~"
+
+		// PUT the updated IdP configuration
+		updateJSON, _ := json.Marshal(existingIdP)
+		req, _ = http.NewRequest("PUT", getURL, bytes.NewReader(updateJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to update identity provider: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to update identity provider secret: status %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		logger.Info("Updated OpenShift identity provider client secret and profile settings", "realm", realmName)
+
+		// Configure realm to skip profile review for federated users
+		if err := r.configureRealmProfileSettings(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
+			logger.Error(err, "failed to configure realm profile settings", "realm", realmName)
+		}
+
+		return nil
+	}
+
+	// Create OpenShift identity provider in Keycloak using openshift-v4 provider
+	idpConfig := map[string]interface{}{
+		"alias":                       "openshift",
+		"displayName":                 "OpenShift",
+		"providerId":                  "openshift-v4",
+		"enabled":                     true,
+		"trustEmail":                  true,
+		"firstBrokerLoginFlowAlias":   "first broker login",
+		"updateProfileFirstLoginMode": "off", // Don't prompt for profile updates
+		"config": map[string]interface{}{
+			"baseUrl":      apiServerURL,
+			"clientId":     "keycloak-" + realmName,
+			"clientSecret": clientSecret,
+			"defaultScope": "user:full",
+			"userInfoUrl":  apiServerURL + "/apis/user.openshift.io/v1/users/~",
+		},
+	}
+
+	idpJSON, _ := json.Marshal(idpConfig)
+	req, _ = http.NewRequest("POST", idpURL, bytes.NewBuffer(idpJSON))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create identity provider: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create identity provider: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully added OpenShift identity provider", "realm", realmName)
+
+	// Configure realm to skip profile review for federated users
+	if err := r.configureRealmProfileSettings(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
+		logger.Error(err, "failed to configure realm profile settings", "realm", realmName)
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) configureRealmProfileSettings(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Get the "first broker login" authentication flow
+	flowURL := fmt.Sprintf("https://%s/admin/realms/%s/authentication/flows/first%%20broker%%20login/executions", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", flowURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		logger.Error(err, "failed to get authentication flow", "realm", realmName)
+		return fmt.Errorf("failed to get authentication flow: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Error(fmt.Errorf("unexpected status"), "failed to get authentication flow", "status", resp.StatusCode, "body", string(body))
+		return fmt.Errorf("failed to get authentication flow: status %d", resp.StatusCode)
+	}
+
+	var executions []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&executions); err != nil {
+		return fmt.Errorf("failed to decode executions: %w", err)
+	}
+
+	logger.Info("Found authentication flow executions", "realm", realmName, "count", len(executions))
+
+	// Find the "Review Profile" execution and set its requirement to DISABLED
+	for i, execution := range executions {
+		if displayName, ok := execution["displayName"].(string); ok && displayName == "Review Profile" {
+			logger.Info("Found Review Profile execution", "realm", realmName)
+
+			// Check current requirement
+			currentReq, _ := execution["requirement"].(string)
+			if currentReq == "DISABLED" {
+				logger.Info("Review Profile already disabled", "realm", realmName)
+				continue
+			}
+
+			// Update the execution requirement to DISABLED
+			execution["requirement"] = "DISABLED"
+			executions[i] = execution
+
+			// Update via the flow executions endpoint
+			updateURL := fmt.Sprintf("https://%s/admin/realms/%s/authentication/flows/first%%20broker%%20login/executions", keycloakHost, realmName)
+
+			// PUT the updated execution back
+			execJSON, _ := json.Marshal(execution)
+			updateReq, _ := http.NewRequest("PUT", updateURL, bytes.NewReader(execJSON))
+			updateReq.Header.Set("Authorization", "Bearer "+adminToken)
+			updateReq.Header.Set("Content-Type", "application/json")
+
+			updateResp, err := httpClient.Do(updateReq)
+			if err != nil {
+				logger.Error(err, "failed to disable Review Profile execution", "realm", realmName)
+			} else {
+				defer updateResp.Body.Close()
+				if updateResp.StatusCode == http.StatusNoContent || updateResp.StatusCode == http.StatusAccepted {
+					logger.Info("Disabled Review Profile execution to skip profile updates", "realm", realmName)
+				} else {
+					body, _ := io.ReadAll(updateResp.Body)
+					logger.Error(fmt.Errorf("unexpected status"), "failed to disable Review Profile",
+						"realm", realmName, "status", updateResp.StatusCode, "body", string(body))
+				}
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) addOpenShiftAttributeMappers(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Add username mapper to handle usernames with special characters like "kube:admin"
+	// Note: We don't need hardcoded attribute mappers for email/firstName/lastName
+	// because we set updateProfileFirstLoginMode to "off" which skips the profile update screen
+	mappers := []map[string]interface{}{
+		{
+			"name":                   "username-mapper",
+			"identityProviderAlias":  "openshift",
+			"identityProviderMapper": "oidc-username-idp-mapper",
+			"config": map[string]interface{}{
+				"template": "${CLAIM.preferred_username}",
+			},
+		},
+	}
+
+	for _, mapper := range mappers {
+		mapperJSON, _ := json.Marshal(mapper)
+		mapperURL := fmt.Sprintf("https://%s/admin/realms/%s/identity-provider/instances/openshift/mappers", keycloakHost, realmName)
+		req, _ := http.NewRequest("POST", mapperURL, bytes.NewReader(mapperJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			logger.Error(err, "failed to create attribute mapper", "mapper", mapper["name"])
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict {
+			body, _ := io.ReadAll(resp.Body)
+			logger.Error(fmt.Errorf("unexpected status"), "failed to create attribute mapper",
+				"mapper", mapper["name"], "status", resp.StatusCode, "body", string(body))
+		} else {
+			logger.Info("Added attribute mapper", "mapper", mapper["name"], "realm", realmName)
 		}
 	}
 
