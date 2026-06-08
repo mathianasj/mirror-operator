@@ -342,25 +342,49 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 
 func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) error {
 	output := pipeline.Spec.Storage.Output
-	if output == nil || output.PVC == "" {
+	if output == nil {
 		return nil
 	}
 
+	// Determine PVC name: use explicit name if provided, otherwise generate from pipeline name
+	pvcName := output.PVC
+	if pvcName == "" {
+		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+	}
+
+	// For incremental collections, check if we should reuse the base version's PVC
+	// This allows oc-mirror to calculate deltas from previous collections
+	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+		// Use the base version's PVC name for incremental builds
+		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+	}
+
 	existing := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: output.PVC}, existing)
+	err := r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: pvcName}, existing)
 	if err == nil {
-		return nil
+		return nil // PVC already exists
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
 
+	// Create new PVC - only for non-incremental collections
+	// Incremental collections should reference an existing base PVC
+	if pipeline.Spec.Incremental {
+		return fmt.Errorf("incremental collection requires base PVC %s to exist", pvcName)
+	}
+
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      output.PVC,
+			Name:      pvcName,
 			Namespace: pipeline.Namespace,
-			// Do NOT set owner references - PVCs may be shared across multiple CollectionPipelines
-			// Setting an owner reference would cause the PVC to be deleted when one pipeline is deleted
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "mirror-operator",
+				"mirror.mathianasj.github.com/collection": pipeline.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
+			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -415,15 +439,22 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 
 	output := pipeline.Spec.Storage.Output
 	if output != nil {
-		if output.PVC != "" {
-			declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "output"})
-			bindings = append(bindings, pipelinev1.WorkspaceBinding{
-				Name: "output",
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: output.PVC,
-				},
-			})
+		// Determine PVC name: explicit name, generated name, or base version's PVC for incremental
+		pvcName := output.PVC
+		if pvcName == "" {
+			pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
 		}
+		if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+			pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+		}
+
+		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "output"})
+		bindings = append(bindings, pipelinev1.WorkspaceBinding{
+			Name: "output",
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: pvcName,
+			},
+		})
 
 		if output.S3 != nil {
 			s3Secret := &corev1.Secret{}
