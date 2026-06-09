@@ -554,23 +554,120 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Env: envVars,
 	}
 
-	// Actual mirror step
-	ocMirrorStep := pipelinev1.Step{
-		Name:    "mirror",
-		Image:   mirrorImage,
-		Command: []string{"oc-mirror"},
-		Args: []string{
-			"--v2",
-			"--config=/workspace/config/" + configMapKey,
-			"--authfile=/workspace/pull-secret/.dockerconfigjson",
-			"--cache-dir=/workspace/output/.cache",
-			"file:///workspace/output",
-		},
-		Env: envVars,
+	// Get intermediate registry from DisconnectedPlatform if available
+	var intermediateRegistry string
+	platform, err := r.getParentDisconnectedPlatform(ctx, pipeline)
+	if err != nil || platform == nil {
+		// If no parent platform, try to find any platform in the cluster
+		platform, err = r.findPlatform(ctx)
+	}
+	if err == nil && platform != nil && platform.Spec.Connected != nil {
+		intermediateRegistry = platform.Spec.Connected.MirrorRegistry
+	}
+
+	// Determine if we're using keyless signing (need to check this before configuring mirror steps)
+	hasKeylessSigning := pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil
+
+	// Mirror step configuration depends on whether we're using intermediate registry
+	var ocMirrorStep pipelinev1.Step
+	var mirrorToIntermediateStep pipelinev1.Step
+	var mirrorFromIntermediateStep pipelinev1.Step
+
+	if intermediateRegistry != "" && hasKeylessSigning {
+		// Three-phase workflow with intermediate registry:
+		// 1. Mirror from internet to intermediate registry (m2m)
+		// 2. Sign images in intermediate registry
+		// 3. Mirror from intermediate registry to disk (m2d with signatures)
+
+		// Phase 1: Mirror to intermediate registry (m2m requires --workspace with file:// prefix)
+		mirrorToIntermediateStep = pipelinev1.Step{
+			Name:    "mirror-to-intermediate",
+			Image:   mirrorImage,
+			Command: []string{"oc-mirror"},
+			Args: []string{
+				"--v2",
+				"--config=/workspace/config/" + configMapKey,
+				"--authfile=/workspace/pull-secret/.dockerconfigjson",
+				"--cache-dir=/workspace/output/.cache",
+				"--workspace=file:///workspace/output",
+				"docker://" + intermediateRegistry,
+			},
+			Env: envVars,
+		}
+
+		// Phase 3: Mirror FROM intermediate registry TO disk (will include signatures)
+		mirrorFromIntermediateStep = pipelinev1.Step{
+			Name:    "mirror-from-intermediate",
+			Image:   mirrorImage,
+			Command: []string{"/bin/sh", "-c"},
+			Args: []string{`
+set -e
+echo "=== Creating ImageSetConfiguration to mirror FROM intermediate registry ==="
+
+# Find the mapping file from dry-run
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
+  echo "ERROR: No mapping.txt found, cannot generate intermediate config"
+  exit 1
+fi
+
+# Build ImageSetConfiguration with all images from intermediate registry
+cat > /tmp/intermediate-config.yaml <<'CONFIGHEADER'
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  additionalImages:
+CONFIGHEADER
+
+# Read mapping.txt and convert each dest image to point to intermediate registry
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  # Extract destination path (remove docker:// prefix and localhost:55000)
+  dest_no_proto="${dest#docker://}"
+  intermediate_ref="${dest_no_proto//localhost:55000/` + intermediateRegistry + `}"
+
+  # Add to config (oc-mirror additionalImages expects just name, not docker:// prefix)
+  echo "    - name: $intermediate_ref" >> /tmp/intermediate-config.yaml
+done < "$MAPPING_FILE"
+
+echo "Generated intermediate config with $(grep -c 'name:' /tmp/intermediate-config.yaml) images"
+
+echo "=== Mirroring from intermediate registry to disk (with signatures) ==="
+oc-mirror --v2 \
+  --config=/tmp/intermediate-config.yaml \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  --cache-dir=/workspace/output/.cache-from-intermediate \
+  file:///workspace/output
+
+echo "=== Mirror from intermediate complete ==="
+`},
+			Env: envVars,
+		}
+	} else {
+		// Standard workflow: direct mirror to disk
+		ocMirrorStep = pipelinev1.Step{
+			Name:    "mirror",
+			Image:   mirrorImage,
+			Command: []string{"oc-mirror"},
+			Args: []string{
+				"--v2",
+				"--config=/workspace/config/" + configMapKey,
+				"--authfile=/workspace/pull-secret/.dockerconfigjson",
+				"--cache-dir=/workspace/output/.cache",
+				"file:///workspace/output",
+			},
+			Env: envVars,
+		}
 	}
 
 	// Generate SBOM by scanning images from the oc-mirror cache during mirror operation
 	// Prefer embedded SBOMs when available, fall back to Syft scanning
+	// Also generate per-image SBOMs for attestation
 	syftStep := pipelinev1.Step{
 		Name:    "sbom",
 		Image:   mirrorImage,
@@ -578,6 +675,12 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		Args: []string{`
 set -e
 echo "=== Generating comprehensive SBOM from mirrored images ==="
+
+# Set up registry authentication
+export HOME=/tmp
+mkdir -p $HOME/.docker
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
+export DOCKER_CONFIG=$HOME/.docker
 
 # Use mapping.txt from dry-run step (it contains the complete list of images that were mirrored)
 MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
@@ -605,19 +708,31 @@ SBOM_CACHE_DIR="/workspace/output/sbom-cache"
 mkdir -p "$SBOM_CACHE_DIR"
 mkdir -p /tmp/sboms
 
-echo "Step 1: Extracting SBOMs from images using local registry sidecar..."
+# Create per-image attestation directory for cosign
+ATTESTATION_DIR="/workspace/output/attestations"
+mkdir -p "$ATTESTATION_DIR"
+
+echo "Step 1: Extracting SBOMs from images..."
 echo "SBOM cache directory: $SBOM_CACHE_DIR"
 
-# Wait for registry sidecar to be ready
-echo "Waiting for local registry to start..."
-for i in {1..30}; do
-  if curl -s http://localhost:5000/v2/ >/dev/null 2>&1; then
-    echo "Registry is ready"
-    break
-  fi
-  echo "  Waiting for registry... ($i/30)"
-  sleep 2
-done
+# Determine if we're using intermediate registry or local sidecar
+if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+  echo "Using intermediate registry: $INTERMEDIATE_REGISTRY"
+  SCAN_REGISTRY="$INTERMEDIATE_REGISTRY"
+else
+  echo "Using local registry sidecar"
+  SCAN_REGISTRY="localhost:5000"
+  # Wait for registry sidecar to be ready
+  echo "Waiting for local registry to start..."
+  for i in {1..30}; do
+    if curl -s http://localhost:5000/v2/ >/dev/null 2>&1; then
+      echo "Registry is ready"
+      break
+    fi
+    echo "  Waiting for registry... ($i/30)"
+    sleep 2
+  done
+fi
 
 scan_count=0
 embedded_count=0
@@ -632,15 +747,25 @@ while IFS='=' read -r source dest; do
 
   current_image=$((current_image + 1))
 
-  # The dest format is: docker://localhost:55000/openshift/release@sha256:xxx
-  # Strip docker:// and change to registry: transport, port 55000 -> 5000
+  # For intermediate registry: use dest path but replace localhost:55000 with intermediate registry
+  # For local sidecar: use dest format docker://localhost:55000/... -> localhost:5000
   dest_no_proto="${dest#docker://}"
-  local_image="registry:${dest_no_proto//localhost:55000/localhost:5000}"
+  if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+    # Scan from intermediate registry - use registry: transport for remote registry
+    local_image="registry:${dest_no_proto//localhost:55000/$INTERMEDIATE_REGISTRY}"
+  else
+    # Scan from local sidecar
+    local_image="registry:${dest_no_proto//localhost:55000/localhost:5000}"
+  fi
 
   echo "  [$current_image/$image_count] Processing: $source"
 
   # Extract digest from dest (format: docker://localhost:55000/repo/path@sha256:digest)
+  # If dest doesn't have digest, try source
   image_digest=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+  if [ -z "$image_digest" ]; then
+    image_digest=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+  fi
 
   sbom_file="/tmp/sboms/$(echo "$dest_no_proto" | tr '/:@' '_').json"
   found_sbom=false
@@ -662,9 +787,16 @@ while IFS='=' read -r source dest; do
 
   # Try to extract embedded SBOM using cosign (try modern attestations first, then deprecated attachments)
   # (cosign doesn't use protocol prefix, just registry:port/path)
-  cosign_ref="${dest_no_proto//localhost:55000/localhost:5000}"
+  if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+    # For intermediate registry, use dest path with intermediate registry
+    cosign_ref="${dest_no_proto//localhost:55000/$INTERMEDIATE_REGISTRY}"
+  else
+    # For local sidecar
+    cosign_ref="${dest_no_proto//localhost:55000/localhost:5000}"
+  fi
 
   # Try attestations (modern approach)
+  # Note: DOCKER_CONFIG is already exported at the top of the script
   if cosign download attestation "$cosign_ref" --predicate-type=https://spdx.dev/Document > "$sbom_file" 2>/dev/null; then
     pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
     if [ "$pkg_count" -gt 0 ]; then
@@ -676,6 +808,7 @@ while IFS='=' read -r source dest; do
   fi
 
   # Try deprecated SBOM attachments if attestation not found
+  # Note: DOCKER_CONFIG is already exported at the top of the script
   if [ "$found_sbom" = false ] && cosign download sbom "$cosign_ref" > "$sbom_file" 2>/dev/null; then
     pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
     if [ "$pkg_count" -gt 0 ]; then
@@ -687,8 +820,10 @@ while IFS='=' read -r source dest; do
   fi
 
   # If no embedded SBOM, scan with Syft using registry: transport
+  # Note: DOCKER_CONFIG is already exported at the top of the script
   if [ "$found_sbom" = false ]; then
-    if syft "$local_image" -o cyclonedx-json > "$sbom_file" 2>&1; then
+    syft_err_file="/tmp/syft_err_$$"
+    if syft "$local_image" -o cyclonedx-json > "$sbom_file" 2>"$syft_err_file"; then
       pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
       if [ "$pkg_count" -gt 0 ]; then
         scan_count=$((scan_count + 1))
@@ -696,15 +831,35 @@ while IFS='=' read -r source dest; do
         echo "    ✓ Scanned with Syft ($pkg_count packages)"
         found_sbom=true
       fi
+      rm -f "$syft_err_file"
     else
-      echo "    ✗ Syft scan failed"
+      echo "    ✗ Syft scan failed for: $local_image"
+      if [ -f "$syft_err_file" ] && [ -s "$syft_err_file" ]; then
+        echo "    Error: $(head -3 "$syft_err_file")"
+      fi
+      rm -f "$syft_err_file"
     fi
   fi
 
   # Cache the SBOM if we successfully generated/extracted one
-  if [ "$found_sbom" = true ] && [ -n "$image_digest" ] && [ -f "$sbom_file" ]; then
+  # Debug: always try to cache and report what happens
+  if [ -z "$image_digest" ]; then
+    echo "    [cache skip: no digest]"
+  elif [ ! -f "$sbom_file" ]; then
+    echo "    [cache skip: SBOM file missing]"
+  elif [ "$found_sbom" != true ]; then
+    echo "    [cache skip: found_sbom=$found_sbom]"
+  else
     cached_sbom="$SBOM_CACHE_DIR/$(echo "$image_digest" | tr ':' '_').json"
-    cp "$sbom_file" "$cached_sbom" 2>/dev/null || true
+    if cp "$sbom_file" "$cached_sbom"; then
+      echo "    → Cached"
+    else
+      echo "    ⚠ Cache write failed"
+    fi
+
+    # Also save per-image SBOM for cosign attestation
+    attestation_file="$ATTESTATION_DIR/$(echo "$dest_no_proto" | tr '/:@' '_').json"
+    cp "$sbom_file" "$attestation_file" 2>/dev/null || true
   fi
 
   if [ "$found_sbom" = false ]; then
@@ -718,30 +873,20 @@ echo "Processed images: $embedded_count embedded SBOMs, $scan_count Syft scans, 
 # Step 2: Build SBOM from mapping.txt and scanned data
 echo "Step 2: Building comprehensive SBOM..."
 
-cat > /workspace/output/sbom.cyclonedx.json <<'SBOM_HEADER'
-{
-  "bomFormat": "CycloneDX",
-  "specVersion": "1.4",
-  "version": 1,
-  "metadata": {
-    "timestamp": "TIMESTAMP_PLACEHOLDER",
-    "component": {
-      "type": "container",
-      "name": "mirror-collection",
-      "version": "VERSION_PLACEHOLDER"
-    }
-  },
-  "components": [
-SBOM_HEADER
+# First, collect all packages with container context
+echo "Aggregating packages from all images..."
+all_packages_file="/tmp/all_packages.json"
+echo "[]" > "$all_packages_file"
 
-first=true
-component_count=0
-scanned_packages=0
+image_count_for_packages=0
+total_packages=0
 
 # Parse mapping.txt (format: source=dest)
 while IFS='=' read -r source dest; do
   # Skip empty lines and comments
   [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  image_count_for_packages=$((image_count_for_packages + 1))
 
   # Extract image details
   image_full="$source"
@@ -756,41 +901,63 @@ while IFS='=' read -r source dest; do
     version="${version:-latest}"
   fi
 
-  # Add comma separator
-  [ "$first" = false ] && echo "," >> /workspace/output/sbom.cyclonedx.json
-  first=false
-
   # Try to find package data from extracted/scanned SBOMs
-  packages="[]"
-  sbom_file="/tmp/sboms/$(echo "$dest" | tr '/:@' '_').json"
+  dest_no_proto="${dest#docker://}"
+  sbom_file="/tmp/sboms/$(echo "$dest_no_proto" | tr '/:@' '_').json"
   if [ -f "$sbom_file" ]; then
     packages=$(jq '.components // []' "$sbom_file" 2>/dev/null || echo "[]")
     pkg_count=$(echo "$packages" | jq 'length // 0')
     if [ "$pkg_count" -gt 0 ]; then
-      scanned_packages=$((scanned_packages + pkg_count))
-      echo "  Found $pkg_count packages for $image_name"
+      total_packages=$((total_packages + pkg_count))
+      echo "  [$image_count_for_packages] Found $pkg_count packages in $image_name"
+
+      # Add container context to each package and merge into all_packages
+      # This adds properties to track which container each package came from
+      enriched_packages=$(echo "$packages" | jq --arg img "$image_full" --arg name "$image_name" --arg ver "$version" '
+        map(. + {
+          "properties": ([.properties // [] | .[],
+            {"name": "container:image", "value": $img},
+            {"name": "container:name", "value": $name},
+            {"name": "container:version", "value": $ver}
+          ])
+        })
+      ')
+
+      # Merge into all_packages array
+      jq -s '.[0] + .[1]' "$all_packages_file" <(echo "$enriched_packages") > /tmp/merged.json
+      mv /tmp/merged.json "$all_packages_file"
     fi
   fi
-
-  # Write component entry
-  cat >> /workspace/output/sbom.cyclonedx.json <<COMPONENT
-    {
-      "type": "container",
-      "name": "$image_name",
-      "version": "$version",
-      "purl": "pkg:oci/$image_full",
-      "components": $packages
-    }
-COMPONENT
-
-  component_count=$((component_count + 1))
 done < "$MAPPING_FILE"
 
-# Close JSON
-cat >> /workspace/output/sbom.cyclonedx.json <<'SBOM_FOOTER'
-  ]
+echo "Total packages collected: $total_packages from $image_count_for_packages images"
+
+# Build final SBOM with flattened package list
+cat > /workspace/output/sbom.cyclonedx.json <<SBOM_TEMPLATE
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.4",
+  "version": 1,
+  "metadata": {
+    "timestamp": "TIMESTAMP_PLACEHOLDER",
+    "component": {
+      "type": "container",
+      "name": "mirror-collection",
+      "version": "VERSION_PLACEHOLDER"
+    }
+  },
+  "components": COMPONENTS_PLACEHOLDER
 }
-SBOM_FOOTER
+SBOM_TEMPLATE
+
+# Insert the aggregated components
+components_json=$(cat "$all_packages_file")
+# Use a unique delimiter that won't appear in JSON
+jq --argjson components "$components_json" '.components = $components' /workspace/output/sbom.cyclonedx.json > /tmp/final_sbom.json
+mv /tmp/final_sbom.json /workspace/output/sbom.cyclonedx.json
+
+component_count=$total_packages
+scanned_packages=$total_packages
 
 # Update placeholders
 sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/" /workspace/output/sbom.cyclonedx.json
@@ -817,7 +984,150 @@ rm -rf /tmp/sboms
 		},
 	}
 
-	// Build signing step based on configuration
+	// Build image signing step for signing container images and attaching SBOM attestations
+	var signImagesStep *pipelinev1.Step
+	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil {
+		// Keyless signing - sign container images with SBOM attestations
+		tufURL := pipeline.Spec.Signing.Keyless.TUFURL
+		if tufURL == "" {
+			tufURL = "http://tuf.mirror-operator-system.svc"
+		}
+
+		// Determine target registry (intermediate if available, otherwise local cache)
+		var registryTarget string
+		if intermediateRegistry != "" {
+			registryTarget = intermediateRegistry
+		} else {
+			registryTarget = "localhost:5000" // Local registry sidecar
+		}
+
+		signImagesStep = &pipelinev1.Step{
+			Name:    "sign-images",
+			Image:   mirrorImage,
+			Command: []string{"/bin/sh", "-c"},
+			Args: []string{`
+set -e
+
+# Set up registry authentication
+export HOME=/tmp
+mkdir -p $HOME/.docker
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
+export DOCKER_CONFIG=$HOME/.docker
+
+echo "=== Initializing TUF root ==="
+cosign initialize --mirror="$TUF_URL" --root="$TUF_URL/root.json"
+
+echo "=== Signing container images in $REGISTRY_TARGET ==="
+
+# Find the mapping file from dry-run
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
+  echo "No mapping.txt found, skipping image signing"
+  exit 0
+fi
+
+signed_count=0
+attested_count=0
+total_images=$(wc -l < "$MAPPING_FILE")
+
+echo "Processing $total_images images from mapping file..."
+
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  # Construct target image reference
+  # For intermediate registry: use dest path but replace localhost:55000 with intermediate registry
+  # For local cache: use localhost:5000
+  dest_no_proto="${dest#docker://}"
+  if [ "$REGISTRY_TARGET" = "localhost:5000" ]; then
+    # Local cache mode - convert to localhost:5000
+    image_ref="${dest_no_proto//localhost:55000/localhost:5000}"
+  else
+    # Intermediate registry mode - replace localhost:55000 with intermediate registry
+    image_ref="${dest_no_proto//localhost:55000/$REGISTRY_TARGET}"
+  fi
+
+  # Convert tag references to digests for safer signing
+  if [[ "$image_ref" =~ :[^@]+$ ]] && [[ ! "$image_ref" =~ @ ]]; then
+    echo "  Resolving tag to digest for: $image_ref"
+    digest=$(skopeo inspect --format '{{.Digest}}' "docker://$image_ref" 2>/dev/null || echo "")
+    if [ -n "$digest" ]; then
+      # Replace tag with digest
+      image_ref="${image_ref%%:*}@$digest"
+      echo "    Resolved to: $image_ref"
+    else
+      echo "    Warning: Could not resolve digest, signing with tag"
+    fi
+  fi
+
+  echo "  Signing: $image_ref"
+
+  # Sign the image
+  if cosign sign \
+    --fulcio-url "$FULCIO_URL" \
+    --rekor-url "$REKOR_URL" \
+    --fulcio-auth-flow=client_credentials \
+    --oidc-issuer "$COSIGN_OIDC_ISSUER" \
+    --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" \
+    --oidc-client-secret-file /workspace/oidc-secret/clientSecret \
+    --yes \
+    --registry-referrers-mode=oci-1-1 \
+    "$image_ref" 2>&1; then
+    signed_count=$((signed_count + 1))
+    echo "    ✓ Signed"
+  else
+    echo "    ✗ Failed to sign: $image_ref"
+  fi
+
+  # Attach SBOM attestation if available
+  dest_no_proto="${dest#docker://}"
+  attestation_file="/workspace/output/attestations/$(echo "$dest_no_proto" | tr '/:@' '_').json"
+  if [ -f "$attestation_file" ]; then
+    echo "    Attaching SBOM attestation..."
+    if cosign attest \
+      --fulcio-url "$FULCIO_URL" \
+      --rekor-url "$REKOR_URL" \
+      --fulcio-auth-flow=client_credentials \
+      --oidc-issuer "$COSIGN_OIDC_ISSUER" \
+      --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" \
+      --oidc-client-secret-file /workspace/oidc-secret/clientSecret \
+      --yes \
+      --type cyclonedx \
+      --predicate "$attestation_file" \
+      --registry-referrers-mode=oci-1-1 \
+      "$image_ref" 2>&1; then
+      attested_count=$((attested_count + 1))
+      echo "    ✓ SBOM attestation attached"
+    else
+      echo "    ✗ Failed to attach SBOM attestation"
+    fi
+  fi
+
+done < "$MAPPING_FILE"
+
+echo "=== Image Signing Complete ==="
+echo "  Registry: $REGISTRY_TARGET"
+echo "  Total images: $total_images"
+echo "  Successfully signed: $signed_count"
+echo "  SBOM attestations attached: $attested_count"
+`},
+			Env: []corev1.EnvVar{
+				{Name: "COSIGN_EXPERIMENTAL", Value: "1"},
+				{Name: "COSIGN_OIDC_ISSUER", Value: pipeline.Spec.Signing.Keyless.OIDCIssuer},
+				{Name: "COSIGN_OIDC_CLIENT_ID", Value: pipeline.Spec.Signing.Keyless.OIDCClientID},
+				{Name: "FULCIO_URL", Value: pipeline.Spec.Signing.Keyless.FulcioURL},
+				{Name: "REKOR_URL", Value: pipeline.Spec.Signing.Keyless.RekorURL},
+				{Name: "TUF_URL", Value: tufURL},
+				{Name: "REGISTRY_TARGET", Value: registryTarget},
+			},
+		}
+	}
+
+	// Build bundle signing step based on configuration
 	var cosignSignStep pipelinev1.Step
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil {
 		// Keyless signing with Fulcio using client credentials flow
@@ -828,7 +1138,7 @@ rm -rf /tmp/sboms
 		}
 
 		cosignSignStep = pipelinev1.Step{
-			Name:    "sign",
+			Name:    "sign-bundles",
 			Image:   mirrorImage,
 			Command: []string{"/bin/sh", "-c"},
 			Args:    []string{`echo "=== Initializing TUF root ==="; cosign initialize --mirror="$TUF_URL" --root="$TUF_URL/root.json"; echo "=== Signing bundles ==="; for f in /workspace/output/*.tar; do [ -f "$f" ] || continue; bn=$(basename "$f" .tar); cosign sign-blob --fulcio-url "$FULCIO_URL" --rekor-url "$REKOR_URL" --fulcio-auth-flow=client_credentials --oidc-issuer "$COSIGN_OIDC_ISSUER" --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" --oidc-client-secret-file /workspace/oidc-secret/clientSecret --yes "$f" --bundle "/workspace/output/${bn}.bundle"; done; echo "=== Generating attestation ==="; bh=$(sha256sum /workspace/output/*.tar 2>/dev/null | head -1 | cut -d' ' -f1); if [ -z "$bh" ]; then exit 0; fi; sh=$(sha256sum /workspace/output/sbom.cyclonedx.json 2>/dev/null | cut -d' ' -f1 || echo ""); if [ -z "$sh" ]; then exit 0; fi; printf '{"bundle":{"sha256":"%s"},"sbom":{"sha256":"%s"}}\n' "$bh" "$sh" > /workspace/output/attestation.json; echo "=== Signing attestation ==="; cosign sign-blob --fulcio-url "$FULCIO_URL" --rekor-url "$REKOR_URL" --fulcio-auth-flow=client_credentials --oidc-issuer "$COSIGN_OIDC_ISSUER" --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" --oidc-client-secret-file /workspace/oidc-secret/clientSecret --yes /workspace/output/attestation.json --bundle /workspace/output/attestation.bundle`},
@@ -843,7 +1153,7 @@ rm -rf /tmp/sboms
 	} else {
 		// Legacy key-based signing
 		cosignSignStep = pipelinev1.Step{
-			Name:    "sign",
+			Name:    "sign-bundles",
 			Image:   mirrorImage,
 			Command: []string{"/bin/sh", "-c"},
 			Args:    []string{`for f in /workspace/output/*.tar; do [ -f "$f" ] || continue; bn=$(basename "$f" .tar); cosign sign-blob --key /workspace/cosign-key/cosign.key "$f" --output-signature "/workspace/output/${bn}.sig"; done; bh=$(sha256sum /workspace/output/*.tar 2>/dev/null | head -1 | cut -d' ' -f1); if [ -z "$bh" ]; then exit 0; fi; sh=$(sha256sum /workspace/output/sbom.cyclonedx.json 2>/dev/null | cut -d' ' -f1 || echo ""); if [ -z "$sh" ]; then exit 0; fi; printf '{"bundle":{"sha256":"%s"},"sbom":{"sha256":"%s"}}\n' "$bh" "$sh" > /workspace/output/attestation.json; cosign sign-blob --key /workspace/cosign-key/cosign.key /workspace/output/attestation.json --output-signature /workspace/output/attestation.json.sig`},
@@ -872,7 +1182,7 @@ fi
 echo "Getting OIDC token..."
 TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
   -d "grant_type=client_credentials" \
-  -d "client_id=sbom-uploader" \
+  -d "client_id=cli" \
   -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)")
 
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
@@ -882,11 +1192,10 @@ if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
 fi
 
 echo "Uploading SBOM to TPA..."
-UPLOAD_URL="%s?format=cyclonedx&labels="
-HTTP_CODE=$(curl -k -s -w "%%{http_code}" -o /tmp/upload_response.txt -X POST "$UPLOAD_URL" \
+HTTP_CODE=$(curl -k -s -w "%%{http_code}" -o /tmp/upload_response.txt -X POST "%s" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary @/workspace/output/sbom.cyclonedx.json)
+  -H "Content-Type: application/json" \
+  -d @/workspace/output/sbom.cyclonedx.json)
 
 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
   echo "SBOM uploaded successfully (HTTP $HTTP_CODE)"
@@ -900,8 +1209,20 @@ fi
 		}
 	}
 
-	cosignTasks := []pipelinev1.PipelineTask{
-		{
+	// Build task pipeline based on signing configuration and intermediate registry availability
+	var pipelineTasks []pipelinev1.PipelineTask
+
+	if hasKeylessSigning && intermediateRegistry != "" {
+		// Intermediate registry workflow with keyless signing:
+		// 1. dry-run (fast mapping generation)
+		// 2. mirror-to-intermediate (m2m: internet -> intermediate quay)
+		// 3. syft-sbom (generate SBOMs from intermediate registry)
+		// 4. sign-images (sign images IN intermediate registry + attach SBOM attestations)
+		// 5. mirror-from-intermediate (m2d: intermediate quay -> disk, includes signatures!)
+		// 6. sign-bundles (sign the tar file)
+
+		// Step 1: dry-run for mapping
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
 			Name: "dry-run",
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
@@ -909,8 +1230,101 @@ fi
 				},
 			},
 			Workspaces: taskWorkspaceBindings,
-		},
-		{
+		})
+
+		// Step 2: Mirror to intermediate registry
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "mirror-to-intermediate",
+			RunAfter: []string{"dry-run"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{mirrorToIntermediateStep},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		})
+
+		// Step 3: SBOM generation (from intermediate registry)
+		// Create a modified syftStep with INTERMEDIATE_REGISTRY env var
+		syftStepWithRegistry := syftStep
+		syftStepWithRegistry.Env = append(syftStepWithRegistry.Env, corev1.EnvVar{
+			Name:  "INTERMEDIATE_REGISTRY",
+			Value: intermediateRegistry,
+		})
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "syft-sbom",
+			RunAfter: []string{"mirror-to-intermediate"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{syftStepWithRegistry},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		})
+
+		// Step 4: Sign images in intermediate registry
+		signImagesWorkspaces := append(taskWorkspaceBindings, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "sign-images",
+			RunAfter: []string{"syft-sbom"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{*signImagesStep},
+				},
+			},
+			Workspaces: signImagesWorkspaces,
+		})
+
+		// Step 5: Mirror FROM intermediate TO disk (with signatures!)
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "mirror-from-intermediate",
+			RunAfter: []string{"sign-images"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{mirrorFromIntermediateStep},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		})
+
+		// Step 6: Sign the tar bundle
+		signBundlesWorkspaces := []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding}
+		if hasKeylessSigning {
+			signBundlesWorkspaces = append(signBundlesWorkspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
+		}
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "sign-bundles",
+			RunAfter: []string{"mirror-from-intermediate"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{cosignSignStep},
+				},
+			},
+			Workspaces: signBundlesWorkspaces,
+		})
+
+	} else if hasKeylessSigning {
+		// Local cache workflow with keyless signing (fallback if no intermediate registry):
+		// 1. dry-run (fast mapping generation)
+		// 2. oc-mirror (populate cache)
+		// 3. syft-sbom (generate SBOMs for attestation)
+		// 4. sign-images (sign images + attach SBOM attestations in local cache)
+		// 5. create-archive (tar with signed images)
+		// 6. sign-bundles (sign the tar file)
+
+		// Step 1: dry-run for mapping
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name: "dry-run",
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{dryRunStep},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		})
+
+		// Step 2: Mirror to local cache
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
 			Name:     "oc-mirror",
 			RunAfter: []string{"dry-run"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
@@ -919,8 +1333,10 @@ fi
 				},
 			},
 			Workspaces: taskWorkspaceBindings,
-		},
-		{
+		})
+
+		// Step 3: SBOM generation (from local cache)
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
 			Name:     "syft-sbom",
 			RunAfter: []string{"oc-mirror"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
@@ -945,24 +1361,123 @@ fi
 				},
 			},
 			Workspaces: taskWorkspaceBindings,
-		},
-		{
-			Name:     "cosign-sign",
+		})
+
+		// Step 4: Sign images in local cache
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "sign-images",
 			RunAfter: []string{"syft-sbom"},
+			TaskSpec: &pipelinev1.EmbeddedTask{
+				TaskSpec: pipelinev1.TaskSpec{
+					Steps: []pipelinev1.Step{*signImagesStep},
+					Sidecars: []pipelinev1.Sidecar{
+						{
+							Name:  "registry",
+							Image: "registry:2",
+							Env: []corev1.EnvVar{
+								{
+									Name:  "REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY",
+									Value: "/workspace/output/.cache/.oc-mirror/.cache",
+								},
+								{
+									Name:  "REGISTRY_HTTP_ADDR",
+									Value: "0.0.0.0:5000",
+								},
+							},
+						},
+					},
+				},
+			},
+			Workspaces: taskWorkspaceBindings,
+		})
+
+		// Note: Signatures in local cache won't be included in tar created by oc-mirror
+		// This fallback workflow is less ideal - recommend using intermediate registry
+
+		// Step 5: Sign the tar bundle
+		pipelineTasks = append(pipelineTasks, pipelinev1.PipelineTask{
+			Name:     "sign-bundles",
+			RunAfter: []string{"sign-images"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{cosignSignStep},
 				},
 			},
 			Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding},
-		},
+		})
+	} else {
+		// Legacy workflow (no keyless signing):
+		// 1. dry-run
+		// 2. oc-mirror (creates archive)
+		// 3. syft-sbom
+		// 4. sign-bundles (tar only)
+
+		pipelineTasks = []pipelinev1.PipelineTask{
+			{
+				Name: "dry-run",
+				TaskSpec: &pipelinev1.EmbeddedTask{
+					TaskSpec: pipelinev1.TaskSpec{
+						Steps: []pipelinev1.Step{dryRunStep},
+					},
+				},
+				Workspaces: taskWorkspaceBindings,
+			},
+			{
+				Name:     "oc-mirror",
+				RunAfter: []string{"dry-run"},
+				TaskSpec: &pipelinev1.EmbeddedTask{
+					TaskSpec: pipelinev1.TaskSpec{
+						Steps: []pipelinev1.Step{ocMirrorStep},
+					},
+				},
+				Workspaces: taskWorkspaceBindings,
+			},
+			{
+				Name:     "syft-sbom",
+				RunAfter: []string{"oc-mirror"},
+				TaskSpec: &pipelinev1.EmbeddedTask{
+					TaskSpec: pipelinev1.TaskSpec{
+						Steps: []pipelinev1.Step{syftStep},
+						Sidecars: []pipelinev1.Sidecar{
+							{
+								Name:  "registry",
+								Image: "registry:2",
+								Env: []corev1.EnvVar{
+									{
+										Name:  "REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY",
+										Value: "/workspace/output/.cache/.oc-mirror/.cache",
+									},
+									{
+										Name:  "REGISTRY_HTTP_ADDR",
+										Value: "0.0.0.0:5000",
+									},
+								},
+							},
+						},
+					},
+				},
+				Workspaces: taskWorkspaceBindings,
+			},
+			{
+				Name:     "sign-bundles",
+				RunAfter: []string{"syft-sbom"},
+				TaskSpec: &pipelinev1.EmbeddedTask{
+					TaskSpec: pipelinev1.TaskSpec{
+						Steps: []pipelinev1.Step{cosignSignStep},
+					},
+				},
+				Workspaces: []pipelinev1.WorkspacePipelineTaskBinding{outputWorkspaceBinding},
+			},
+		}
 	}
+
+	cosignTasks := pipelineTasks
 
 	// Add SBOM upload task if TPA is available
 	if uploadSbomStep != nil {
 		uploadTask := pipelinev1.PipelineTask{
 			Name:     "upload-sbom",
-			RunAfter: []string{"cosign-sign"},
+			RunAfter: []string{"sign-bundles"},
 			TaskSpec: &pipelinev1.EmbeddedTask{
 				TaskSpec: pipelinev1.TaskSpec{
 					Steps: []pipelinev1.Step{*uploadSbomStep},
@@ -975,16 +1490,18 @@ fi
 		}
 		cosignTasks = append(cosignTasks, uploadTask)
 
-		// Add TPA OIDC secret workspace binding (using dedicated sbom-uploader client)
+		// Add TPA OIDC secret workspace binding (using CLI client)
 		tpaOidcSecretBinding := pipelinev1.WorkspaceBinding{
 			Name: "tpa-oidc-secret",
 			Secret: &corev1.SecretVolumeSource{
-				SecretName: "sbom-uploader-secret",
+				SecretName: "rhtpa-oidc-cli-secret",
 			},
 		}
 		bindings = append(bindings, tpaOidcSecretBinding)
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "tpa-oidc-secret"})
 	}
+
+	// OIDC secret workspace is added later at line 1426-1438, so skip duplicate here
 
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.KeySecretRef != nil {
 		cosignKeyBinding := pipelinev1.WorkspaceBinding{
@@ -995,7 +1512,13 @@ fi
 		}
 		bindings = append(bindings, cosignKeyBinding)
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "cosign-key"})
-		cosignTasks[3].Workspaces = append(cosignTasks[3].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "cosign-key", Workspace: "cosign-key"})
+		// Find the bundle signing task and add cosign-key workspace
+		for i := range cosignTasks {
+			if cosignTasks[i].Name == "sign-bundles" {
+				cosignTasks[i].Workspaces = append(cosignTasks[i].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "cosign-key", Workspace: "cosign-key"})
+				break
+			}
+		}
 	}
 
 	if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.PasswordSecretRef != nil {
@@ -1024,7 +1547,17 @@ fi
 		}
 		bindings = append(bindings, oidcSecretBinding)
 		declaredWorkspaces = append(declaredWorkspaces, pipelinev1.PipelineWorkspaceDeclaration{Name: "oidc-secret"})
-		cosignTasks[3].Workspaces = append(cosignTasks[3].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
+
+		// Add oidc-secret workspace to sign-images task (only for local cache workflow)
+		// For intermediate registry workflow, it's already added at line 1241
+		if intermediateRegistry == "" {
+			for i := range cosignTasks {
+				if cosignTasks[i].Name == "sign-images" {
+					cosignTasks[i].Workspaces = append(cosignTasks[i].Workspaces, pipelinev1.WorkspacePipelineTaskBinding{Name: "oidc-secret", Workspace: "oidc-secret"})
+					break
+				}
+			}
+		}
 	}
 
 	pipelineRunNamePrefix := fmt.Sprintf("collection-pipeline-%s-", pipeline.Name)
@@ -1129,6 +1662,48 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	keycloakHost := "keycloak." + domain
 
 	return tpaHostname, keycloakHost
+}
+
+// generateIntermediateImageSetConfig creates an ImageSetConfiguration that pulls from the intermediate registry
+func (r *CollectionPipelineReconciler) generateIntermediateImageSetConfig(pipeline *mirrorv1.CollectionPipeline, intermediateRegistry string) string {
+	// Parse the original config to understand what was mirrored
+	// For now, we'll create a simple config that mirrors everything from the intermediate registry
+	// This is a simplified version - in production you'd want to parse the original config
+	// and rewrite all image references to point to the intermediate registry
+
+	return `kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  additionalImages:
+    - name: ` + intermediateRegistry + `/*
+`
+	// TODO: Properly parse original ImageSetConfiguration and rewrite registry references
+	// This requires more sophisticated logic to handle:
+	// - platform.release paths
+	// - operator catalog references
+	// - additionalImages
+	// - helm charts
+}
+
+// getParentDisconnectedPlatform finds the DisconnectedPlatform that owns this CollectionPipeline
+func (r *CollectionPipelineReconciler) getParentDisconnectedPlatform(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) (*mirrorv1.DisconnectedPlatform, error) {
+	// Check if this pipeline has an owner reference to a DisconnectedPlatform
+	for _, ownerRef := range pipeline.GetOwnerReferences() {
+		if ownerRef.Kind == "DisconnectedPlatform" {
+			platform := &mirrorv1.DisconnectedPlatform{}
+			err := r.Get(ctx, types.NamespacedName{
+				Namespace: pipeline.Namespace,
+				Name:      ownerRef.Name,
+			}, platform)
+			if err != nil {
+				return nil, err
+			}
+			return platform, nil
+		}
+	}
+
+	// No DisconnectedPlatform owner found
+	return nil, nil
 }
 
 func (r *CollectionPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -1,0 +1,60 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: CollectionPipeline
+metadata:
+  name: ocp-4-18-signed
+  namespace: mirror-operator-system
+spec:
+  triggerType: scheduled
+  incremental: false
+
+  # ImageSetConfiguration for mirroring
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v2alpha1
+    mirror:
+      platform:
+        channels:
+        - name: stable-4.18
+          minVersion: 4.18.1
+          maxVersion: 4.18.3
+        graph: true
+      operators:
+        - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.18
+          packages:
+           - name: aws-load-balancer-operator
+           - name: node-observability-operator
+      additionalImages:
+       - name: quay.io/my-org/custom-app:v1.0
+
+  # Storage for tar bundles
+  storage:
+    output:
+      pvc: "collection-storage"
+
+  # Keyless signing configuration
+  # This will:
+  # 1. Mirror images from internet to intermediate Quay (from DisconnectedPlatform)
+  # 2. Sign images in Quay with SBOM attestations
+  # 3. Mirror FROM Quay to disk (tar includes signatures!)
+  signing:
+    keyless:
+      fulcioURL: "https://fulcio.mirror-operator-system.svc"
+      rekorURL: "https://rekor.mirror-operator-system.svc"
+      tufURL: "http://tuf.mirror-operator-system.svc"
+      oidcIssuer: "https://keycloak.apps.example.com/realms/trusted-artifact-signer"
+      oidcClientID: "mirror-operator"
+      oidcClientSecret:
+        name: "rhtpa-oidc-secret"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: collection-storage
+  namespace: mirror-operator-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: gp3-csi

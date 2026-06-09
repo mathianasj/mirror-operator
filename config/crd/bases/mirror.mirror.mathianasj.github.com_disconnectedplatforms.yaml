@@ -97,6 +97,22 @@ spec:
                     type: boolean
                   frontendImage:
                     type: string
+                  githubTokenSecret:
+                    description: |-
+                      LocalObjectReference contains enough information to let you locate the
+                      referenced object inside the same namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   pullSecret:
                     description: |-
                       LocalObjectReference contains enough information to let you locate the
@@ -178,6 +194,21 @@ spec:
                           startingCSV:
                             type: string
                         type: object
+                      quayOperator:
+                        properties:
+                          approvalStrategy:
+                            type: string
+                          catalogSource:
+                            type: string
+                          catalogSourceNamespace:
+                            type: string
+                          channel:
+                            type: string
+                          disabled:
+                            type: boolean
+                          startingCSV:
+                            type: string
+                        type: object
                       rhtas:
                         properties:
                           approvalStrategy:
@@ -207,6 +238,96 @@ spec:
                             type: boolean
                           startingCSV:
                             type: string
+                        type: object
+                    type: object
+                  quay:
+                    properties:
+                      externalURL:
+                        description: External Quay configuration if not using managed
+                          instance
+                        type: string
+                      managed:
+                        description: Managed Quay instance for intermediate registry
+                        properties:
+                          adminPassword:
+                            type: string
+                          adminUser:
+                            type: string
+                          certIssuer:
+                            properties:
+                              kind:
+                                type: string
+                              name:
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          clair:
+                            properties:
+                              useRedHatVEXOnly:
+                                description: UseRedHatVEXOnly configures Clair to
+                                  use only Red Hat VEX data for vulnerability scanning
+                                type: boolean
+                            type: object
+                          database:
+                            properties:
+                              host:
+                                type: string
+                              name:
+                                type: string
+                              password:
+                                type: string
+                              port:
+                                format: int32
+                                type: integer
+                              username:
+                                type: string
+                            required:
+                            - host
+                            - name
+                            type: object
+                          enabled:
+                            type: boolean
+                          organizationName:
+                            type: string
+                          storage:
+                            properties:
+                              s3AccessKey:
+                                type: string
+                              s3Bucket:
+                                description: S3-specific config
+                                type: string
+                              s3Endpoint:
+                                type: string
+                              s3SecretKey:
+                                type: string
+                              size:
+                                type: string
+                              storageClass:
+                                type: string
+                              type:
+                                type: string
+                            required:
+                            - type
+                            type: object
+                          tlsSecret:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - enabled
                         type: object
                     type: object
                   rhtas:
@@ -346,7 +467,6 @@ spec:
                 required:
                 - artifactStorage
                 - collectionSchedule
-                - mirrorRegistry
                 type: object
               gitOps:
                 properties:

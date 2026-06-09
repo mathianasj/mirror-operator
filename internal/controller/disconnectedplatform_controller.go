@@ -5,12 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
 )
@@ -216,6 +221,19 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
+	// Reconcile Quay for intermediate registry (only in connected mode)
+	if platform.Spec.Mode == mirrorv1.PlatformModeConnected && platform.Spec.Connected != nil {
+		if err := r.reconcileQuayConfig(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile Quay config")
+		}
+		// Ensure Quay credentials are in pull-secret for managed Quay
+		if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
+			if err := r.ensureQuayCredentials(ctx, platform); err != nil {
+				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
+			}
+		}
+	}
+
 	if err := r.reconcileArchitect(ctx, platform); err != nil {
 		log.FromContext(ctx).Error(err, "failed to reconcile airgap-architect")
 		platform.Status.Phase = mirrorv1.PlatformPhaseError
@@ -345,6 +363,14 @@ var defaultOperators = []operatorDef{
 		catalogNS: "openshift-marketplace",
 		ns:        architectNamespace,
 	},
+	{
+		name:      "quay-operator",
+		pkg:       "quay-operator",
+		channel:   "stable-3.13",
+		catalog:   "redhat-operators",
+		catalogNS: "openshift-marketplace",
+		ns:        "openshift-operators",
+	},
 }
 
 func getOperatorOverrides(platform *mirrorv1.DisconnectedPlatform) map[string]*mirrorv1.OLMSubscriptionConfig {
@@ -364,6 +390,9 @@ func getOperatorOverrides(platform *mirrorv1.DisconnectedPlatform) map[string]*m
 	}
 	if op.RHTPA != nil {
 		overrides["trusted-profile-analyzer"] = op.RHTPA
+	}
+	if op.QuayOperator != nil {
+		overrides["quay-operator"] = op.QuayOperator
 	}
 	return overrides
 }
@@ -1440,6 +1469,16 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 				logger.Info("Assigned create:document scope to client", "clientId", clientID)
 			}
 		}
+
+		// For CLI client, assign trustify-manager role to its service account for create permissions
+		if clientID == "cli" {
+			serviceAccountUsername := "service-account-" + clientID
+			if err := r.assignRoleToServiceAccount(ctx, keycloakHost, realmName, serviceAccountUsername, "trustify-manager", adminToken, httpClient); err != nil {
+				logger.Error(err, "failed to assign trustify-manager role to service account", "clientId", clientID, "username", serviceAccountUsername)
+			} else {
+				logger.Info("Assigned trustify-manager role to service account", "clientId", clientID, "username", serviceAccountUsername)
+			}
+		}
 	}
 
 	return nil
@@ -1505,6 +1544,87 @@ func (r *DisconnectedPlatformReconciler) assignScopeToClient(ctx context.Context
 	}
 
 	logger.Info("Assigned read:document scope to client", "clientUUID", clientUUID)
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) assignRoleToServiceAccount(ctx context.Context, keycloakHost, realmName, username, roleName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Get the user UUID for the service account
+	usersURL := fmt.Sprintf("https://%s/admin/realms/%s/users?username=%s&exact=true", keycloakHost, realmName, username)
+	userReq, _ := http.NewRequest("GET", usersURL, nil)
+	userReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+	userResp, err := httpClient.Do(userReq)
+	if err != nil {
+		return fmt.Errorf("failed to get service account user: %w", err)
+	}
+	defer userResp.Body.Close()
+
+	var users []map[string]interface{}
+	if err := json.NewDecoder(userResp.Body).Decode(&users); err != nil {
+		return fmt.Errorf("failed to decode users response: %w", err)
+	}
+
+	if len(users) == 0 {
+		return fmt.Errorf("service account user not found: %s", username)
+	}
+
+	userUUID := users[0]["id"].(string)
+
+	// Get the role UUID
+	rolesURL := fmt.Sprintf("https://%s/admin/realms/%s/roles/%s", keycloakHost, realmName, roleName)
+	roleReq, _ := http.NewRequest("GET", rolesURL, nil)
+	roleReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+	roleResp, err := httpClient.Do(roleReq)
+	if err != nil {
+		return fmt.Errorf("failed to get role: %w", err)
+	}
+	defer roleResp.Body.Close()
+
+	if roleResp.StatusCode == 404 {
+		return fmt.Errorf("role not found: %s", roleName)
+	}
+
+	var role map[string]interface{}
+	if err := json.NewDecoder(roleResp.Body).Decode(&role); err != nil {
+		return fmt.Errorf("failed to decode role response: %w", err)
+	}
+
+	roleUUID := role["id"].(string)
+
+	// Assign the role to the user
+	roleMapping := []map[string]interface{}{
+		{
+			"id":   roleUUID,
+			"name": roleName,
+		},
+	}
+
+	roleMappingJSON, _ := json.Marshal(roleMapping)
+	assignURL := fmt.Sprintf("https://%s/admin/realms/%s/users/%s/role-mappings/realm", keycloakHost, realmName, userUUID)
+	assignReq, _ := http.NewRequest("POST", assignURL, bytes.NewReader(roleMappingJSON))
+	assignReq.Header.Set("Authorization", "Bearer "+adminToken)
+	assignReq.Header.Set("Content-Type", "application/json")
+
+	assignResp, err := httpClient.Do(assignReq)
+	if err != nil {
+		return fmt.Errorf("failed to assign role: %w", err)
+	}
+	defer assignResp.Body.Close()
+
+	if assignResp.StatusCode != http.StatusNoContent && assignResp.StatusCode != http.StatusOK && assignResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(assignResp.Body)
+		// If status is 409, the role is already assigned - that's fine
+		if assignResp.StatusCode == 409 {
+			logger.Info("Role already assigned to service account", "username", username, "role", roleName)
+			return nil
+		}
+		return fmt.Errorf("failed to assign role: %s - %s", assignResp.Status, string(body))
+	}
+
+	logger.Info("Assigned role to service account", "username", username, "role", roleName)
 	return nil
 }
 
@@ -2854,6 +2974,463 @@ func (r *DisconnectedPlatformReconciler) updateKeycloakClientSecret(ctx context.
 	return nil
 }
 
+// reconcileQuayConfig creates and manages a Quay registry for intermediate image storage
+func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	if platform.Spec.Connected == nil || platform.Spec.Connected.Quay == nil {
+		return nil
+	}
+
+	quayConfig := platform.Spec.Connected.Quay
+
+	// If using external Quay, just update mirrorRegistry field
+	if quayConfig.ExternalURL != "" {
+		if platform.Spec.Connected.MirrorRegistry != quayConfig.ExternalURL {
+			platform.Spec.Connected.MirrorRegistry = quayConfig.ExternalURL
+			logger.Info("Using external Quay registry", "url", quayConfig.ExternalURL)
+		}
+		return nil
+	}
+
+	// Deploy managed Quay instance
+	if quayConfig.Managed != nil && quayConfig.Managed.Enabled {
+		// Check if QuayRegistry CRD exists
+		quayRegistry := &unstructured.Unstructured{}
+		quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "quay.redhat.com",
+			Version: "v1",
+			Kind:    "QuayRegistry",
+		})
+		quayRegistry.SetName("mirror-operator-quay")
+		quayRegistry.SetNamespace(architectNamespace)
+
+		// Check if QuayRegistry already exists
+		err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry)
+		if err == nil {
+			// QuayRegistry exists, get its hostname and update mirrorRegistry
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			if err != nil {
+				logger.Error(err, "failed to get Quay hostname")
+				return err
+			}
+
+			if hostname != "" && platform.Spec.Connected.MirrorRegistry != hostname+"/mirror" {
+				newRegistry := hostname + "/mirror"
+				logger.Info("Updated mirrorRegistry from managed Quay", "registry", newRegistry)
+
+				// Refetch to get latest version before updating
+				latest := &mirrorv1.DisconnectedPlatform{}
+				if err := r.Get(ctx, client.ObjectKeyFromObject(platform), latest); err != nil {
+					return fmt.Errorf("failed to refetch platform for mirrorRegistry update: %w", err)
+				}
+
+				latest.Spec.Connected.MirrorRegistry = newRegistry
+				if err := r.Update(ctx, latest); err != nil {
+					return fmt.Errorf("failed to update mirrorRegistry: %w", err)
+				}
+
+				// Update our local copy too
+				platform.Spec.Connected.MirrorRegistry = newRegistry
+			}
+
+			// Configure Clair VEX if needed for existing QuayRegistry
+			if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
+				if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
+					logger.Error(err, "failed to configure Clair VEX")
+					return err
+				}
+			}
+
+			return nil
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// Create new QuayRegistry
+		logger.Info("Creating managed Quay registry")
+
+		orgName := quayConfig.Managed.OrganizationName
+		if orgName == "" {
+			orgName = "mirror"
+		}
+
+		// Determine if using S3 storage
+		useS3Storage := quayConfig.Managed.Storage != nil && quayConfig.Managed.Storage.Type == "s3"
+
+		// Build QuayRegistry spec
+		// For filesystem storage: use managed objectstorage (requires ObjectBucketClaim CRD)
+		// For S3 storage: use unmanaged objectstorage with config bundle secret
+		objectStorageManaged := !useS3Storage
+
+		components := []interface{}{
+			map[string]interface{}{
+				"kind":    "clair",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "postgres",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "objectstorage",
+				"managed": objectStorageManaged,
+			},
+			map[string]interface{}{
+				"kind":    "redis",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "horizontalpodautoscaler",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "route",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "mirror",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "tls",
+				"managed": true,
+			},
+			map[string]interface{}{
+				"kind":    "quay",
+				"managed": true,
+			},
+		}
+
+		if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
+			return fmt.Errorf("failed to set QuayRegistry components: %w", err)
+		}
+
+		// If using S3 storage, set the configBundleSecret reference
+		if useS3Storage {
+			// Set the configBundleSecret reference
+			if err := unstructured.SetNestedField(quayRegistry.Object, quayRegistry.GetName()+"-config-bundle", "spec", "configBundleSecret"); err != nil {
+				return fmt.Errorf("failed to set configBundleSecret: %w", err)
+			}
+		}
+
+		// Create QuayRegistry first
+		if err := r.Create(ctx, quayRegistry); err != nil {
+			return fmt.Errorf("failed to create QuayRegistry: %w", err)
+		}
+
+		logger.Info("Created managed Quay registry", "name", quayRegistry.GetName(), "s3Storage", useS3Storage)
+
+		// If using S3 storage, create config bundle secret with S3 credentials after QuayRegistry is created
+		if useS3Storage {
+			if err := r.createQuayS3ConfigSecret(ctx, quayRegistry, quayConfig.Managed.Storage); err != nil {
+				logger.Error(err, "failed to create Quay S3 config secret, will retry on next reconciliation")
+				// Don't return error - let it retry on next reconciliation when QuayRegistry has UID
+			}
+		}
+
+		// Configure Clair if requested
+		if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
+			if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to configure Clair VEX, will retry on next reconciliation")
+			}
+		}
+
+		// Wait for Quay to be ready and get hostname
+		// Note: This will be updated in subsequent reconciliations
+		return nil
+	}
+
+	return nil
+}
+
+// createQuayS3ConfigSecret creates a config bundle secret for Quay with S3 storage configuration
+func (r *DisconnectedPlatformReconciler) createQuayS3ConfigSecret(ctx context.Context, quayRegistry *unstructured.Unstructured, storage *mirrorv1.QuayStorageConfig) error {
+	logger := log.FromContext(ctx)
+
+	// Parse endpoint to extract hostname and port
+	endpoint := storage.S3Endpoint
+	hostname := endpoint
+	port := 443
+	isSecure := true
+
+	// Check if endpoint includes port (e.g., "minio.svc:9000")
+	if strings.Contains(endpoint, ":") {
+		parts := strings.Split(endpoint, ":")
+		hostname = parts[0]
+		if len(parts) == 2 {
+			// Parse port
+			if p, err := strconv.Atoi(parts[1]); err == nil {
+				port = p
+				// If port is not 443, assume not using TLS
+				if port != 443 {
+					isSecure = false
+				}
+			}
+		}
+	}
+
+	// Quay config.yaml structure for S3 storage
+	quayConfig := map[string]interface{}{
+		"DISTRIBUTED_STORAGE_CONFIG": map[string]interface{}{
+			"default": []interface{}{
+				"RadosGWStorage",
+				map[string]interface{}{
+					"hostname":     hostname,
+					"is_secure":    isSecure,
+					"port":         port,
+					"bucket_name":  storage.S3Bucket,
+					"access_key":   storage.S3AccessKey,
+					"secret_key":   storage.S3SecretKey,
+					"storage_path": "/datastorage/registry",
+				},
+			},
+		},
+		"DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS": []interface{}{},
+		"DISTRIBUTED_STORAGE_PREFERENCE": []interface{}{
+			"default",
+		},
+	}
+
+	// Convert to YAML
+	configYAML, err := yaml.Marshal(quayConfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Quay config: %w", err)
+	}
+
+	// Create secret
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      quayRegistry.GetName() + "-config-bundle",
+			Namespace: quayRegistry.GetNamespace(),
+		},
+		Data: map[string][]byte{
+			"config.yaml": configYAML,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+
+	// Set owner reference if QuayRegistry has UID (already created)
+	if quayRegistry.GetUID() != "" {
+		secret.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: quayRegistry.GetAPIVersion(),
+				Kind:       quayRegistry.GetKind(),
+				Name:       quayRegistry.GetName(),
+				UID:        quayRegistry.GetUID(),
+				Controller: func() *bool { b := true; return &b }(),
+			},
+		})
+	}
+
+	if err := r.Create(ctx, secret); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		logger.Info("Config bundle secret already exists", "secret", secret.Name)
+	} else {
+		logger.Info("Created Quay S3 config bundle secret", "secret", secret.Name)
+	}
+
+	return nil
+}
+
+// configureClairVEX configures Clair to use only Red Hat VEX data for vulnerability scanning
+func (r *DisconnectedPlatformReconciler) configureClairVEX(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	// Find the Clair deployment
+	deployment := &appsv1.Deployment{}
+	deploymentName := quayRegistry.GetName() + "-clair-app"
+	if err := r.Get(ctx, client.ObjectKey{Name: deploymentName, Namespace: quayRegistry.GetNamespace()}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Clair deployment not found yet, will configure on next reconciliation", "deployment", deploymentName)
+			return nil
+		}
+		return fmt.Errorf("failed to get Clair deployment: %w", err)
+	}
+
+	// Get the current Clair config secret name from the deployment
+	var currentConfigSecret string
+	for _, vol := range deployment.Spec.Template.Spec.Volumes {
+		if vol.Name == "config" && vol.Secret != nil {
+			currentConfigSecret = vol.Secret.SecretName
+			break
+		}
+	}
+
+	if currentConfigSecret == "" {
+		return fmt.Errorf("could not find config volume in Clair deployment")
+	}
+
+	// Read the current config
+	currentSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: currentConfigSecret, Namespace: quayRegistry.GetNamespace()}, currentSecret); err != nil {
+		return fmt.Errorf("failed to get current Clair config secret: %w", err)
+	}
+
+	// Parse the current config to extract key values
+	clairConfig := string(currentSecret.Data["config.yaml"])
+
+	// Extract PSK key and connection strings
+	pskKey := extractPSKKey(clairConfig)
+	connString := extractValue(clairConfig, "connstring")
+	webhookTarget := extractValue(clairConfig, "target")
+
+	// Create VEX-only configuration
+	vexConfig := fmt.Sprintf(`auth:
+    psk:
+        iss:
+            - quay
+            - clairctl
+        key: %s
+http_listen_addr: :8080
+indexer:
+    connstring: %s
+    layer_scan_concurrency: 5
+    migrations: true
+    scanlock_retry: 10
+log_level: info
+matcher:
+    connstring: %s
+    migrations: true
+metrics:
+    name: prometheus
+notifier:
+    connstring: %s
+    delivery_interval: 1m0s
+    migrations: true
+    poll_interval: 5m0s
+    webhook:
+        callback: http://mirror-operator-quay-clair-app/notifier/api/v1/notifications
+        target: %s
+updaters:
+    sets:
+        - rhcc
+    config:
+        rhcc:
+            url: https://access.redhat.com/security/data/csaf/v2/vex/
+            vex: true
+`, pskKey, connString, connString, connString, webhookTarget)
+
+	// Create or update the custom config secret
+	customSecretName := quayRegistry.GetName() + "-clair-vex-config"
+	customSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      customSecretName,
+			Namespace: quayRegistry.GetNamespace(),
+		},
+		StringData: map[string]string{
+			"config.yaml": vexConfig,
+		},
+	}
+
+	// Set owner reference if QuayRegistry has UID
+	if quayRegistry.GetUID() != "" {
+		customSecret.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: quayRegistry.GetAPIVersion(),
+				Kind:       quayRegistry.GetKind(),
+				Name:       quayRegistry.GetName(),
+				UID:        quayRegistry.GetUID(),
+				Controller: func() *bool { b := true; return &b }(),
+			},
+		})
+	}
+
+	if err := r.Create(ctx, customSecret); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Update existing secret
+			existing := &corev1.Secret{}
+			if err := r.Get(ctx, client.ObjectKey{Name: customSecretName, Namespace: quayRegistry.GetNamespace()}, existing); err != nil {
+				return err
+			}
+			existing.StringData = customSecret.StringData
+			if err := r.Update(ctx, existing); err != nil {
+				return err
+			}
+			logger.Info("Updated Clair VEX config secret", "secret", customSecretName)
+		} else {
+			return err
+		}
+	} else {
+		logger.Info("Created Clair VEX config secret", "secret", customSecretName)
+	}
+
+	// Update the deployment to use the custom config secret (if not already using it)
+	if currentConfigSecret != customSecretName {
+		for i, vol := range deployment.Spec.Template.Spec.Volumes {
+			if vol.Name == "config" {
+				deployment.Spec.Template.Spec.Volumes[i].Secret.SecretName = customSecretName
+				break
+			}
+		}
+
+		if err := r.Update(ctx, deployment); err != nil {
+			return fmt.Errorf("failed to update Clair deployment with VEX config: %w", err)
+		}
+		logger.Info("Updated Clair deployment to use VEX-only configuration", "deployment", deploymentName)
+	}
+
+	return nil
+}
+
+// Helper functions to extract values from existing Clair config
+func extractPSKKey(config string) string {
+	lines := strings.Split(config, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "key:") {
+			return strings.TrimSpace(strings.Split(line, "key:")[1])
+		}
+	}
+	return ""
+}
+
+func extractValue(config, key string) string {
+	lines := strings.Split(config, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, key+":") {
+			parts := strings.Split(line, key+":")
+			if len(parts) >= 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+// getQuayHostname extracts the hostname from a QuayRegistry resource
+func (r *DisconnectedPlatformReconciler) getQuayHostname(ctx context.Context, quayRegistry *unstructured.Unstructured) (string, error) {
+	// Get hostname from QuayRegistry status
+	hostname, found, err := unstructured.NestedString(quayRegistry.Object, "status", "registryEndpoint")
+	if err != nil {
+		return "", err
+	}
+	if !found || hostname == "" {
+		// Try getting from route
+		route := &unstructured.Unstructured{}
+		route.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "route.openshift.io",
+			Version: "v1",
+			Kind:    "Route",
+		})
+		route.SetName(quayRegistry.GetName() + "-quay")
+		route.SetNamespace(quayRegistry.GetNamespace())
+
+		if err := r.Get(ctx, client.ObjectKeyFromObject(route), route); err != nil {
+			return "", err
+		}
+
+		hostname, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+	}
+
+	// Remove protocol if present
+	hostname = strings.TrimPrefix(hostname, "https://")
+	hostname = strings.TrimPrefix(hostname, "http://")
+
+	return hostname, nil
+}
+
 func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	cfg := platform.Spec.Connected.RHTAS
 	if cfg == nil || cfg.OIDC == nil {
@@ -3581,9 +4158,25 @@ func (r *DisconnectedPlatformReconciler) ensurePullSecret(ctx context.Context, s
 
 	existing := &corev1.Secret{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(targetSecret), existing); err == nil {
-		// Secret already exists, update it if needed
-		if string(existing.Data[pullSecretKey]) != string(sourceSecret.Data[pullSecretKey]) {
+		// Secret already exists, merge with existing to preserve Quay credentials
+		merged, changed, err := r.mergePullSecrets(existing.Data[pullSecretKey], sourceSecret.Data[pullSecretKey])
+		if err != nil {
+			return fmt.Errorf("failed to merge pull secrets: %w", err)
+		}
+
+		// After merging, also ensure Quay credentials are added if managed Quay is enabled
+		mergedWithQuay, quayChanged, err := r.addQuayCredentialsIfNeeded(ctx, merged)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to add Quay credentials to pull-secret")
+			// Don't fail the whole reconcile, just log
+		} else {
+			merged = mergedWithQuay
+			changed = changed || quayChanged
+		}
+
+		if changed {
 			targetSecret.ResourceVersion = existing.ResourceVersion
+			targetSecret.Data[pullSecretKey] = merged
 			if err := r.Update(ctx, targetSecret); err != nil {
 				return err
 			}
@@ -3595,7 +4188,157 @@ func (r *DisconnectedPlatformReconciler) ensurePullSecret(ctx context.Context, s
 		return err
 	}
 
+	// Creating new secret - also add Quay credentials if needed
+	quayEnhanced, _, err := r.addQuayCredentialsIfNeeded(ctx, targetSecret.Data[pullSecretKey])
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to add Quay credentials during create")
+	} else {
+		targetSecret.Data[pullSecretKey] = quayEnhanced
+	}
+
 	return r.Create(ctx, targetSecret)
+}
+
+// addQuayCredentialsIfNeeded adds Quay robot credentials to dockerconfig if managed Quay is deployed
+func (r *DisconnectedPlatformReconciler) addQuayCredentialsIfNeeded(ctx context.Context, dockerconfigJSON []byte) ([]byte, bool, error) {
+	logger := log.FromContext(ctx)
+
+	// Check if there's a managed Quay instance
+	quayRegistry := &unstructured.Unstructured{}
+	quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "quay.redhat.com",
+		Version: "v1",
+		Kind:    "QuayRegistry",
+	})
+	quayRegistry.SetName("mirror-operator-quay")
+	quayRegistry.SetNamespace(architectNamespace)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry); err != nil {
+		// No Quay registry, return unchanged
+		return dockerconfigJSON, false, nil
+	}
+
+	// Get Quay hostname
+	hostname, err := r.getQuayHostname(ctx, quayRegistry)
+	if err != nil || hostname == "" {
+		// Quay not ready yet
+		return dockerconfigJSON, false, nil
+	}
+
+	// Parse dockerconfig
+	var dockerConfig map[string]interface{}
+	if err := json.Unmarshal(dockerconfigJSON, &dockerConfig); err != nil {
+		return nil, false, fmt.Errorf("failed to parse dockerconfig: %w", err)
+	}
+
+	auths, ok := dockerConfig["auths"].(map[string]interface{})
+	if !ok {
+		auths = make(map[string]interface{})
+		dockerConfig["auths"] = auths
+	}
+
+	// Check if Quay credentials already exist
+	if _, hasQuay := auths[hostname]; hasQuay {
+		// Already have credentials, return unchanged
+		return dockerconfigJSON, false, nil
+	}
+
+	// Get robot credentials from database
+	robot, token, err := r.getQuayRobotCredentials(ctx)
+	if err != nil {
+		return dockerconfigJSON, false, fmt.Errorf("failed to get Quay robot credentials: %w", err)
+	}
+
+	// Add Quay credentials (base64 encode username:token)
+	authString := base64.StdEncoding.EncodeToString([]byte(robot + ":" + token))
+	auths[hostname] = map[string]interface{}{
+		"auth": authString,
+	}
+
+	logger.Info("Adding Quay credentials to pull-secret", "registry", hostname, "robot", robot)
+
+	// Marshal back
+	updated, err := json.Marshal(dockerConfig)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal updated dockerconfig: %w", err)
+	}
+
+	return updated, true, nil
+}
+
+// getQuayRobotCredentials retrieves robot account credentials from Quay database
+func (r *DisconnectedPlatformReconciler) getQuayRobotCredentials(ctx context.Context) (string, string, error) {
+	// Try to get from database via kubectl exec
+	// This is a temporary solution - ideally we'd store this in a secret
+	robot := "mirror+mirroroperator"
+
+	// Check if we have cached credentials in a secret
+	robotSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "quay-robot-credentials", Namespace: architectNamespace}, robotSecret); err == nil {
+		token := string(robotSecret.Data["token"])
+		if token != "" {
+			return robot, token, nil
+		}
+	}
+
+	// TODO: Query database or Quay API to get token
+	// For now, return empty which will skip adding credentials
+	return "", "", fmt.Errorf("robot credentials not available")
+}
+
+// mergePullSecrets merges source dockerconfig into existing, preserving Quay credentials
+// Returns merged dockerconfig bytes, whether it changed, and any error
+func (r *DisconnectedPlatformReconciler) mergePullSecrets(existing, source []byte) ([]byte, bool, error) {
+	var existingConfig, sourceConfig map[string]interface{}
+
+	// Parse existing config
+	if err := json.Unmarshal(existing, &existingConfig); err != nil {
+		return nil, false, fmt.Errorf("failed to parse existing dockerconfig: %w", err)
+	}
+
+	// Parse source config
+	if err := json.Unmarshal(source, &sourceConfig); err != nil {
+		return nil, false, fmt.Errorf("failed to parse source dockerconfig: %w", err)
+	}
+
+	existingAuths, _ := existingConfig["auths"].(map[string]interface{})
+	sourceAuths, _ := sourceConfig["auths"].(map[string]interface{})
+
+	if existingAuths == nil {
+		existingAuths = make(map[string]interface{})
+	}
+	if sourceAuths == nil {
+		sourceAuths = make(map[string]interface{})
+	}
+
+	// Preserve Quay credentials from existing
+	quayHosts := []string{}
+	for host := range existingAuths {
+		if strings.Contains(host, "mirror-operator-quay") {
+			quayHosts = append(quayHosts, host)
+		}
+	}
+
+	// Merge: source overwrites existing, except for Quay registries
+	changed := false
+	for host, auth := range sourceAuths {
+		if existingAuth, exists := existingAuths[host]; !exists || fmt.Sprintf("%v", existingAuth) != fmt.Sprintf("%v", auth) {
+			existingAuths[host] = auth
+			changed = true
+		}
+	}
+
+	// Quay credentials are already preserved in existingAuths
+	// No need to set changed=true since they were never removed
+
+	existingConfig["auths"] = existingAuths
+
+	merged, err := json.Marshal(existingConfig)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal merged dockerconfig: %w", err)
+	}
+
+	return merged, changed, nil
 }
 
 func (r *DisconnectedPlatformReconciler) restartBackendPods(ctx context.Context) error {
@@ -3780,37 +4523,40 @@ func (r *DisconnectedPlatformReconciler) ensureArchitectBackend(ctx context.Cont
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
 	dep.SetNamespace(architectNamespace)
+
+	// Get GitHub token secret name if configured
+	githubTokenSecretName := ""
+	if platform.Spec.Architect != nil && platform.Spec.Architect.GitHubTokenSecret != nil {
+		githubTokenSecretName = platform.Spec.Architect.GitHubTokenSecret.Name
+	}
+
+	// Create container builder with GitHub token secret
+	containerBuilder := makeBackendContainerBuilder(githubTokenSecretName)
+
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
-		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, backendContainer)
+		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, containerBuilder)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	newDep := architectBackendDeployment(name, image, replicas, labels, pullSecretName, pullSecretNamespace)
+	newDep := architectBackendDeployment(name, image, replicas, labels, pullSecretName, pullSecretNamespace, containerBuilder)
 	setOwnerReference(newDep, platform)
 	return r.Create(ctx, newDep)
 }
 
-func architectBackendDeployment(name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
+func architectBackendDeployment(name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string, buildContainer containerBuilder) *unstructured.Unstructured {
 	dep := &unstructured.Unstructured{}
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
 	dep.SetNamespace(architectNamespace)
 	dep.SetLabels(labels)
-	dep.Object["spec"] = architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, backendContainer)
+	dep.Object["spec"] = architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, buildContainer)
 	return dep
 }
 
-func backendContainer(name, image string, labels map[string]string) map[string]interface{} {
-	return map[string]interface{}{
-		"name":  "airgap-architect-backend",
-		"image": image,
-		"ports": []interface{}{
-			map[string]interface{}{
-				"containerPort": int64(architectPort),
-				"protocol":      "TCP",
-			},
-		},
-		"env": []interface{}{
+// makeBackendContainerBuilder creates a container builder function with GitHub token secret support
+func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder {
+	return func(name, image string, labels map[string]string) map[string]interface{} {
+		env := []interface{}{
 			map[string]interface{}{
 				"name":  "DATA_DIR",
 				"value": "/data",
@@ -3827,8 +4573,13 @@ func backendContainer(name, image string, labels map[string]string) map[string]i
 				"name":  "OPENSHIFT_OPERATOR_MANAGED",
 				"value": "true",
 			},
-		},
-		"volumeMounts": []interface{}{
+			map[string]interface{}{
+				"name":  "LOG_LEVEL",
+				"value": "debug",
+			},
+		}
+
+		volumeMounts := []interface{}{
 			map[string]interface{}{
 				"name":      "data",
 				"mountPath": "/data",
@@ -3838,22 +4589,59 @@ func backendContainer(name, image string, labels map[string]string) map[string]i
 				"mountPath": pullSecretMountPath,
 				"readOnly":  true,
 			},
-		},
-		"readinessProbe": map[string]interface{}{
-			"tcpSocket": map[string]interface{}{
-				"port": int64(architectPort),
+		}
+
+		// Add GitHub token if secret is configured
+		if githubTokenSecretName != "" {
+			env = append(env, map[string]interface{}{
+				"name": "GITHUB_TOKEN",
+				"valueFrom": map[string]interface{}{
+					"secretKeyRef": map[string]interface{}{
+						"name": githubTokenSecretName,
+						"key":  "token",
+					},
+				},
+			})
+		}
+
+		return map[string]interface{}{
+			"name":  "airgap-architect-backend",
+			"image": image,
+			"ports": []interface{}{
+				map[string]interface{}{
+					"containerPort": int64(architectPort),
+					"protocol":      "TCP",
+				},
 			},
-			"initialDelaySeconds": int64(5),
-			"periodSeconds":       int64(10),
-		},
-		"livenessProbe": map[string]interface{}{
-			"tcpSocket": map[string]interface{}{
-				"port": int64(architectPort),
+			"env":          env,
+			"volumeMounts": volumeMounts,
+			"readinessProbe": map[string]interface{}{
+				"tcpSocket": map[string]interface{}{
+					"port": int64(architectPort),
+				},
+				"initialDelaySeconds": int64(5),
+				"periodSeconds":       int64(10),
+				"failureThreshold":    int64(3),
+				"successThreshold":    int64(1),
+				"timeoutSeconds":      int64(1),
 			},
-			"initialDelaySeconds": int64(15),
-			"periodSeconds":       int64(20),
-		},
+			"livenessProbe": map[string]interface{}{
+				"tcpSocket": map[string]interface{}{
+					"port": int64(architectPort),
+				},
+				"initialDelaySeconds": int64(15),
+				"periodSeconds":       int64(20),
+				"failureThreshold":    int64(3),
+				"successThreshold":    int64(1),
+				"timeoutSeconds":      int64(1),
+			},
+		}
 	}
+}
+
+func backendContainer(name, image string, labels map[string]string) map[string]interface{} {
+	// Default backend container without GitHub token (deprecated - use makeBackendContainerBuilder)
+	return makeBackendContainerBuilder("")(name, image, labels)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureArchitectService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name string, port int32, labels map[string]string) error {
@@ -4047,6 +4835,7 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 }
 
 func (r *DisconnectedPlatformReconciler) updateArchitectDeployment(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string, buildContainer containerBuilder) error {
+	logger := log.FromContext(ctx)
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(deploymentGVK)
 	existing.SetName(name)
@@ -4054,6 +4843,26 @@ func (r *DisconnectedPlatformReconciler) updateArchitectDeployment(ctx context.C
 	if err := r.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
 		return err
 	}
+
+	// Build desired spec
+	desiredSpec := architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, buildContainer)
+
+	// Compare with existing spec to avoid unnecessary updates
+	existingSpec, found, err := unstructured.NestedMap(existing.Object, "spec")
+	if err != nil {
+		return fmt.Errorf("failed to get existing spec: %w", err)
+	}
+	if found {
+		// Compare critical fields that would require an update
+		equal, reason := deploymentsEqual(existingSpec, desiredSpec)
+		if equal {
+			logger.V(1).Info("Deployment spec unchanged, skipping update", "name", name)
+			return nil
+		}
+		logger.Info("Deployment specs differ, will update", "name", name, "reason", reason)
+	}
+
+	// Specs differ, perform update
 	dep := &unstructured.Unstructured{}
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
@@ -4061,8 +4870,70 @@ func (r *DisconnectedPlatformReconciler) updateArchitectDeployment(ctx context.C
 	dep.SetLabels(labels)
 	dep.SetResourceVersion(existing.GetResourceVersion())
 	setOwnerReference(dep, platform)
-	dep.Object["spec"] = architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, buildContainer)
+	dep.Object["spec"] = desiredSpec
+
+	logger.Info("Updating deployment due to spec changes", "name", name)
 	return r.Update(ctx, dep)
+}
+
+// deploymentsEqual compares deployment specs, ignoring fields that don't affect pod template
+func deploymentsEqual(existing, desired map[string]interface{}) (bool, string) {
+	// Compare replicas
+	existingReplicas, _, _ := unstructured.NestedInt64(existing, "replicas")
+	desiredReplicas, _, _ := unstructured.NestedInt64(desired, "replicas")
+	if existingReplicas != desiredReplicas {
+		return false, "replicas differ"
+	}
+
+	// Get container specs for comparison (most important for changes)
+	existingContainers, _, _ := unstructured.NestedSlice(existing, "template", "spec", "containers")
+	desiredContainers, _, _ := unstructured.NestedSlice(desired, "template", "spec", "containers")
+
+	if len(existingContainers) != len(desiredContainers) {
+		return false, "container count differs"
+	}
+
+	// Compare first container (we only have one)
+	if len(existingContainers) > 0 && len(desiredContainers) > 0 {
+		existingContainer, _ := existingContainers[0].(map[string]interface{})
+		desiredContainer, _ := desiredContainers[0].(map[string]interface{})
+
+		// Compare critical fields: image, env, volumeMounts
+		if existingContainer["image"] != desiredContainer["image"] {
+			return false, "image differs"
+		}
+
+		// Compare env vars
+		existingEnv, _ := json.Marshal(existingContainer["env"])
+		desiredEnv, _ := json.Marshal(desiredContainer["env"])
+		if string(existingEnv) != string(desiredEnv) {
+			return false, "env differs"
+		}
+
+		// Compare volume mounts
+		existingMounts, _ := json.Marshal(existingContainer["volumeMounts"])
+		desiredMounts, _ := json.Marshal(desiredContainer["volumeMounts"])
+		if string(existingMounts) != string(desiredMounts) {
+			return false, "volumeMounts differ"
+		}
+
+		// Compare readiness probe
+		existingReadiness, _ := json.Marshal(existingContainer["readinessProbe"])
+		desiredReadiness, _ := json.Marshal(desiredContainer["readinessProbe"])
+		if string(existingReadiness) != string(desiredReadiness) {
+			return false, fmt.Sprintf("readinessProbe differs: existing=%s desired=%s", string(existingReadiness), string(desiredReadiness))
+		}
+
+		// Compare liveness probe
+		existingLiveness, _ := json.Marshal(existingContainer["livenessProbe"])
+		desiredLiveness, _ := json.Marshal(desiredContainer["livenessProbe"])
+		if string(existingLiveness) != string(desiredLiveness) {
+			return false, fmt.Sprintf("livenessProbe differs: existing=%s desired=%s", string(existingLiveness), string(desiredLiveness))
+		}
+	}
+
+	// Specs are equivalent
+	return true, ""
 }
 
 // Route
@@ -4875,6 +5746,690 @@ func (r *DisconnectedPlatformReconciler) addOpenShiftAttributeMappers(ctx contex
 	}
 
 	return nil
+}
+
+// ensureQuayCredentials creates a robot account in managed Quay and merges credentials into pull-secret
+func (r *DisconnectedPlatformReconciler) ensureQuayCredentials(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	// Get Quay hostname
+	quayRegistry := &unstructured.Unstructured{}
+	quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "quay.redhat.com",
+		Version: "v1",
+		Kind:    "QuayRegistry",
+	})
+	quayRegistry.SetName("mirror-operator-quay")
+	quayRegistry.SetNamespace(architectNamespace)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry); err != nil {
+		return fmt.Errorf("failed to get QuayRegistry: %w", err)
+	}
+
+	hostname, err := r.getQuayHostname(ctx, quayRegistry)
+	if err != nil || hostname == "" {
+		logger.Info("Quay hostname not yet available, skipping credential setup")
+		return nil
+	}
+
+	// Create or get robot account credentials using Python API (REST API requires CSRF tokens)
+	// This runs Python code inside the Quay pod via kubectl exec
+	robotShortName := "mirroroperator"
+	robotFullName := "mirror+" + robotShortName
+	robotToken, err := r.ensureQuayRobotViaPython(ctx, "mirror", robotShortName)
+	if err != nil {
+		return fmt.Errorf("failed to ensure Quay robot account: %w", err)
+	}
+
+	// Save robot credentials to secret for reuse by addQuayCredentialsIfNeeded
+	if err := r.saveQuayRobotCredentials(ctx, robotFullName, robotToken); err != nil {
+		logger.Error(err, "failed to save robot credentials")
+	}
+
+	logger.Info("Successfully configured Quay credentials", "registry", hostname, "robot", robotFullName)
+	return nil
+}
+
+// ensureQuayRobotAccount creates or retrieves a robot account in Quay
+func (r *DisconnectedPlatformReconciler) ensureQuayRobotAccount(ctx context.Context, quayURL, hostname, orgName, robotShortName string) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// First, ensure there's a user to create the robot account
+	// Check if we have saved admin credentials in a secret
+	adminSecret := &corev1.Secret{}
+	adminSecretName := "quay-admin-credentials"
+	adminUser := "admin"
+	adminPassword := ""
+
+	err := r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: architectNamespace}, adminSecret)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return "", err
+		}
+
+		// Admin secret doesn't exist - try to initialize Quay with admin user
+		logger.Info("Initializing Quay with admin user")
+		adminPassword = generateRandomPassword(16)
+
+		// Try user initialization endpoint
+		initData := map[string]interface{}{
+			"username":     adminUser,
+			"password":     adminPassword,
+			"email":        "admin@example.com",
+			"access_token": true,
+		}
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+			Timeout: 10 * time.Second,
+		}
+
+		initBody, _ := json.Marshal(initData)
+		resp, err := client.Post(quayURL+"/api/v1/user/initialize", "application/json", bytes.NewReader(initBody))
+		if err != nil {
+			logger.Info("Failed to initialize Quay user (may already exist)", "error", err.Error())
+		} else {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				logger.Info("Successfully initialized Quay admin user")
+
+				// Save admin credentials for future use
+				adminSecret = &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      adminSecretName,
+						Namespace: architectNamespace,
+					},
+					StringData: map[string]string{
+						"username": adminUser,
+						"password": adminPassword,
+					},
+					Type: corev1.SecretTypeOpaque,
+				}
+				if err := r.Create(ctx, adminSecret); err != nil {
+					logger.Error(err, "failed to save admin credentials")
+				}
+			} else {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				logger.Info("Quay initialization response", "status", resp.StatusCode, "body", string(bodyBytes))
+			}
+		}
+	} else {
+		// Load saved admin credentials
+		adminPassword = string(adminSecret.Data["password"])
+		if savedUser := string(adminSecret.Data["username"]); savedUser != "" {
+			adminUser = savedUser
+		}
+	}
+
+	// If we still don't have admin password, generate one and try to create user directly
+	if adminPassword == "" {
+		logger.Info("No admin credentials available, attempting to create user via API")
+		adminPassword = generateRandomPassword(16)
+	}
+
+	// Create organization if it doesn't exist
+	if err := r.ensureQuayOrganization(ctx, quayURL, adminUser, adminPassword, orgName); err != nil {
+		logger.Error(err, "failed to ensure Quay organization", "org", orgName)
+	}
+
+	// Create or get robot account
+	robotFullName := orgName + "+" + robotShortName
+	robotToken, err := r.createQuayRobotAccount(ctx, quayURL, adminUser, adminPassword, orgName, robotShortName)
+	if err != nil {
+		return "", fmt.Errorf("failed to create robot account: %w", err)
+	}
+
+	// Save robot credentials to a secret for reuse
+	robotSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "quay-robot-credentials",
+			Namespace: architectNamespace,
+		},
+		StringData: map[string]string{
+			"username": robotFullName,
+			"token":    robotToken,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(robotSecret), existing); err == nil {
+		// Update existing
+		robotSecret.ResourceVersion = existing.ResourceVersion
+		if err := r.Update(ctx, robotSecret); err != nil {
+			logger.Error(err, "failed to update robot credentials secret")
+		}
+	} else if apierrors.IsNotFound(err) {
+		// Create new
+		if err := r.Create(ctx, robotSecret); err != nil {
+			logger.Error(err, "failed to create robot credentials secret")
+		}
+	}
+
+	logger.Info("Robot account ready", "robot", robotFullName)
+	return robotToken, nil
+}
+
+// ensureQuayOrganization creates an organization in Quay if it doesn't exist
+func (r *DisconnectedPlatformReconciler) ensureQuayOrganization(ctx context.Context, quayURL, username, password, orgName string) error {
+	logger := log.FromContext(ctx)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	// Check if organization exists
+	req, _ := http.NewRequest("GET", quayURL+"/api/v1/organization/"+orgName, nil)
+	req.SetBasicAuth(username, password)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		logger.Info("Quay organization already exists", "org", orgName)
+		return nil
+	}
+
+	// Create organization
+	logger.Info("Creating Quay organization", "org", orgName)
+	orgData := map[string]interface{}{
+		"name":  orgName,
+		"email": "mirror@example.com",
+	}
+
+	orgBody, _ := json.Marshal(orgData)
+	req, _ = http.NewRequest("POST", quayURL+"/api/v1/organization/", bytes.NewReader(orgBody))
+	req.SetBasicAuth(username, password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create organization: %s (status %d)", string(bodyBytes), resp.StatusCode)
+	}
+
+	logger.Info("Successfully created Quay organization", "org", orgName)
+	return nil
+}
+
+// createQuayRobotAccount creates a robot account in Quay and returns its token
+func (r *DisconnectedPlatformReconciler) createQuayRobotAccount(ctx context.Context, quayURL, username, password, orgName, robotName string) (string, error) {
+	logger := log.FromContext(ctx)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	// Check if robot already exists
+	robotFullName := orgName + "+" + robotName
+	req, _ := http.NewRequest("GET", quayURL+"/api/v1/organization/"+orgName+"/robots/"+robotName, nil)
+	req.SetBasicAuth(username, password)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		// Robot exists, get its token
+		var robotData map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&robotData); err != nil {
+			return "", err
+		}
+
+		if token, ok := robotData["token"].(string); ok && token != "" {
+			logger.Info("Using existing robot account", "robot", robotFullName)
+			return token, nil
+		}
+	}
+
+	// Create new robot account
+	logger.Info("Creating robot account", "robot", robotFullName)
+	robotData := map[string]interface{}{
+		"description": "Mirror operator robot account for image mirroring",
+	}
+
+	robotBody, _ := json.Marshal(robotData)
+	req, _ = http.NewRequest("PUT", quayURL+"/api/v1/organization/"+orgName+"/robots/"+robotName, bytes.NewReader(robotBody))
+	req.SetBasicAuth(username, password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to create robot account: %s (status %d)", string(bodyBytes), resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	token, ok := result["token"].(string)
+	if !ok || token == "" {
+		return "", fmt.Errorf("robot account created but no token returned")
+	}
+
+	logger.Info("Successfully created robot account", "robot", robotFullName)
+	return token, nil
+}
+
+// mergeQuayCredentialsIntoPullSecret adds Quay robot credentials to the pull-secret
+func (r *DisconnectedPlatformReconciler) mergeQuayCredentialsIntoPullSecret(ctx context.Context, hostname, username, token string) error {
+	logger := log.FromContext(ctx)
+
+	pullSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "pull-secret", Namespace: architectNamespace}, pullSecret); err != nil {
+		return fmt.Errorf("failed to get pull-secret: %w", err)
+	}
+
+	// Parse existing dockerconfigjson
+	var dockerConfig map[string]interface{}
+	if pullSecret.Data[".dockerconfigjson"] != nil {
+		if err := json.Unmarshal(pullSecret.Data[".dockerconfigjson"], &dockerConfig); err != nil {
+			return fmt.Errorf("failed to parse dockerconfigjson: %w", err)
+		}
+	} else {
+		dockerConfig = map[string]interface{}{
+			"auths": make(map[string]interface{}),
+		}
+	}
+
+	// Add Quay credentials
+	auths, ok := dockerConfig["auths"].(map[string]interface{})
+	if !ok {
+		auths = make(map[string]interface{})
+		dockerConfig["auths"] = auths
+	}
+
+	// Create auth string: base64(username:token)
+	authString := username + ":" + token
+	authEncoded := map[string]interface{}{
+		"auth": authString,
+	}
+
+	auths[hostname] = authEncoded
+	logger.Info("Adding Quay registry to pull-secret", "registry", hostname)
+
+	// Marshal back to JSON
+	updatedConfig, err := json.Marshal(dockerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated dockerconfig: %w", err)
+	}
+
+	pullSecret.Data[".dockerconfigjson"] = updatedConfig
+
+	if err := r.Update(ctx, pullSecret); err != nil {
+		return fmt.Errorf("failed to update pull-secret: %w", err)
+	}
+
+	logger.Info("Successfully merged Quay credentials into pull-secret", "registry", hostname)
+	return nil
+}
+
+// generateRandomPassword generates a random password
+func generateRandomPassword(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	password := make([]byte, length)
+	for i := range password {
+		password[i] = charset[sha256.Sum256([]byte(fmt.Sprintf("%d%d", time.Now().UnixNano(), i)))[0]%byte(len(charset))]
+	}
+	return string(password)
+}
+
+// ensureQuayAPIToken ensures we have a Quay API token, bootstrapping if needed
+func (r *DisconnectedPlatformReconciler) ensureQuayAPIToken(ctx context.Context) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Check if we already have an API token saved
+	tokenSecret := &corev1.Secret{}
+	tokenSecret.SetName("quay-api-token")
+	tokenSecret.SetNamespace(architectNamespace)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(tokenSecret), tokenSecret); err == nil {
+		// Token exists, return it
+		if token, ok := tokenSecret.Data["token"]; ok && len(token) > 0 {
+			logger.Info("Found existing Quay API token")
+			return string(token), nil
+		}
+	}
+
+	// No token found, need to bootstrap
+	logger.Info("No Quay API token found, bootstrapping")
+	token, err := r.bootstrapQuayAPIToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to bootstrap Quay API token: %w", err)
+	}
+
+	// Save token to secret for future use
+	tokenSecret.Data = map[string][]byte{
+		"token": []byte(token),
+	}
+	if err := r.Create(ctx, tokenSecret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("failed to save API token: %w", err)
+	}
+
+	logger.Info("Successfully bootstrapped Quay API token")
+	return token, nil
+}
+
+// bootstrapQuayAPIToken ensures admin user exists in Quay (deprecated - no longer used)
+// Kept for backwards compatibility but we now use Python API directly for all operations
+func (r *DisconnectedPlatformReconciler) bootstrapQuayAPIToken(ctx context.Context) (string, error) {
+	// No longer needed - we use Python API directly for robot creation
+	// Just return a dummy token to satisfy the interface
+	return "unused", nil
+}
+
+// execInQuayPod executes a Python script in the Quay pod
+func (r *DisconnectedPlatformReconciler) execInQuayPod(ctx context.Context, namespace, pythonScript string) (string, error) {
+	// TODO: Implement proper Kubernetes exec using client-go
+	// For now, using kubectl as placeholder
+	logger := log.FromContext(ctx)
+
+	// Find Quay pod
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{"quay-component": "quay-app"}); err != nil {
+		return "", fmt.Errorf("failed to list Quay pods: %w", err)
+	}
+
+	if len(podList.Items) == 0 {
+		return "", fmt.Errorf("no Quay pods found")
+	}
+
+	podName := podList.Items[0].Name
+	logger.Info("Executing Python script in Quay pod", "pod", podName)
+
+	// Create temp file with script
+	tmpFile := "/tmp/quay-bootstrap-" + time.Now().Format("20060102150405") + ".py"
+	if err := os.WriteFile(tmpFile, []byte(pythonScript), 0644); err != nil {
+		return "", fmt.Errorf("failed to write temp script: %w", err)
+	}
+	defer os.Remove(tmpFile)
+
+	// Copy script to pod
+	cpCmd := exec.Command("kubectl", "cp", tmpFile, namespace+"/"+podName+":/tmp/bootstrap.py")
+	if err := cpCmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to copy script to pod: %w", err)
+	}
+
+	// Execute script (get only stdout, ignore stderr warnings)
+	execCmd := exec.Command("kubectl", "exec", "-n", namespace, podName, "--", "python", "/tmp/bootstrap.py")
+	output, err := execCmd.Output()
+	if err != nil {
+		// Get stderr for error message
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("failed to execute script: %w (stderr: %s)", err, string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("failed to execute script: %w", err)
+	}
+
+	// Extract the last line which should be the token (previous lines are stderr messages)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 {
+		return "", fmt.Errorf("script returned no output")
+	}
+	token := strings.TrimSpace(lines[len(lines)-1])
+
+	return token, nil
+}
+
+// ensureQuayOrganizationViaAPI creates organization using REST API
+func (r *DisconnectedPlatformReconciler) ensureQuayOrganizationViaAPI(ctx context.Context, quayURL, apiToken, orgName string) error {
+	logger := log.FromContext(ctx)
+
+	// Check if organization exists
+	checkURL := quayURL + "/api/v1/organization/" + orgName
+	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to check organization: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		logger.Info("Organization already exists", "org", orgName)
+		return nil
+	}
+
+	// Create organization
+	createURL := quayURL + "/api/v1/organization/"
+	payload := map[string]interface{}{
+		"name": orgName,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err = http.NewRequestWithContext(ctx, "POST", createURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create organization: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create organization (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully created organization", "org", orgName)
+	return nil
+}
+
+// ensureQuayRobotViaAPI creates or retrieves a robot account using REST API
+func (r *DisconnectedPlatformReconciler) ensureQuayRobotViaAPI(ctx context.Context, quayURL, apiToken, orgName, robotShortName string) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Create or update robot account
+	robotURL := quayURL + "/api/v1/organization/" + orgName + "/robots/" + robotShortName
+	payload := map[string]interface{}{
+		"description": "Mirror operator robot account",
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", robotURL, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to create robot: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to create robot (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response to get robot token
+	var robotResp map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&robotResp); err != nil {
+		return "", fmt.Errorf("failed to parse robot response: %w", err)
+	}
+
+	token, ok := robotResp["token"].(string)
+	if !ok || token == "" {
+		return "", fmt.Errorf("robot response missing token field")
+	}
+
+	logger.Info("Successfully created/updated robot account", "org", orgName, "robot", robotShortName)
+
+	// Add robot to owners team for admin permissions
+	if err := r.addRobotToOwnersTeam(ctx, quayURL, apiToken, orgName, robotShortName); err != nil {
+		logger.Error(err, "failed to add robot to owners team, continuing anyway")
+	}
+
+	return token, nil
+}
+
+// addRobotToOwnersTeam adds robot to the owners team for admin permissions
+func (r *DisconnectedPlatformReconciler) addRobotToOwnersTeam(ctx context.Context, quayURL, apiToken, orgName, robotShortName string) error {
+	logger := log.FromContext(ctx)
+	robotFullName := orgName + "+" + robotShortName
+
+	teamURL := quayURL + "/api/v1/organization/" + orgName + "/team/owners/members/" + robotFullName
+	req, err := http.NewRequestWithContext(ctx, "PUT", teamURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to add robot to team: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to add robot to team (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully added robot to owners team", "robot", robotFullName)
+	return nil
+}
+
+// saveQuayRobotCredentials saves robot credentials to a secret for reuse
+func (r *DisconnectedPlatformReconciler) saveQuayRobotCredentials(ctx context.Context, robotName, robotToken string) error {
+	secret := &corev1.Secret{}
+	secret.SetName("quay-robot-credentials")
+	secret.SetNamespace(architectNamespace)
+
+	secret.Data = map[string][]byte{
+		"username": []byte(robotName),
+		"token":    []byte(robotToken),
+	}
+
+	// Create or update
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(secret), existing); err == nil {
+		// Update existing
+		secret.SetResourceVersion(existing.GetResourceVersion())
+		return r.Update(ctx, secret)
+	} else if apierrors.IsNotFound(err) {
+		// Create new
+		return r.Create(ctx, secret)
+	} else {
+		return err
+	}
+}
+
+// ensureQuayRobotViaPython creates or retrieves a robot account using Python API in Quay pod
+func (r *DisconnectedPlatformReconciler) ensureQuayRobotViaPython(ctx context.Context, orgName, robotShortName string) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Python script to create/get robot account and add to owners team
+	pythonScript := `
+import os
+import sys
+from app import app
+from data import model
+from data.database import configure
+
+# Initialize database
+configure(app.config)
+
+org_name = "` + orgName + `"
+robot_short_name = "` + robotShortName + `"
+robot_full_name = org_name + "+" + robot_short_name
+
+try:
+    # Get organization
+    org = model.organization.get_organization(org_name)
+    if not org:
+        print(f"Organization {org_name} not found, creating it", file=sys.stderr)
+        # Create organization if it doesn't exist
+        admin = model.user.get_user("admin")
+        org = model.organization.create_organization(org_name, "admin@example.com", admin)
+
+    # Check if robot already exists
+    existing_robot = model.user.lookup_robot(robot_full_name)
+    if existing_robot:
+        print(f"Robot {robot_full_name} already exists", file=sys.stderr)
+        # Get the robot's token
+        robot_token = model.user.retrieve_robot_token(existing_robot)
+        print(robot_token)
+    else:
+        print(f"Creating robot {robot_full_name}", file=sys.stderr)
+        # Create robot account
+        robot = model.user.create_robot(robot_short_name, org, "Mirror operator robot account")
+        robot_token = model.user.retrieve_robot_token(robot)
+
+        # Add robot to owners team for admin permissions
+        try:
+            owners_team = model.team.get_organization_team(org_name, "owners")
+            model.team.add_user_to_team(robot, owners_team)
+            print(f"Added robot to owners team", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not add robot to owners team: {e}", file=sys.stderr)
+
+        print(robot_token)
+
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+`
+
+	// Execute Python script in Quay pod
+	output, err := r.execInQuayPod(ctx, architectNamespace, pythonScript)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute robot creation script: %w", err)
+	}
+
+	token := strings.TrimSpace(output)
+	if token == "" {
+		return "", fmt.Errorf("robot creation script returned empty token")
+	}
+
+	logger.Info("Successfully ensured Quay robot account via Python", "org", orgName, "robot", robotShortName)
+	return token, nil
 }
 
 func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {

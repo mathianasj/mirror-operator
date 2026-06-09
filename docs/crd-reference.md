@@ -290,6 +290,18 @@ The `CollectionPipeline` CRD triggers and manages the collection of container im
 | `completionTime` | Time | Collection completion time |
 | `conditions` | []Condition | Standard Kubernetes conditions |
 
+### Annotations
+
+| Annotation | Description |
+|------------|-------------|
+| `mirror.mathianasj.github.com/trigger` | Triggers a new collection run when a previous run has completed (Succeeded/Failed). The annotation value can be any string (typically a timestamp or reason). The controller automatically removes this annotation after processing to prevent continuous re-triggering. |
+
+**Example: Retry a failed collection**
+```bash
+kubectl annotate collectionpipeline <name> \
+  mirror.mathianasj.github.com/trigger="retry-$(date +%s)"
+```
+
 ### Example
 
 ```yaml

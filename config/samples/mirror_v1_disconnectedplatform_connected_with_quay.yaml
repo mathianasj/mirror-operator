@@ -1,0 +1,77 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  name: connected-platform-with-quay
+  namespace: mirror-operator-system
+spec:
+  mode: connected
+  connected:
+    collectionSchedule: "0 2 * * *"  # Daily at 2 AM
+    artifactStorage:
+      size: "100Gi"
+      storageClass: "gp3-csi"
+
+    # Managed Quay as intermediate registry for signed image storage
+    # REQUIREMENT: ObjectBucketClaim CRD must be available (ODF/Noobaa operator)
+    quay:
+      managed:
+        enabled: true
+        organizationName: "mirror"
+        storage:
+          type: "filesystem"
+          size: "500Gi"
+          storageClass: "gp3-csi"
+        # Optional: Custom TLS
+        # tlsSecret:
+        #   name: quay-tls-cert
+
+    # Alternative 1: S3 storage (no ObjectBucketClaim required)
+    # quay:
+    #   managed:
+    #     enabled: true
+    #     organizationName: "mirror"
+    #     storage:
+    #       type: "s3"
+    #       s3Bucket: "my-quay-storage"
+    #       s3AccessKey: "AKIA..."
+    #       s3SecretKey: "secret..."
+    #       s3Endpoint: "s3.amazonaws.com"
+
+    # Alternative 2: Use external Quay (no ObjectBucketClaim required)
+    # quay:
+    #   externalURL: "quay.example.com/mirror"
+
+    # RHTAS for keyless signing
+    rhtas:
+      oidc:
+        managed:
+          enabled: true
+          realm: "trusted-artifact-signer"
+
+    # RHTPA for SBOM analysis
+    rhtpa:
+      storage:
+        type: "filesystem"
+        size: "50Gi"
+      oidc:
+        issuer: "https://keycloak.apps.example.com/realms/trustify"
+        clientId: "tpa-cli"
+        clientSecret: "secret123"
+
+    # Optional: Operator overrides
+    operators:
+      quayOperator:
+        channel: "stable-3.13"
+        approvalStrategy: "Automatic"
+      rhtas:
+        channel: "stable"
+      rhtpa:
+        channel: "stable-v1.1"
+
+  # Architect UI configuration
+  architect:
+    enabled: true
+    frontend:
+      replicas: 2
+    backend:
+      replicas: 2

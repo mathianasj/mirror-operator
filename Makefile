@@ -133,9 +133,20 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
+.PHONY: kill
+kill: ## Kill any running operator instances
+	@echo "Killing existing operator processes..."
+	@ps aux | grep -E "go run.*cmd/main.go|controller-gen" | grep -v grep | awk '{print $$2}' | xargs kill -9 2>/dev/null || true
+	@lsof -ti:8080 | xargs kill -9 2>/dev/null || true
+	@lsof -ti:8081 | xargs kill -9 2>/dev/null || true
+	@echo "All operator processes killed"
+
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
+
+.PHONY: restart
+restart: kill run ## Kill existing instances and restart the operator
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.

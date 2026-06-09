@@ -27,12 +27,13 @@ type ArtifactStorageConfig struct {
 
 type ConnectedConfig struct {
 	CollectionSchedule string                `json:"collectionSchedule"`
-	MirrorRegistry     string                `json:"mirrorRegistry"`
+	MirrorRegistry     string                `json:"mirrorRegistry,omitempty"`
 	ArtifactStorage    ArtifactStorageConfig `json:"artifactStorage"`
 	TriggerTypes       []TriggerType         `json:"triggerTypes,omitempty"`
 	Operators          *OperatorConfig       `json:"operators,omitempty"`
 	RHTAS              *RHTASInstallerConfig `json:"rhtas,omitempty"`
 	RHTPA              *RHTPAInstallerConfig `json:"rhtpa,omitempty"`
+	Quay               *QuayInstallerConfig  `json:"quay,omitempty"`
 }
 
 type OLMSubscriptionConfig struct {
@@ -49,6 +50,7 @@ type OperatorConfig struct {
 	Keycloak           *OLMSubscriptionConfig `json:"keycloak,omitempty"`
 	RHTAS              *OLMSubscriptionConfig `json:"rhtas,omitempty"`
 	RHTPA              *OLMSubscriptionConfig `json:"rhtpa,omitempty"`
+	QuayOperator       *OLMSubscriptionConfig `json:"quayOperator,omitempty"`
 }
 
 type RHTASInstallerConfig struct {
@@ -91,6 +93,49 @@ type RHTPAInstallerConfig struct {
 	Storage  *RHTPAStorageConfig  `json:"storage,omitempty"`
 	Database *RHTPADatabaseConfig `json:"database,omitempty"`
 	OIDC     *RHTPAOIDCConfig     `json:"oidc,omitempty"`
+}
+
+type QuayInstallerConfig struct {
+	// Managed Quay instance for intermediate registry
+	Managed *ManagedQuayConfig `json:"managed,omitempty"`
+	// External Quay configuration if not using managed instance
+	ExternalURL string `json:"externalURL,omitempty"`
+}
+
+type ManagedQuayConfig struct {
+	Enabled          bool                         `json:"enabled"`
+	OrganizationName string                       `json:"organizationName,omitempty"`
+	Storage          *QuayStorageConfig           `json:"storage,omitempty"`
+	Database         *QuayDatabaseConfig          `json:"database,omitempty"`
+	AdminUser        string                       `json:"adminUser,omitempty"`
+	AdminPassword    string                       `json:"adminPassword,omitempty"`
+	TLSSecret        *corev1.LocalObjectReference `json:"tlsSecret,omitempty"`
+	CertIssuer       *CertIssuerReference         `json:"certIssuer,omitempty"`
+	Clair            *ClairConfig                 `json:"clair,omitempty"`
+}
+
+type ClairConfig struct {
+	// UseRedHatVEXOnly configures Clair to use only Red Hat VEX data for vulnerability scanning
+	UseRedHatVEXOnly bool `json:"useRedHatVEXOnly,omitempty"`
+}
+
+type QuayStorageConfig struct {
+	Type         string `json:"type"` // filesystem, s3, etc.
+	Size         string `json:"size,omitempty"`
+	StorageClass string `json:"storageClass,omitempty"`
+	// S3-specific config
+	S3Bucket    string `json:"s3Bucket,omitempty"`
+	S3AccessKey string `json:"s3AccessKey,omitempty"`
+	S3SecretKey string `json:"s3SecretKey,omitempty"`
+	S3Endpoint  string `json:"s3Endpoint,omitempty"`
+}
+
+type QuayDatabaseConfig struct {
+	Host     string `json:"host"`
+	Name     string `json:"name"`
+	Port     int32  `json:"port,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type RHTPAStorageConfig struct {
@@ -138,12 +183,13 @@ type RouteConfig struct {
 }
 
 type AirgapArchitectConfig struct {
-	Enabled       bool                         `json:"enabled"`
-	FrontendImage string                       `json:"frontendImage,omitempty"`
-	BackendImage  string                       `json:"backendImage,omitempty"`
-	Replicas      int32                        `json:"replicas,omitempty"`
-	Route         *RouteConfig                 `json:"route,omitempty"`
-	PullSecret    *corev1.LocalObjectReference `json:"pullSecret,omitempty"`
+	Enabled           bool                         `json:"enabled"`
+	FrontendImage     string                       `json:"frontendImage,omitempty"`
+	BackendImage      string                       `json:"backendImage,omitempty"`
+	Replicas          int32                        `json:"replicas,omitempty"`
+	Route             *RouteConfig                 `json:"route,omitempty"`
+	PullSecret        *corev1.LocalObjectReference `json:"pullSecret,omitempty"`
+	GitHubTokenSecret *corev1.LocalObjectReference `json:"githubTokenSecret,omitempty"`
 }
 
 type GitOpsConfig struct {
