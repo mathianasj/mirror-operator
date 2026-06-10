@@ -23,6 +23,9 @@ spec:
       additionalImages:
         - name: registry.redhat.io/openshift4/ose-cli:v4.17
   triggerType: manual
+  # Timeout for the entire pipeline (default: 12h)
+  # For large collections, increase as needed (e.g., 24h)
+  timeout: 12h
   signing:
     keySecretRef:
       name: cosign-signing-key

@@ -57,6 +57,9 @@ type CollectionPipelineSpec struct {
 	BaseVersion    string               `json:"baseVersion,omitempty"`
 	Storage        ArtifactOutput       `json:"storage,omitempty"`
 	Signing        *CosignSigningConfig `json:"signing,omitempty"`
+	// Timeout for the collection pipeline. Defaults to 12 hours if not specified.
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }
 
 type CollectionPhase string

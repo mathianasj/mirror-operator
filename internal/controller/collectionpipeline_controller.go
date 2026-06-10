@@ -765,41 +765,67 @@ while IFS='=' read -r source dest; do
   image_digest=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
   if [ -z "$image_digest" ]; then
     image_digest=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+    if [ -n "$image_digest" ]; then
+      echo "    [digest] Found in source: $image_digest"
+    fi
+  else
+    echo "    [digest] Found in dest: $image_digest"
   fi
 
   sbom_file="/tmp/sboms/$(echo "$dest_no_proto" | tr '/:@' '_').json"
   found_sbom=false
+  from_cache=false
 
   # Check cache first if we have a digest
   if [ -n "$image_digest" ]; then
     cached_sbom="$SBOM_CACHE_DIR/$(echo "$image_digest" | tr ':' '_').json"
+    echo "    [cache] Looking for cached SBOM: $(basename "$cached_sbom")"
     if [ -f "$cached_sbom" ]; then
-      cp "$cached_sbom" "$sbom_file"
+      echo "    [cache] Found cached SBOM, validating..."
+      cache_size=$(stat -f%z "$cached_sbom" 2>/dev/null || stat -c%s "$cached_sbom" 2>/dev/null || echo 0)
+      echo "    [cache] Source size: $cache_size bytes"
+      if cp "$cached_sbom" "$sbom_file"; then
+        temp_size=$(stat -f%z "$sbom_file" 2>/dev/null || stat -c%s "$sbom_file" 2>/dev/null || echo 0)
+        echo "    [cache] Copied to temp: $(basename "$sbom_file") ($temp_size bytes)"
+      else
+        echo "    [cache] ✗ Copy to temp failed"
+      fi
       pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
-      if [ "$pkg_count" -gt 0 ]; then
+      pkg_count=${pkg_count:-0}
+      if [ "$pkg_count" -gt 0 ] 2>/dev/null; then
         echo "    ✓ Using cached SBOM ($pkg_count packages)"
         scan_count=$((scan_count + 1))
         scanned_packages=$((scanned_packages + pkg_count))
         found_sbom=true
+        from_cache=true
+      else
+        echo "    [cache] Cached SBOM invalid (0 packages), will rescan"
       fi
+    else
+      echo "    [cache] No cached SBOM found, will scan"
     fi
+  else
+    echo "    [cache] No digest available, skipping cache check"
   fi
 
   # Try to extract embedded SBOM using cosign (try modern attestations first, then deprecated attachments)
+  # Skip if we already found a valid SBOM from cache
   # (cosign doesn't use protocol prefix, just registry:port/path)
-  if [ -n "$INTERMEDIATE_REGISTRY" ]; then
-    # For intermediate registry, use dest path with intermediate registry
-    cosign_ref="${dest_no_proto//localhost:55000/$INTERMEDIATE_REGISTRY}"
-  else
-    # For local sidecar
-    cosign_ref="${dest_no_proto//localhost:55000/localhost:5000}"
-  fi
+  if [ "$found_sbom" = false ]; then
+    if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+      # For intermediate registry, use dest path with intermediate registry
+      cosign_ref="${dest_no_proto//localhost:55000/$INTERMEDIATE_REGISTRY}"
+    else
+      # For local sidecar
+      cosign_ref="${dest_no_proto//localhost:55000/localhost:5000}"
+    fi
 
-  # Try attestations (modern approach)
-  # Note: DOCKER_CONFIG is already exported at the top of the script
-  if cosign download attestation "$cosign_ref" --predicate-type=https://spdx.dev/Document > "$sbom_file" 2>/dev/null; then
+    # Try attestations (modern approach)
+    # Note: DOCKER_CONFIG is already exported at the top of the script
+    if cosign download attestation "$cosign_ref" --predicate-type=https://spdx.dev/Document > "$sbom_file" 2>/dev/null; then
     pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
-    if [ "$pkg_count" -gt 0 ]; then
+    pkg_count=${pkg_count:-0}
+    if [ "$pkg_count" -gt 0 ] 2>/dev/null; then
       embedded_count=$((embedded_count + 1))
       scanned_packages=$((scanned_packages + pkg_count))
       echo "    ✓ Extracted SBOM attestation ($pkg_count packages)"
@@ -811,7 +837,8 @@ while IFS='=' read -r source dest; do
   # Note: DOCKER_CONFIG is already exported at the top of the script
   if [ "$found_sbom" = false ] && cosign download sbom "$cosign_ref" > "$sbom_file" 2>/dev/null; then
     pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
-    if [ "$pkg_count" -gt 0 ]; then
+    pkg_count=${pkg_count:-0}
+    if [ "$pkg_count" -gt 0 ] 2>/dev/null; then
       embedded_count=$((embedded_count + 1))
       scanned_packages=$((scanned_packages + pkg_count))
       echo "    ✓ Extracted SBOM attachment ($pkg_count packages)"
@@ -825,7 +852,8 @@ while IFS='=' read -r source dest; do
     syft_err_file="/tmp/syft_err_$$"
     if syft "$local_image" -o cyclonedx-json > "$sbom_file" 2>"$syft_err_file"; then
       pkg_count=$(jq '.components | length // 0' "$sbom_file" 2>/dev/null || echo 0)
-      if [ "$pkg_count" -gt 0 ]; then
+      pkg_count=${pkg_count:-0}
+      if [ "$pkg_count" -gt 0 ] 2>/dev/null; then
         scan_count=$((scan_count + 1))
         scanned_packages=$((scanned_packages + pkg_count))
         echo "    ✓ Scanned with Syft ($pkg_count packages)"
@@ -840,26 +868,46 @@ while IFS='=' read -r source dest; do
       rm -f "$syft_err_file"
     fi
   fi
+  fi  # End of if [ "$found_sbom" = false ] for cosign/syft attempts
 
-  # Cache the SBOM if we successfully generated/extracted one
-  # Debug: always try to cache and report what happens
-  if [ -z "$image_digest" ]; then
-    echo "    [cache skip: no digest]"
+  # Cache the SBOM if we successfully generated/extracted one (but not if it came from cache)
+  if [ "$from_cache" = true ]; then
+    echo "    [cache] Skip write: already cached"
+  elif [ -z "$image_digest" ]; then
+    echo "    [cache] Skip: no digest available"
   elif [ ! -f "$sbom_file" ]; then
-    echo "    [cache skip: SBOM file missing]"
+    echo "    [cache] Skip: SBOM file missing"
   elif [ "$found_sbom" != true ]; then
-    echo "    [cache skip: found_sbom=$found_sbom]"
+    echo "    [cache] Skip: no valid SBOM found"
   else
     cached_sbom="$SBOM_CACHE_DIR/$(echo "$image_digest" | tr ':' '_').json"
+    echo "    [cache] Writing to: $(basename "$cached_sbom")"
     if cp "$sbom_file" "$cached_sbom"; then
-      echo "    → Cached"
+      echo "    [cache] ✓ Successfully cached SBOM"
     else
-      echo "    ⚠ Cache write failed"
+      echo "    [cache] ✗ Cache write failed"
     fi
+  fi
 
-    # Also save per-image SBOM for cosign attestation
+  # Always save per-image SBOM for cosign attestation (even if from cache, different images can share digests)
+  if [ "$found_sbom" = true ]; then
     attestation_file="$ATTESTATION_DIR/$(echo "$dest_no_proto" | tr '/:@' '_').json"
-    cp "$sbom_file" "$attestation_file" 2>/dev/null || true
+    echo "    [attestation] Checking source: $(basename "$sbom_file")"
+    if [ -f "$sbom_file" ]; then
+      src_size=$(stat -f%z "$sbom_file" 2>/dev/null || stat -c%s "$sbom_file" 2>/dev/null || echo 0)
+      echo "    [attestation] Source exists: $src_size bytes"
+      if [ "$src_size" -gt 0 ]; then
+        if cp "$sbom_file" "$attestation_file" 2>/dev/null; then
+          echo "    [attestation] ✓ Saved for signing"
+        else
+          echo "    [attestation] ✗ Copy failed"
+        fi
+      else
+        echo "    [attestation] ✗ Source file is 0 bytes"
+      fi
+    else
+      echo "    [attestation] ✗ Source file does not exist"
+    fi
   fi
 
   if [ "$found_sbom" = false ]; then
@@ -873,10 +921,13 @@ echo "Processed images: $embedded_count embedded SBOMs, $scan_count Syft scans, 
 # Step 2: Build SBOM from mapping.txt and scanned data
 echo "Step 2: Building comprehensive SBOM..."
 
-# First, collect all packages with container context
+# Debug: Check how many SBOM files exist in /tmp/sboms
+sbom_count=$(ls -1 /tmp/sboms/*.json 2>/dev/null | wc -l)
+echo "Found $sbom_count SBOM files in /tmp/sboms/"
+
+# First, collect all container components with nested packages
 echo "Aggregating packages from all images..."
-all_packages_file="/tmp/all_packages.json"
-echo "[]" > "$all_packages_file"
+rm -f /tmp/container_components.jsonl
 
 image_count_for_packages=0
 total_packages=0
@@ -906,62 +957,85 @@ while IFS='=' read -r source dest; do
   sbom_file="/tmp/sboms/$(echo "$dest_no_proto" | tr '/:@' '_').json"
   if [ -f "$sbom_file" ]; then
     packages=$(jq '.components // []' "$sbom_file" 2>/dev/null || echo "[]")
-    pkg_count=$(echo "$packages" | jq 'length // 0')
-    if [ "$pkg_count" -gt 0 ]; then
+    pkg_count=$(echo "$packages" | jq 'length // 0' 2>/dev/null || echo 0)
+    pkg_count=${pkg_count:-0}
+    if [ "$pkg_count" -gt 0 ] 2>/dev/null; then
       total_packages=$((total_packages + pkg_count))
       echo "  [$image_count_for_packages] Found $pkg_count packages in $image_name"
 
-      # Add container context to each package and merge into all_packages
-      # This adds properties to track which container each package came from
-      enriched_packages=$(echo "$packages" | jq --arg img "$image_full" --arg name "$image_name" --arg ver "$version" '
-        map(. + {
-          "properties": ([.properties // [] | .[],
-            {"name": "container:image", "value": $img},
-            {"name": "container:name", "value": $name},
-            {"name": "container:version", "value": $ver}
-          ])
-        })
-      ')
+      # Create a container-image component with nested packages
+      # Extract digest from dest (format: registry/path@sha256:...)
+      image_digest=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+      image_purl=""
+      if [ -n "$image_digest" ]; then
+        # Build OCI purl: pkg:oci/name@digest?repository_url=registry/path
+        image_repo=$(echo "$dest" | sed -E 's|^[^/]+/||' | sed -E 's|@sha256:.*||')
+        image_registry=$(echo "$dest" | sed -E 's|/.*||')
+        image_purl="pkg:oci/${image_name}@${image_digest}?repository_url=${image_registry}/${image_repo}"
+      fi
 
-      # Merge into all_packages array
-      jq -s '.[0] + .[1]' "$all_packages_file" <(echo "$enriched_packages") > /tmp/merged.json
-      mv /tmp/merged.json "$all_packages_file"
+      # Build container component with nested packages
+      # Use slurpfile to avoid ARG_MAX with large package arrays
+      packages_temp="/tmp/packages_$image_count_for_packages.json"
+      echo "$packages" > "$packages_temp"
+
+      jq -n \
+        --arg name "$image_name" \
+        --arg version "$version" \
+        --arg img "$image_full" \
+        --arg purl "$image_purl" \
+        --arg digest "$image_digest" \
+        --slurpfile packages "$packages_temp" \
+        '{
+          "type": "container-image",
+          "name": $name,
+          "version": $version,
+          "purl": $purl,
+          "properties": [
+            {"name": "container:image", "value": $img},
+            {"name": "container:digest", "value": $digest}
+          ],
+          "components": $packages[0]
+        }' >> /tmp/container_components.jsonl
+
+      rm -f "$packages_temp"
     fi
   fi
 done < "$MAPPING_FILE"
 
 echo "Total packages collected: $total_packages from $image_count_for_packages images"
 
-# Build final SBOM with flattened package list
-cat > /workspace/output/sbom.cyclonedx.json <<SBOM_TEMPLATE
-{
-  "bomFormat": "CycloneDX",
-  "specVersion": "1.4",
-  "version": 1,
-  "metadata": {
-    "timestamp": "TIMESTAMP_PLACEHOLDER",
-    "component": {
-      "type": "container",
-      "name": "mirror-collection",
-      "version": "VERSION_PLACEHOLDER"
-    }
-  },
-  "components": COMPONENTS_PLACEHOLDER
-}
-SBOM_TEMPLATE
+# Build final hierarchical SBOM with container components
+# Use jq to construct the SBOM to avoid ARG_MAX issues
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+version=$(basename /workspace/output)
 
-# Insert the aggregated components
-components_json=$(cat "$all_packages_file")
-# Use a unique delimiter that won't appear in JSON
-jq --argjson components "$components_json" '.components = $components' /workspace/output/sbom.cyclonedx.json > /tmp/final_sbom.json
-mv /tmp/final_sbom.json /workspace/output/sbom.cyclonedx.json
+# Combine all container components into array
+container_components="[]"
+if [ -f /tmp/container_components.jsonl ]; then
+  container_components=$(jq -s '.' /tmp/container_components.jsonl)
+fi
 
-component_count=$total_packages
+echo "$container_components" | jq \
+  --arg timestamp "$timestamp" \
+  --arg version "$version" \
+  '{
+    bomFormat: "CycloneDX",
+    specVersion: "1.4",
+    version: 1,
+    metadata: {
+      timestamp: $timestamp,
+      component: {
+        type: "container",
+        name: "mirror-collection",
+        version: $version
+      }
+    },
+    components: .
+  }' > /workspace/output/sbom.cyclonedx.json
+
+component_count=$image_count_for_packages
 scanned_packages=$total_packages
-
-# Update placeholders
-sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/" /workspace/output/sbom.cyclonedx.json
-sed -i "s/VERSION_PLACEHOLDER/$(basename /workspace/output)/" /workspace/output/sbom.cyclonedx.json
 
 # Validate and report
 echo "=== SBOM Generation Complete ==="
@@ -1019,6 +1093,11 @@ cosign initialize --mirror="$TUF_URL" --root="$TUF_URL/root.json"
 
 echo "=== Signing container images in $REGISTRY_TARGET ==="
 
+# Debug: Check attestation files
+total_att=$(ls -1 /workspace/output/attestations/*.json 2>/dev/null | wc -l)
+nonzero_att=$(find /workspace/output/attestations -name "*.json" -size +0 2>/dev/null | wc -l)
+echo "Attestation files: $total_att total, $nonzero_att non-zero"
+
 # Find the mapping file from dry-run
 MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
 if [ ! -f "$MAPPING_FILE" ]; then
@@ -1075,7 +1154,6 @@ while IFS='=' read -r source dest; do
     --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" \
     --oidc-client-secret-file /workspace/oidc-secret/clientSecret \
     --yes \
-    --registry-referrers-mode=oci-1-1 \
     "$image_ref" 2>&1; then
     signed_count=$((signed_count + 1))
     echo "    ✓ Signed"
@@ -1086,25 +1164,33 @@ while IFS='=' read -r source dest; do
   # Attach SBOM attestation if available
   dest_no_proto="${dest#docker://}"
   attestation_file="/workspace/output/attestations/$(echo "$dest_no_proto" | tr '/:@' '_').json"
+  echo "    [attestation] Checking: $(basename "$attestation_file")"
   if [ -f "$attestation_file" ]; then
-    echo "    Attaching SBOM attestation..."
-    if cosign attest \
-      --fulcio-url "$FULCIO_URL" \
-      --rekor-url "$REKOR_URL" \
-      --fulcio-auth-flow=client_credentials \
-      --oidc-issuer "$COSIGN_OIDC_ISSUER" \
-      --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" \
-      --oidc-client-secret-file /workspace/oidc-secret/clientSecret \
-      --yes \
-      --type cyclonedx \
-      --predicate "$attestation_file" \
-      --registry-referrers-mode=oci-1-1 \
-      "$image_ref" 2>&1; then
-      attested_count=$((attested_count + 1))
-      echo "    ✓ SBOM attestation attached"
+    att_size=$(stat -f%z "$attestation_file" 2>/dev/null || stat -c%s "$attestation_file" 2>/dev/null || echo 0)
+    echo "    [attestation] Found: $att_size bytes"
+    if [ "$att_size" -gt 0 ]; then
+      echo "    [attestation] Attaching SBOM attestation..."
+      if cosign attest \
+        --fulcio-url "$FULCIO_URL" \
+        --rekor-url "$REKOR_URL" \
+        --fulcio-auth-flow=client_credentials \
+        --oidc-issuer "$COSIGN_OIDC_ISSUER" \
+        --oidc-client-id "$COSIGN_OIDC_CLIENT_ID" \
+        --oidc-client-secret-file /workspace/oidc-secret/clientSecret \
+        --yes \
+        --type cyclonedx \
+        --predicate "$attestation_file" \
+        "$image_ref" 2>&1; then
+        attested_count=$((attested_count + 1))
+        echo "    ✓ SBOM attestation attached"
+      else
+        echo "    ✗ Failed to attach SBOM attestation"
+      fi
     else
-      echo "    ✗ Failed to attach SBOM attestation"
+      echo "    [attestation] ✗ File is 0 bytes, skipping"
     fi
+  else
+    echo "    [attestation] ✗ File not found"
   fi
 
 done < "$MAPPING_FILE"
@@ -1162,9 +1248,10 @@ echo "  SBOM attestations attached: $attested_count"
 
 	// SBOM upload step - get TPA URL
 	var uploadSbomStep *pipelinev1.Step
-	tpaHostname, keycloakHost := r.getTPAAndKeycloakHosts(ctx)
+	tpaHostname, keycloakHost, tpaNamespace := r.getTPAAndKeycloakHosts(ctx)
 	if tpaHostname != "" && keycloakHost != "" {
-		tpaURL := fmt.Sprintf("https://%s/api/v2/sbom", tpaHostname)
+		// Use internal service to avoid ingress timeout (99MB compressed SBOM takes time to process)
+		tpaURL := fmt.Sprintf("https://server.%s.svc.cluster.local/api/v2/sbom", tpaNamespace)
 		tokenURL := fmt.Sprintf("https://%s/realms/trustify/protocol/openid-connect/token", keycloakHost)
 
 		uploadSbomStep = &pipelinev1.Step{
@@ -1179,6 +1266,16 @@ if [ ! -f /workspace/output/sbom.cyclonedx.json ]; then
   exit 0
 fi
 
+# Check SBOM size and compress if large
+SBOM_SIZE=$(stat -f%%z /workspace/output/sbom.cyclonedx.json 2>/dev/null || stat -c%%s /workspace/output/sbom.cyclonedx.json)
+echo "SBOM size: $(numfmt --to=iec-i --suffix=B $SBOM_SIZE 2>/dev/null || echo $SBOM_SIZE bytes)"
+
+# Compress SBOM with gzip for upload
+echo "Compressing SBOM..."
+gzip -c /workspace/output/sbom.cyclonedx.json > /tmp/sbom.cyclonedx.json.gz
+COMPRESSED_SIZE=$(stat -f%%z /tmp/sbom.cyclonedx.json.gz 2>/dev/null || stat -c%%s /tmp/sbom.cyclonedx.json.gz)
+echo "Compressed size: $(numfmt --to=iec-i --suffix=B $COMPRESSED_SIZE 2>/dev/null || echo $COMPRESSED_SIZE bytes)"
+
 echo "Getting OIDC token..."
 TOKEN_RESPONSE=$(curl -k -s -X POST "%s" \
   -d "grant_type=client_credentials" \
@@ -1191,11 +1288,12 @@ if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
   exit 1
 fi
 
-echo "Uploading SBOM to TPA..."
-HTTP_CODE=$(curl -k -s -w "%%{http_code}" -o /tmp/upload_response.txt -X POST "%s" \
+echo "Uploading compressed SBOM to TPA via internal service (timeout: 300s)..."
+HTTP_CODE=$(curl -k -s --max-time 300 -w "%%{http_code}" -o /tmp/upload_response.txt -X POST "%s" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
-  -d @/workspace/output/sbom.cyclonedx.json)
+  -H "Content-Encoding: gzip" \
+  --data-binary @/tmp/sbom.cyclonedx.json.gz)
 
 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
   echo "SBOM uploaded successfully (HTTP $HTTP_CODE)"
@@ -1561,6 +1659,13 @@ fi
 	}
 
 	pipelineRunNamePrefix := fmt.Sprintf("collection-pipeline-%s-", pipeline.Name)
+
+	// Set timeout - default to 12 hours if not specified
+	timeout := &metav1.Duration{Duration: 12 * time.Hour}
+	if pipeline.Spec.Timeout != nil {
+		timeout = pipeline.Spec.Timeout
+	}
+
 	pr := &pipelinev1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: pipelineRunNamePrefix,
@@ -1579,6 +1684,9 @@ fi
 				Tasks:      cosignTasks,
 			},
 			Workspaces: bindings,
+			Timeouts: &pipelinev1.TimeoutFields{
+				Pipeline: timeout,
+			},
 		},
 	}
 
@@ -1586,7 +1694,7 @@ fi
 }
 
 // getTPAAndKeycloakHosts retrieves the TPA and Keycloak hostnames from Ingresses
-func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Context) (string, string) {
+func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Context) (string, string, string) {
 	logger := log.FromContext(ctx)
 
 	// Find TPA instance
@@ -1598,15 +1706,16 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	})
 	if err := r.List(ctx, tpaList); err != nil {
 		logger.Error(err, "failed to list TPA instances")
-		return "", ""
+		return "", "", ""
 	}
 
 	if len(tpaList.Items) == 0 {
-		return "", ""
+		return "", "", ""
 	}
 
 	tpa := tpaList.Items[0]
 	tpaUID := tpa.GetUID()
+	tpaNamespace := tpa.GetNamespace()
 
 	// Find TPA Ingress
 	ingressList := &unstructured.UnstructuredList{}
@@ -1617,7 +1726,7 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	})
 	if err := r.List(ctx, ingressList, client.InNamespace(tpa.GetNamespace())); err != nil {
 		logger.Error(err, "failed to list Ingresses")
-		return "", ""
+		return "", "", ""
 	}
 
 	var tpaHostname string
@@ -1642,7 +1751,7 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	}
 
 	if tpaHostname == "" {
-		return "", ""
+		return "", "", ""
 	}
 
 	// Get Keycloak hostname
@@ -1655,13 +1764,13 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	ingress.SetName("cluster")
 	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
 		logger.Error(err, "failed to get cluster ingress")
-		return tpaHostname, ""
+		return tpaHostname, "", tpaNamespace
 	}
 
 	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
 	keycloakHost := "keycloak." + domain
 
-	return tpaHostname, keycloakHost
+	return tpaHostname, keycloakHost, tpaNamespace
 }
 
 // generateIntermediateImageSetConfig creates an ImageSetConfiguration that pulls from the intermediate registry

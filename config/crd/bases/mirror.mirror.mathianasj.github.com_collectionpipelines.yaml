@@ -157,6 +157,10 @@ spec:
                         type: object
                     type: object
                 type: object
+              timeout:
+                description: Timeout for the collection pipeline. Defaults to 12 hours
+                  if not specified.
+                type: string
               triggerType:
                 type: string
             required:
