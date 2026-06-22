@@ -12,8 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -99,9 +101,12 @@ var (
 
 type DisconnectedPlatformReconciler struct {
 	client.Client
-	Scheme                 *runtime.Scheme
-	ArchitectFrontendImage string
-	ArchitectBackendImage  string
+	Scheme                      *runtime.Scheme
+	ArchitectFrontendImage      string
+	ArchitectBackendImage       string
+	ArchitectConsolePluginImage string
+	ClientSet                   kubernetes.Interface
+	RESTConfig                  *rest.Config
 }
 
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms,verbs=get;list;watch;create;update;patch;delete
@@ -128,6 +133,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=console.openshift.io,resources=consoleplugins,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=operator.openshift.io,resources=consoles,verbs=get;list;watch;update;patch
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	platform := &mirrorv1.DisconnectedPlatform{}
@@ -160,6 +167,14 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			platform.Status.Phase = mirrorv1.PlatformPhaseError
 			return ctrl.Result{}, r.Status().Update(ctx, platform)
 		}
+	}
+
+	// Reconcile Airgap Architect UI early so it's not blocked by downstream components
+	if err := r.reconcileArchitect(ctx, platform); err != nil {
+		log.FromContext(ctx).Error(err, "failed to reconcile airgap-architect")
+		platform.Status.Phase = mirrorv1.PlatformPhaseError
+		r.setErrorCondition(platform, "ArchitectReconcileFailed", err.Error())
+		return ctrl.Result{}, r.Status().Update(ctx, platform)
 	}
 
 	keycloakReady := false
@@ -232,13 +247,6 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
-	}
-
-	if err := r.reconcileArchitect(ctx, platform); err != nil {
-		log.FromContext(ctx).Error(err, "failed to reconcile airgap-architect")
-		platform.Status.Phase = mirrorv1.PlatformPhaseError
-		r.setErrorCondition(platform, "ArchitectReconcileFailed", err.Error())
-		return ctrl.Result{}, r.Status().Update(ctx, platform)
 	}
 
 	// Aggregate collection history from CollectionPipeline resources.
@@ -450,6 +458,15 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 			Name:   op.name,
 			Status: compStatus,
 		})
+
+		// Enable console plugins for operators that provide them
+		if compStatus == "Succeeded" {
+			if op.name == "openshift-pipelines" {
+				if err := r.enableConsolePluginInOperator(ctx, "pipelines-console-plugin"); err != nil {
+					log.FromContext(ctx).Error(err, "failed to enable pipelines console plugin")
+				}
+			}
+		}
 	}
 
 	platform.Status.Components = components
@@ -4266,10 +4283,10 @@ func (r *DisconnectedPlatformReconciler) addQuayCredentialsIfNeeded(ctx context.
 	return updated, true, nil
 }
 
-// getQuayRobotCredentials retrieves robot account credentials from Quay database
+// getQuayRobotCredentials retrieves robot account credentials from Quay
+// It first checks the cached secret, then queries the Quay database if needed
 func (r *DisconnectedPlatformReconciler) getQuayRobotCredentials(ctx context.Context) (string, string, error) {
-	// Try to get from database via kubectl exec
-	// This is a temporary solution - ideally we'd store this in a secret
+	logger := log.FromContext(ctx)
 	robot := "mirror+mirroroperator"
 
 	// Check if we have cached credentials in a secret
@@ -4277,13 +4294,80 @@ func (r *DisconnectedPlatformReconciler) getQuayRobotCredentials(ctx context.Con
 	if err := r.Get(ctx, types.NamespacedName{Name: "quay-robot-credentials", Namespace: architectNamespace}, robotSecret); err == nil {
 		token := string(robotSecret.Data["token"])
 		if token != "" {
+			logger.V(1).Info("Retrieved robot credentials from cached secret")
 			return robot, token, nil
 		}
 	}
 
-	// TODO: Query database or Quay API to get token
-	// For now, return empty which will skip adding credentials
-	return "", "", fmt.Errorf("robot credentials not available")
+	// Secret not found or empty - query Quay database directly
+	logger.Info("Cached robot credentials not found, querying Quay database")
+	token, err := r.queryQuayRobotToken(ctx, "mirror", "mirroroperator")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to query robot token from Quay: %w", err)
+	}
+
+	// Cache the retrieved token for future use
+	if err := r.saveQuayRobotCredentials(ctx, robot, token); err != nil {
+		logger.Error(err, "failed to cache robot credentials to secret")
+		// Non-fatal - we still have the token
+	}
+
+	return robot, token, nil
+}
+
+// queryQuayRobotToken queries the Quay database directly for a robot account's token
+func (r *DisconnectedPlatformReconciler) queryQuayRobotToken(ctx context.Context, orgName, robotShortName string) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Python script to query robot token from Quay database
+	pythonScript := `
+import sys
+from app import app
+from data import model
+from data.database import configure
+
+# Initialize database
+configure(app.config)
+
+org_name = "` + orgName + `"
+robot_short_name = "` + robotShortName + `"
+robot_full_name = org_name + "+" + robot_short_name
+
+try:
+    # Look up the robot account
+    robot = model.user.lookup_robot(robot_full_name)
+    if not robot:
+        print(f"Robot {robot_full_name} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Retrieve the robot's token
+    robot_token = model.user.retrieve_robot_token(robot)
+    if not robot_token:
+        print(f"Robot {robot_full_name} has no token", file=sys.stderr)
+        sys.exit(1)
+
+    print(robot_token)
+
+except Exception as e:
+    print(f"Error querying robot token: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+`
+
+	// Execute Python script in Quay pod
+	output, err := r.execInQuayPod(ctx, architectNamespace, pythonScript)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute token query script: %w", err)
+	}
+
+	token := strings.TrimSpace(output)
+	if token == "" {
+		return "", fmt.Errorf("token query script returned empty token")
+	}
+
+	logger.Info("Successfully retrieved robot token from Quay database", "org", orgName, "robot", robotShortName)
+	return token, nil
 }
 
 // mergePullSecrets merges source dockerconfig into existing, preserving Quay credentials
@@ -4416,6 +4500,7 @@ func (r *DisconnectedPlatformReconciler) getRouteHostname(route *unstructured.Un
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
 	cfg := platform.Spec.Architect
 	if cfg == nil || !cfg.Enabled {
 		return r.deleteArchitectResources(ctx, platform)
@@ -4500,17 +4585,61 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 	}
 
 	// Frontend resources (after routes to get hostnames)
-	frontendName := architectResourceName(platform, "airgap-architect-frontend")
-	frontendLabels := architectComponentLabels("frontend")
-	if err := r.ensureArchitectFrontend(ctx, platform, frontendName, frontendImage, replicas, frontendLabels, backendRouteHostname, frontendRouteHostname); err != nil {
-		return err
+	// Deploy if frontendImage is explicitly set, or if console plugin is not enabled (default mode)
+	deployFrontend := frontendImage != "" && (cfg.ConsolePlugin == nil || !cfg.ConsolePlugin.Enabled || cfg.FrontendImage != "")
+
+	if deployFrontend {
+		frontendName := architectResourceName(platform, "airgap-architect-frontend")
+		frontendLabels := architectComponentLabels("frontend")
+		if err := r.ensureArchitectFrontend(ctx, platform, frontendName, frontendImage, replicas, frontendLabels, backendRouteHostname, frontendRouteHostname); err != nil {
+			return err
+		}
+		if err := r.ensureArchitectService(ctx, platform, frontendName, int32(frontendPort), frontendLabels); err != nil {
+			return err
+		}
+		platform.Status.Components = append(platform.Status.Components,
+			mirrorv1.ComponentStatus{Name: "airgap-architect-frontend", Status: "Running"},
+		)
+	} else if cfg.ConsolePlugin != nil && cfg.ConsolePlugin.Enabled && cfg.FrontendImage == "" {
+		// Only delete frontend if console plugin is enabled AND frontendImage is not explicitly set
+		// This allows hybrid mode (both frontend and plugin) when frontendImage is specified
+		if err := r.deleteArchitectFrontendResources(ctx, platform); err != nil {
+			logger.Error(err, "failed to delete frontend resources")
+		}
 	}
-	if err := r.ensureArchitectService(ctx, platform, frontendName, int32(frontendPort), frontendLabels); err != nil {
-		return err
+
+	// Console Plugin resources (if enabled)
+	if cfg.ConsolePlugin != nil && cfg.ConsolePlugin.Enabled {
+		consolePluginImage := cfg.ConsolePlugin.Image
+		if consolePluginImage == "" {
+			consolePluginImage = r.ArchitectConsolePluginImage
+		}
+		pluginName := "airgap-architect-plugin"
+		pluginLabels := architectComponentLabels("console-plugin")
+		if err := r.ensureConsolePlugin(ctx, platform, pluginName, consolePluginImage, replicas, pluginLabels, pullSecretName, pullSecretNamespace); err != nil {
+			return err
+		}
+		if err := r.ensureArchitectService(ctx, platform, pluginName, int32(9001), pluginLabels); err != nil {
+			return err
+		}
+		if err := r.ensureConsolePluginCR(ctx, platform, pluginName); err != nil {
+			return err
+		}
+		if err := r.enableConsolePluginInOperator(ctx, pluginName); err != nil {
+			logger.Error(err, "failed to enable console plugin in operator")
+		}
+		platform.Status.Components = append(platform.Status.Components,
+			mirrorv1.ComponentStatus{Name: "airgap-architect-console-plugin", Status: "Running"},
+		)
+		logger.Info("Console plugin enabled - UI accessible via OpenShift Console: Administrator → Airgap Architect")
+	} else {
+		// Delete console plugin resources if disabled or not configured
+		if err := r.deleteConsolePluginResources(ctx, platform); err != nil {
+			logger.Error(err, "failed to delete console plugin resources")
+		}
 	}
 
 	platform.Status.Components = append(platform.Status.Components,
-		mirrorv1.ComponentStatus{Name: "airgap-architect-frontend", Status: "Running"},
 		mirrorv1.ComponentStatus{Name: "airgap-architect-backend", Status: "Running"},
 	)
 	return nil
@@ -4589,7 +4718,22 @@ func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder 
 				"mountPath": pullSecretMountPath,
 				"readOnly":  true,
 			},
+			map[string]interface{}{
+				"name":      "tls-cert",
+				"mountPath": "/var/serving-cert",
+				"readOnly":  true,
+			},
 		}
+
+		// Add TLS environment variables
+		env = append(env, map[string]interface{}{
+			"name":  "TLS_CERT_PATH",
+			"value": "/var/serving-cert/tls.crt",
+		})
+		env = append(env, map[string]interface{}{
+			"name":  "TLS_KEY_PATH",
+			"value": "/var/serving-cert/tls.key",
+		})
 
 		// Add GitHub token if secret is configured
 		if githubTokenSecretName != "" {
@@ -4605,8 +4749,9 @@ func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder 
 		}
 
 		return map[string]interface{}{
-			"name":  "airgap-architect-backend",
-			"image": image,
+			"name":            "airgap-architect-backend",
+			"image":           image,
+			"imagePullPolicy": "Always",
 			"ports": []interface{}{
 				map[string]interface{}{
 					"containerPort": int64(architectPort),
@@ -4645,34 +4790,58 @@ func backendContainer(name, image string, labels map[string]string) map[string]i
 }
 
 func (r *DisconnectedPlatformReconciler) ensureArchitectService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name string, port int32, labels map[string]string) error {
+	// Check if this is the console plugin or backend service (needs TLS)
+	isConsolePlugin := name == "airgap-architect-plugin"
+	isBackend := strings.Contains(name, "airgap-architect-backend")
+	enableTLS := isConsolePlugin || isBackend
+
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(serviceGVK)
 	existing.SetName(name)
 	existing.SetNamespace(architectNamespace)
 	if err := r.Get(ctx, client.ObjectKeyFromObject(existing), existing); err == nil {
 		// Update existing service
-		svc := architectService(name, port, labels)
+		svc := architectService(name, port, labels, enableTLS)
 		svc.SetResourceVersion(existing.GetResourceVersion())
 		setOwnerReference(svc, platform)
 		return r.Update(ctx, svc)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	svc := architectService(name, port, labels)
+	svc := architectService(name, port, labels, enableTLS)
 	setOwnerReference(svc, platform)
 	return r.Create(ctx, svc)
 }
 
-func architectService(name string, port int32, labels map[string]string) *unstructured.Unstructured {
+func architectService(name string, port int32, labels map[string]string, enableTLS bool) *unstructured.Unstructured {
 	svc := &unstructured.Unstructured{}
 	svc.SetGroupVersionKind(serviceGVK)
 	svc.SetName(name)
 	svc.SetNamespace(architectNamespace)
 	svc.SetLabels(labels)
+
+	// Add serving cert annotation for console plugin to enable HTTPS
+	if enableTLS {
+		annotations := map[string]interface{}{
+			"service.beta.openshift.io/serving-cert-secret-name": name + "-cert",
+		}
+		svc.SetAnnotations(map[string]string{
+			"service.beta.openshift.io/serving-cert-secret-name": name + "-cert",
+		})
+		unstructured.SetNestedMap(svc.Object, annotations, "metadata", "annotations")
+	}
+
 	unstructured.SetNestedField(svc.Object, "ClusterIP", "spec", "type")
+
+	// Port name should be "https" for TLS-enabled services
+	portName := "http"
+	if enableTLS {
+		portName = "https"
+	}
+
 	unstructured.SetNestedSlice(svc.Object, []interface{}{
 		map[string]interface{}{
-			"name":       "http",
+			"name":       portName,
 			"port":       int64(port),
 			"protocol":   "TCP",
 			"targetPort": int64(port),
@@ -4777,6 +4946,338 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 	}
 }
 
+// Console Plugin
+
+func (r *DisconnectedPlatformReconciler) ensureConsolePlugin(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) error {
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(deploymentGVK)
+	dep.SetName(name)
+	dep.SetNamespace(architectNamespace)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
+		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(name, image string, labels map[string]string) map[string]interface{} {
+			return consolePluginContainer(name, image, labels)
+		})
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	newDep := consolePluginDeployment(name, image, replicas, labels, pullSecretName, pullSecretNamespace)
+	setOwnerReference(newDep, platform)
+	return r.Create(ctx, newDep)
+}
+
+func consolePluginDeployment(name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(deploymentGVK)
+	dep.SetName(name)
+	dep.SetNamespace(architectNamespace)
+	dep.SetLabels(labels)
+	dep.Object["spec"] = architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(name, image string, labels map[string]string) map[string]interface{} {
+		return consolePluginContainer(name, image, labels)
+	})
+	return dep
+}
+
+func consolePluginContainer(name, image string, labels map[string]string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":            "plugin",
+		"image":           image,
+		"imagePullPolicy": "Always",
+		"ports": []interface{}{
+			map[string]interface{}{
+				"containerPort": int64(9001),
+				"name":          "https",
+				"protocol":      "TCP",
+			},
+		},
+		"volumeMounts": []interface{}{
+			map[string]interface{}{
+				"name":      "serving-cert",
+				"mountPath": "/var/serving-cert",
+				"readOnly":  true,
+			},
+		},
+		"resources": map[string]interface{}{
+			"requests": map[string]interface{}{
+				"cpu":    "100m",
+				"memory": "128Mi",
+			},
+			"limits": map[string]interface{}{
+				"cpu":    "500m",
+				"memory": "256Mi",
+			},
+		},
+		"livenessProbe": map[string]interface{}{
+			"httpGet": map[string]interface{}{
+				"path":   "/plugin-manifest.json",
+				"port":   int64(9001),
+				"scheme": "HTTPS",
+			},
+			"initialDelaySeconds": int64(5),
+			"periodSeconds":       int64(10),
+		},
+		"readinessProbe": map[string]interface{}{
+			"httpGet": map[string]interface{}{
+				"path":   "/plugin-manifest.json",
+				"port":   int64(9001),
+				"scheme": "HTTPS",
+			},
+			"initialDelaySeconds": int64(5),
+			"periodSeconds":       int64(10),
+		},
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) ensureConsolePluginCR(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, pluginName string) error {
+	logger := log.FromContext(ctx)
+
+	consolePlugin := &unstructured.Unstructured{}
+	consolePlugin.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "console.openshift.io",
+		Version: "v1",
+		Kind:    "ConsolePlugin",
+	})
+	consolePlugin.SetName(pluginName)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(consolePlugin), consolePlugin); err == nil {
+		// Already exists, verify spec
+		return r.updateConsolePluginCR(ctx, platform, consolePlugin, pluginName)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// Create new ConsolePlugin CR
+	backendServiceName := architectResourceName(platform, "airgap-architect-backend")
+	consolePlugin.Object["spec"] = map[string]interface{}{
+		"displayName": "Airgap Architect",
+		"backend": map[string]interface{}{
+			"type": "Service",
+			"service": map[string]interface{}{
+				"name":      pluginName,
+				"namespace": architectNamespace,
+				"port":      int64(9001),
+				"basePath":  "/",
+			},
+		},
+		"proxy": []interface{}{
+			map[string]interface{}{
+				"alias":         "backend",
+				"authorization": "None",
+				"endpoint": map[string]interface{}{
+					"type": "Service",
+					"service": map[string]interface{}{
+						"name":      backendServiceName,
+						"namespace": architectNamespace,
+						"port":      int64(4000),
+					},
+				},
+			},
+		},
+	}
+
+	logger.Info("Creating ConsolePlugin CR", "name", pluginName)
+	return r.Create(ctx, consolePlugin)
+}
+
+func (r *DisconnectedPlatformReconciler) updateConsolePluginCR(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, consolePlugin *unstructured.Unstructured, pluginName string) error {
+	logger := log.FromContext(ctx)
+
+	logger.Info("Updating ConsolePlugin CR - fetching service-ca certificate", "pluginName", pluginName)
+
+	// Get the service-ca certificate
+	caCertContent, err := r.getServiceCACert(ctx)
+	if err != nil {
+		logger.Error(err, "failed to get service-ca certificate, plugin may not load properly")
+		caCertContent = "" // Continue without cert - will use insecure connection
+	} else {
+		logger.Info("Successfully retrieved service-ca certificate", "certLength", len(caCertContent))
+	}
+
+	backendServiceName := architectResourceName(platform, "airgap-architect-backend")
+	desiredSpec := map[string]interface{}{
+		"displayName": "Airgap Architect",
+		"backend": map[string]interface{}{
+			"type": "Service",
+			"service": map[string]interface{}{
+				"name":      pluginName,
+				"namespace": architectNamespace,
+				"port":      int64(9001),
+				"basePath":  "/",
+			},
+		},
+		"proxy": []interface{}{
+			map[string]interface{}{
+				"alias":         "backend",
+				"authorization": "None",
+				"endpoint": map[string]interface{}{
+					"type": "Service",
+					"service": map[string]interface{}{
+						"name":      backendServiceName,
+						"namespace": architectNamespace,
+						"port":      int64(4000),
+					},
+				},
+			},
+		},
+	}
+
+	// Add caCertificate if we have one
+	if caCertContent != "" {
+		backendMap := desiredSpec["backend"].(map[string]interface{})
+		serviceMap := backendMap["service"].(map[string]interface{})
+		serviceMap["caCertificate"] = caCertContent
+		logger.Info("Adding CA certificate to ConsolePlugin spec", "certLength", len(caCertContent))
+	}
+
+	currentSpec, _, _ := unstructured.NestedMap(consolePlugin.Object, "spec")
+
+	// Check if caCertificate field changed
+	currentCert, _, _ := unstructured.NestedString(consolePlugin.Object, "spec", "backend", "service", "caCertificate")
+	needsUpdate := currentCert != caCertContent
+
+	if !needsUpdate && fmt.Sprintf("%v", currentSpec) == fmt.Sprintf("%v", desiredSpec) {
+		return nil
+	}
+
+	consolePlugin.Object["spec"] = desiredSpec
+	logger.Info("Updating ConsolePlugin CR", "name", pluginName, "reason", "adding CA certificate")
+	return r.Update(ctx, consolePlugin)
+}
+
+// enableConsolePluginInOperator patches the console operator to enable a plugin
+func (r *DisconnectedPlatformReconciler) enableConsolePluginInOperator(ctx context.Context, pluginName string) error {
+	logger := log.FromContext(ctx)
+
+	console := &unstructured.Unstructured{}
+	console.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.openshift.io",
+		Version: "v1",
+		Kind:    "Console",
+	})
+	console.SetName("cluster")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(console), console); err != nil {
+		return fmt.Errorf("failed to get console operator: %w", err)
+	}
+
+	// Get current plugins list
+	plugins, found, err := unstructured.NestedStringSlice(console.Object, "spec", "plugins")
+	if err != nil {
+		return fmt.Errorf("failed to get plugins list: %w", err)
+	}
+	if !found {
+		plugins = []string{}
+	}
+
+	// Check if plugin is already enabled
+	for _, p := range plugins {
+		if p == pluginName {
+			logger.V(1).Info("Console plugin already enabled", "plugin", pluginName)
+			return nil
+		}
+	}
+
+	// Add plugin to list
+	plugins = append(plugins, pluginName)
+	if err := unstructured.SetNestedStringSlice(console.Object, plugins, "spec", "plugins"); err != nil {
+		return fmt.Errorf("failed to set plugins list: %w", err)
+	}
+
+	logger.Info("Enabling console plugin in operator", "plugin", pluginName)
+	return r.Update(ctx, console)
+}
+
+// getServiceCACert retrieves the service-ca certificate bundle
+func (r *DisconnectedPlatformReconciler) getServiceCACert(ctx context.Context) (string, error) {
+	// The service-ca-operator maintains a signing CA bundle
+	configMap := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "signing-cabundle",
+		Namespace: "openshift-service-ca",
+	}, configMap)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get signing-cabundle ConfigMap: %w", err)
+	}
+
+	caCert, ok := configMap.Data["ca-bundle.crt"]
+	if !ok {
+		return "", fmt.Errorf("ca-bundle.crt not found in ConfigMap")
+	}
+
+	return caCert, nil
+}
+
+func (r *DisconnectedPlatformReconciler) deleteConsolePluginResources(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	pluginName := "airgap-architect-plugin"
+
+	// Delete ConsolePlugin CR
+	consolePlugin := &unstructured.Unstructured{}
+	consolePlugin.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "console.openshift.io",
+		Version: "v1",
+		Kind:    "ConsolePlugin",
+	})
+	consolePlugin.SetName(pluginName)
+	if err := r.Delete(ctx, consolePlugin); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete ConsolePlugin CR")
+	}
+
+	// Delete Service
+	svc := &unstructured.Unstructured{}
+	svc.SetGroupVersionKind(serviceGVK)
+	svc.SetName(pluginName)
+	svc.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete console plugin service")
+	}
+
+	// Delete Deployment
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(deploymentGVK)
+	dep.SetName(pluginName)
+	dep.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, dep); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete console plugin deployment")
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) deleteArchitectFrontendResources(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	frontendName := architectResourceName(platform, "airgap-architect-frontend")
+
+	// Delete Service
+	svc := &unstructured.Unstructured{}
+	svc.SetGroupVersionKind(serviceGVK)
+	svc.SetName(frontendName)
+	svc.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete frontend service")
+	}
+
+	// Delete Deployment
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(deploymentGVK)
+	dep.SetName(frontendName)
+	dep.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, dep); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete frontend deployment")
+	}
+
+	// Delete Route
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(routeGVK)
+	route.SetName("airgap-architect")
+	route.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, route); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete frontend route")
+	}
+
+	return nil
+}
+
 // Shared deployment helpers
 
 type containerBuilder func(name, image string, labels map[string]string) map[string]interface{}
@@ -4801,6 +5302,26 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"name": pullSecretVolumeName,
 			"secret": map[string]interface{}{
 				"secretName": pullSecretName,
+			},
+		})
+	}
+
+	// Add TLS cert volume for backend component
+	if component == "backend" {
+		volumes = append(volumes, map[string]interface{}{
+			"name": "tls-cert",
+			"secret": map[string]interface{}{
+				"secretName": name + "-cert",
+			},
+		})
+	}
+
+	// Add serving cert volume for console plugin component
+	if component == "console-plugin" {
+		volumes = append(volumes, map[string]interface{}{
+			"name": "serving-cert",
+			"secret": map[string]interface{}{
+				"secretName": "airgap-architect-plugin-cert",
 			},
 		})
 	}
@@ -4900,7 +5421,7 @@ func deploymentsEqual(existing, desired map[string]interface{}) (bool, string) {
 
 		// Compare critical fields: image, env, volumeMounts
 		if existingContainer["image"] != desiredContainer["image"] {
-			return false, "image differs"
+			return false, fmt.Sprintf("image differs: existing=%s desired=%s", existingContainer["image"], desiredContainer["image"])
 		}
 
 		// Compare env vars
@@ -6143,10 +6664,8 @@ func (r *DisconnectedPlatformReconciler) bootstrapQuayAPIToken(ctx context.Conte
 	return "unused", nil
 }
 
-// execInQuayPod executes a Python script in the Quay pod
+// execInQuayPod executes a Python script in the Quay pod using proper client-go implementation
 func (r *DisconnectedPlatformReconciler) execInQuayPod(ctx context.Context, namespace, pythonScript string) (string, error) {
-	// TODO: Implement proper Kubernetes exec using client-go
-	// For now, using kubectl as placeholder
 	logger := log.FromContext(ctx)
 
 	// Find Quay pod
@@ -6159,41 +6678,82 @@ func (r *DisconnectedPlatformReconciler) execInQuayPod(ctx context.Context, name
 		return "", fmt.Errorf("no Quay pods found")
 	}
 
-	podName := podList.Items[0].Name
-	logger.Info("Executing Python script in Quay pod", "pod", podName)
+	pod := &podList.Items[0]
+	podName := pod.Name
 
-	// Create temp file with script
-	tmpFile := "/tmp/quay-bootstrap-" + time.Now().Format("20060102150405") + ".py"
-	if err := os.WriteFile(tmpFile, []byte(pythonScript), 0644); err != nil {
-		return "", fmt.Errorf("failed to write temp script: %w", err)
+	// Find a ready container
+	containerName := ""
+	for _, container := range pod.Spec.Containers {
+		containerName = container.Name
+		break
 	}
-	defer os.Remove(tmpFile)
+	if containerName == "" {
+		return "", fmt.Errorf("no containers found in pod %s", podName)
+	}
 
-	// Copy script to pod
-	cpCmd := exec.Command("kubectl", "cp", tmpFile, namespace+"/"+podName+":/tmp/bootstrap.py")
-	if err := cpCmd.Run(); err != nil {
+	logger.Info("Executing Python script in Quay pod", "pod", podName, "container", containerName)
+
+	// Step 1: Copy script to pod using tar/exec (similar to kubectl cp)
+	// We'll write the script directly via stdin with a command
+	writeScriptCommand := []string{"sh", "-c", "cat > /tmp/bootstrap.py"}
+	if err := r.execCommandInPod(ctx, namespace, podName, containerName, writeScriptCommand, strings.NewReader(pythonScript), io.Discard, io.Discard); err != nil {
 		return "", fmt.Errorf("failed to copy script to pod: %w", err)
 	}
 
-	// Execute script (get only stdout, ignore stderr warnings)
-	execCmd := exec.Command("kubectl", "exec", "-n", namespace, podName, "--", "python", "/tmp/bootstrap.py")
-	output, err := execCmd.Output()
-	if err != nil {
-		// Get stderr for error message
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("failed to execute script: %w (stderr: %s)", err, string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("failed to execute script: %w", err)
+	// Step 2: Execute the Python script
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	execCommand := []string{"python", "/tmp/bootstrap.py"}
+	if err := r.execCommandInPod(ctx, namespace, podName, containerName, execCommand, nil, stdout, stderr); err != nil {
+		return "", fmt.Errorf("failed to execute script: %w (stderr: %s)", err, stderr.String())
 	}
 
 	// Extract the last line which should be the token (previous lines are stderr messages)
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 	if len(lines) == 0 {
 		return "", fmt.Errorf("script returned no output")
 	}
 	token := strings.TrimSpace(lines[len(lines)-1])
 
 	return token, nil
+}
+
+// execCommandInPod executes a command in a pod using the Kubernetes exec API
+func (r *DisconnectedPlatformReconciler) execCommandInPod(ctx context.Context, namespace, podName, containerName string, command []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if r.ClientSet == nil || r.RESTConfig == nil {
+		return fmt.Errorf("ClientSet or RESTConfig not initialized")
+	}
+
+	req := r.ClientSet.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   command,
+			Stdin:     stdin != nil,
+			Stdout:    stdout != nil,
+			Stderr:    stderr != nil,
+			TTY:       false,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(r.RESTConfig, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+		Tty:    false,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to execute command: %w", err)
+	}
+
+	return nil
 }
 
 // ensureQuayOrganizationViaAPI creates organization using REST API

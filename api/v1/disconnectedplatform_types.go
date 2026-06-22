@@ -186,10 +186,16 @@ type AirgapArchitectConfig struct {
 	Enabled           bool                         `json:"enabled"`
 	FrontendImage     string                       `json:"frontendImage,omitempty"`
 	BackendImage      string                       `json:"backendImage,omitempty"`
+	ConsolePlugin     *ConsolePluginConfig         `json:"consolePlugin,omitempty"`
 	Replicas          int32                        `json:"replicas,omitempty"`
 	Route             *RouteConfig                 `json:"route,omitempty"`
 	PullSecret        *corev1.LocalObjectReference `json:"pullSecret,omitempty"`
 	GitHubTokenSecret *corev1.LocalObjectReference `json:"githubTokenSecret,omitempty"`
+}
+
+type ConsolePluginConfig struct {
+	Enabled bool   `json:"enabled"`
+	Image   string `json:"image,omitempty"`
 }
 
 type GitOpsConfig struct {

@@ -93,6 +93,15 @@ spec:
                 properties:
                   backendImage:
                     type: string
+                  consolePlugin:
+                    properties:
+                      enabled:
+                        type: boolean
+                      image:
+                        type: string
+                    required:
+                    - enabled
+                    type: object
                   enabled:
                     type: boolean
                   frontendImage:

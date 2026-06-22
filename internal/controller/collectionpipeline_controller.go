@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
@@ -1773,25 +1775,165 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 	return tpaHostname, keycloakHost, tpaNamespace
 }
 
-// generateIntermediateImageSetConfig creates an ImageSetConfiguration that pulls from the intermediate registry
-func (r *CollectionPipelineReconciler) generateIntermediateImageSetConfig(pipeline *mirrorv1.CollectionPipeline, intermediateRegistry string) string {
-	// Parse the original config to understand what was mirrored
-	// For now, we'll create a simple config that mirrors everything from the intermediate registry
-	// This is a simplified version - in production you'd want to parse the original config
-	// and rewrite all image references to point to the intermediate registry
+// ImageSetConfiguration represents the oc-mirror v2 configuration structure
+type ImageSetConfiguration struct {
+	Kind       string                      `json:"kind" yaml:"kind"`
+	APIVersion string                      `json:"apiVersion" yaml:"apiVersion"`
+	Mirror     ImageSetConfigurationMirror `json:"mirror" yaml:"mirror"`
+}
 
-	return `kind: ImageSetConfiguration
-apiVersion: mirror.openshift.io/v2alpha1
-mirror:
-  additionalImages:
-    - name: ` + intermediateRegistry + `/*
-`
-	// TODO: Properly parse original ImageSetConfiguration and rewrite registry references
-	// This requires more sophisticated logic to handle:
-	// - platform.release paths
-	// - operator catalog references
-	// - additionalImages
-	// - helm charts
+type ImageSetConfigurationMirror struct {
+	Platform         *PlatformConfig  `json:"platform,omitempty" yaml:"platform,omitempty"`
+	Operators        []OperatorConfig `json:"operators,omitempty" yaml:"operators,omitempty"`
+	AdditionalImages []ImageConfig    `json:"additionalImages,omitempty" yaml:"additionalImages,omitempty"`
+	Helm             *HelmConfig      `json:"helm,omitempty" yaml:"helm,omitempty"`
+}
+
+type PlatformConfig struct {
+	Channels      []ChannelConfig `json:"channels,omitempty" yaml:"channels,omitempty"`
+	Graph         bool            `json:"graph,omitempty" yaml:"graph,omitempty"`
+	Architectures []string        `json:"architectures,omitempty" yaml:"architectures,omitempty"`
+}
+
+type ChannelConfig struct {
+	Name       string `json:"name" yaml:"name"`
+	MinVersion string `json:"minVersion,omitempty" yaml:"minVersion,omitempty"`
+	MaxVersion string `json:"maxVersion,omitempty" yaml:"maxVersion,omitempty"`
+	Full       bool   `json:"full,omitempty" yaml:"full,omitempty"`
+}
+
+type OperatorConfig struct {
+	Catalog  string          `json:"catalog" yaml:"catalog"`
+	Packages []PackageConfig `json:"packages,omitempty" yaml:"packages,omitempty"`
+}
+
+type PackageConfig struct {
+	Name     string          `json:"name" yaml:"name"`
+	Channels []ChannelConfig `json:"channels,omitempty" yaml:"channels,omitempty"`
+}
+
+type ImageConfig struct {
+	Name string `json:"name" yaml:"name"`
+}
+
+type HelmConfig struct {
+	Repositories []HelmRepoConfig  `json:"repositories,omitempty" yaml:"repositories,omitempty"`
+	Charts       []HelmChartConfig `json:"charts,omitempty" yaml:"charts,omitempty"`
+}
+
+type HelmRepoConfig struct {
+	Name string `json:"name" yaml:"name"`
+	URL  string `json:"url" yaml:"url"`
+}
+
+type HelmChartConfig struct {
+	Name       string `json:"name" yaml:"name"`
+	Repository string `json:"repository" yaml:"repository"`
+	Version    string `json:"version,omitempty" yaml:"version,omitempty"`
+}
+
+// generateIntermediateImageSetConfig creates an ImageSetConfiguration that pulls from the intermediate registry
+// It parses the original ImageSetConfiguration and rewrites all image/catalog references to point to the intermediate registry
+func (r *CollectionPipelineReconciler) generateIntermediateImageSetConfig(pipeline *mirrorv1.CollectionPipeline, intermediateRegistry string) (string, error) {
+	// Parse original ImageSetConfiguration
+	var originalConfig ImageSetConfiguration
+	if err := yaml.Unmarshal([]byte(pipeline.Spec.ImageSetConfig), &originalConfig); err != nil {
+		return "", fmt.Errorf("failed to parse ImageSetConfiguration: %w", err)
+	}
+
+	// Create new config that will pull from intermediate registry
+	intermediateConfig := ImageSetConfiguration{
+		Kind:       originalConfig.Kind,
+		APIVersion: originalConfig.APIVersion,
+		Mirror:     ImageSetConfigurationMirror{},
+	}
+
+	// Rewrite platform references
+	if originalConfig.Mirror.Platform != nil {
+		// Platform releases are mirrored to intermediate with standard paths
+		// Keep platform config as-is since oc-mirror handles release paths automatically
+		intermediateConfig.Mirror.Platform = originalConfig.Mirror.Platform
+	}
+
+	// Rewrite operator catalog references
+	if len(originalConfig.Mirror.Operators) > 0 {
+		intermediateConfig.Mirror.Operators = make([]OperatorConfig, 0, len(originalConfig.Mirror.Operators))
+		for _, op := range originalConfig.Mirror.Operators {
+			// Rewrite catalog reference to point to intermediate registry
+			// Original: registry.redhat.io/redhat/redhat-operator-index:v4.18
+			// Intermediate: quay.apps.example.com/mirror/redhat-operator-index:v4.18
+			intermediateCatalog := rewriteImageReference(op.Catalog, intermediateRegistry)
+
+			intermediateConfig.Mirror.Operators = append(intermediateConfig.Mirror.Operators, OperatorConfig{
+				Catalog:  intermediateCatalog,
+				Packages: op.Packages, // Package selection stays the same
+			})
+		}
+	}
+
+	// Rewrite additional images
+	if len(originalConfig.Mirror.AdditionalImages) > 0 {
+		intermediateConfig.Mirror.AdditionalImages = make([]ImageConfig, 0, len(originalConfig.Mirror.AdditionalImages))
+		for _, img := range originalConfig.Mirror.AdditionalImages {
+			// Rewrite image reference to point to intermediate registry
+			intermediateImage := rewriteImageReference(img.Name, intermediateRegistry)
+			intermediateConfig.Mirror.AdditionalImages = append(intermediateConfig.Mirror.AdditionalImages, ImageConfig{
+				Name: intermediateImage,
+			})
+		}
+	}
+
+	// Helm charts - these are typically stored as OCI artifacts in the intermediate registry
+	if originalConfig.Mirror.Helm != nil {
+		// Note: Helm chart mirroring to intermediate registry may require
+		// converting HTTP(S) repositories to OCI references
+		// For now, preserve original helm config as oc-mirror handles this
+		intermediateConfig.Mirror.Helm = originalConfig.Mirror.Helm
+	}
+
+	// Marshal back to YAML
+	configBytes, err := yaml.Marshal(&intermediateConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal intermediate config: %w", err)
+	}
+
+	return string(configBytes), nil
+}
+
+// rewriteImageReference rewrites an image reference to point to the intermediate registry
+// Examples:
+//
+//	registry.redhat.io/redhat/ubi9:latest -> quay.apps.example.com/mirror/ubi9:latest
+//	quay.io/openshift/origin-cli:v4.18 -> quay.apps.example.com/mirror/origin-cli:v4.18
+//	registry.redhat.io/redhat/redhat-operator-index:v4.18 -> quay.apps.example.com/mirror/redhat-operator-index:v4.18
+func rewriteImageReference(originalRef, intermediateRegistry string) string {
+	// Remove any docker:// prefix if present
+	ref := strings.TrimPrefix(originalRef, "docker://")
+
+	// Split into registry/repository and tag/digest
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) < 2 {
+		// No registry specified (e.g., "nginx:latest") - add intermediate registry
+		return intermediateRegistry + "/" + ref
+	}
+
+	// Extract repository path (everything after first /)
+	repositoryPath := parts[1]
+
+	// Extract just the image name (last component of path) and tag/digest
+	pathComponents := strings.Split(repositoryPath, "/")
+	imageName := pathComponents[len(pathComponents)-1]
+
+	// Handle wildcards (e.g., quay.io/my-org/*)
+	if strings.HasSuffix(originalRef, "/*") {
+		// For wildcards, preserve the organization/namespace structure
+		// quay.io/my-org/* -> intermediate/my-org/*
+		return intermediateRegistry + "/" + repositoryPath
+	}
+
+	// For specific images, use flat structure in intermediate registry
+	// This matches oc-mirror's default behavior of flattening paths
+	return intermediateRegistry + "/" + imageName
 }
 
 // getParentDisconnectedPlatform finds the DisconnectedPlatform that owns this CollectionPipeline

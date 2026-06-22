@@ -1,0 +1,80 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  name: disconnectedplatform-hybrid
+  namespace: mirror-operator-system
+spec:
+  mode: connected
+  connected:
+    collectionSchedule: "0 2 * * 0"  # Weekly at 2 AM on Sunday
+    artifactStorage:
+      size: "500Gi"
+      storageClass: "gp3-csi"
+    triggerTypes:
+      - scheduled
+      - manual
+    operators:
+      openshiftPipelines:
+        disabled: false
+        channel: "latest"
+      keycloak: {}
+      rhtas: {}
+      rhtpa: {}
+    rhtas:
+      oidc:
+        managed:
+          enabled: true
+          realm: "trusted-artifact-signer"
+          # Use existing ClusterIssuer (e.g., Let's Encrypt)
+          certIssuer:
+            name: letsencrypt-prod
+            kind: ClusterIssuer
+        type: "email"
+      database:
+        host: "postgres.example.com"
+        name: "rhtas"
+        port: 5432
+    rhtpa:
+      storage:
+        type: local
+        size: 20Gi
+      database:
+        host: postgres.example.com
+        name: rhtpa
+        username: rhtpa
+        password: change-me
+  # Airgap Architect in HYBRID mode - both standalone and console plugin enabled
+  architect:
+    enabled: true
+    # Standalone frontend (accessible via Route)
+    frontendImage: "quay.io/mirror-operator/openshift-airgap-architect-frontend:latest"
+    # Backend API (shared by both UIs)
+    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    # Console plugin (embedded in OpenShift Console)
+    consolePlugin:
+      enabled: true
+      image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
+    # Optional: custom route configuration
+    # route:
+    #   host: "airgap-architect.apps.example.com"
+    #   tls:
+    #     termination: edge
+---
+# This hybrid configuration provides TWO ways to access the UI:
+#
+# 1. Standalone Frontend:
+#    - Access via Route: https://airgap-architect.apps.<cluster-domain>
+#    - Full-featured Vite/React app running on port 5173
+#    - Useful for: bookmarking, sharing direct links, external access
+#
+# 2. Console Plugin:
+#    - Access via OpenShift Console: Administrator → Airgap Architect
+#    - Integrated seamlessly into the OpenShift web console
+#    - Useful for: unified cluster management experience
+#
+# Both UIs connect to the same backend API and share the same data.
+#
+# To enable the console plugin, run:
+# oc patch console.operator.openshift.io cluster \
+#   --type='json' \
+#   -p='[{"op": "add", "path": "/spec/plugins/-", "value": "airgap-architect-plugin"}]'

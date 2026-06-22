@@ -1,0 +1,37 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  name: disconnectedplatform-console-plugin
+  namespace: mirror-operator-system
+spec:
+  mode: connected
+  connected:
+    collectionSchedule: "0 2 * * 0"  # Weekly at 2 AM on Sunday
+    artifactStorage:
+      size: "500Gi"
+      storageClass: "gp3-csi"
+    operators:
+      openshiftPipelines:
+        disabled: false
+        channel: "latest"
+  # Airgap Architect with OpenShift Console Plugin enabled
+  architect:
+    enabled: true
+    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    # Enable console plugin mode (replaces standalone frontend)
+    consolePlugin:
+      enabled: true
+      image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
+    # Optional: custom route configuration for backend API
+    # route:
+    #   host: "airgap-architect-api.apps.example.com"
+    #   tls:
+    #     termination: edge
+---
+# After deploying, enable the plugin in OpenShift Console:
+# oc patch console.operator.openshift.io cluster \
+#   --type='json' \
+#   -p='[{"op": "add", "path": "/spec/plugins/-", "value": "airgap-architect-plugin"}]'
+#
+# Then refresh the OpenShift Console and navigate to:
+# Administrator → Airgap Architect

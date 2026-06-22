@@ -64,6 +64,7 @@ func main() {
 	var mirrorImage string
 	var architectFrontendImage string
 	var architectBackendImage string
+	var architectConsolePluginImage string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -81,6 +82,8 @@ func main() {
 		"airgap-architect frontend UI container image")
 	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mirror-operator/airgap-architect-backend:latest",
 		"airgap-architect backend API container image")
+	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image", "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest",
+		"airgap-architect OpenShift console plugin container image")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -156,18 +159,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.DisconnectedPlatformReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		ArchitectFrontendImage: architectFrontendImage,
-		ArchitectBackendImage:  architectBackendImage,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DisconnectedPlatform")
-		os.Exit(1)
-	}
+	// Create clientset for both controllers
 	clientSet, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		setupLog.Error(err, "unable to create clientset")
+		os.Exit(1)
+	}
+
+	if err = (&controller.DisconnectedPlatformReconciler{
+		Client:                      mgr.GetClient(),
+		Scheme:                      mgr.GetScheme(),
+		ArchitectFrontendImage:      architectFrontendImage,
+		ArchitectBackendImage:       architectBackendImage,
+		ArchitectConsolePluginImage: architectConsolePluginImage,
+		ClientSet:                   clientSet,
+		RESTConfig:                  mgr.GetConfig(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DisconnectedPlatform")
 		os.Exit(1)
 	}
 	if err = (&controller.CollectionPipelineReconciler{
