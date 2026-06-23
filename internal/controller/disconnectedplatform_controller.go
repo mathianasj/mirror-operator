@@ -247,6 +247,14 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
+		// Reconcile artifact file server for downloading collection bundles
+		if err := r.reconcileArtifactFileServer(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile artifact file server")
+		}
+		// Reconcile collection pipeline template
+		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile collection pipeline template")
+		}
 	}
 
 	// Aggregate collection history from CollectionPipeline resources.
@@ -5595,6 +5603,56 @@ func (h *secretEventHandler) handleSecret(ctx context.Context, obj client.Object
 	}
 }
 
+// collectionPipelineEventHandler triggers DisconnectedPlatform reconciliation when CollectionPipelines complete
+type collectionPipelineEventHandler struct {
+	client client.Client
+}
+
+func (h *collectionPipelineEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// Trigger on create to set up initial file server
+	h.triggerPlatformReconcile(ctx, q)
+}
+
+func (h *collectionPipelineEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	oldPipeline, oldOk := e.ObjectOld.(*mirrorv1.CollectionPipeline)
+	newPipeline, newOk := e.ObjectNew.(*mirrorv1.CollectionPipeline)
+
+	if !oldOk || !newOk {
+		return
+	}
+
+	// Only trigger if phase changed to Complete or Succeeded
+	if (newPipeline.Status.Phase == "Complete" || newPipeline.Status.Phase == "Succeeded") &&
+		oldPipeline.Status.Phase != newPipeline.Status.Phase {
+		h.triggerPlatformReconcile(ctx, q)
+	}
+}
+
+func (h *collectionPipelineEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// Trigger on delete to remove from file server
+	h.triggerPlatformReconcile(ctx, q)
+}
+
+func (h *collectionPipelineEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// Not needed
+}
+
+func (h *collectionPipelineEventHandler) triggerPlatformReconcile(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	platformList := &mirrorv1.DisconnectedPlatformList{}
+	if err := h.client.List(ctx, platformList); err != nil {
+		return
+	}
+
+	for _, platform := range platformList.Items {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      platform.Name,
+				Namespace: platform.Namespace,
+			},
+		})
+	}
+}
+
 // RHTAS Health Check and Self-Healing Functions
 
 func (r *DisconnectedPlatformReconciler) updateStatusFromSecuresignHealth(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
@@ -6939,32 +6997,70 @@ robot_short_name = "` + robotShortName + `"
 robot_full_name = org_name + "+" + robot_short_name
 
 try:
-    # Get organization
-    org = model.organization.get_organization(org_name)
-    if not org:
+    # Ensure initialization user exists
+    init_username = "mirroroperator-init"
+    init_email = "mirroroperator@example.com"
+    try:
+        init_user = model.user.get_user(init_username)
+        print(f"Init user {init_username} already exists", file=sys.stderr)
+    except:
+        print(f"Creating init user {init_username}", file=sys.stderr)
+        # Create initialization user (will be the org owner)
+        init_user = model.user.create_user(init_username, init_email, "", auto_verify=True)
+        init_user.verified = True
+        init_user.save()
+        print(f"Init user {init_username} created and verified", file=sys.stderr)
+
+    # Get or create organization
+    try:
+        org = model.organization.get_organization(org_name)
+        print(f"Organization {org_name} already exists", file=sys.stderr)
+    except:
         print(f"Organization {org_name} not found, creating it", file=sys.stderr)
-        # Create organization if it doesn't exist
-        admin = model.user.get_user("admin")
-        org = model.organization.create_organization(org_name, "admin@example.com", admin)
+        # Create organization directly in database to avoid team member constraint issues
+        from data.database import User
+        org = User.create(username=org_name, email=init_email, verified=True, organization=True)
+        print(f"Organization {org_name} created", file=sys.stderr)
+
+        # Create owners team for the organization
+        try:
+            owners_team = model.team.create_team("owners", org, "admin", "Owners of the organization")
+            print(f"Created owners team for organization", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not create owners team: {e}", file=sys.stderr)
 
     # Check if robot already exists
-    existing_robot = model.user.lookup_robot(robot_full_name)
-    if existing_robot:
+    try:
+        existing_robot = model.user.lookup_robot(robot_full_name)
         print(f"Robot {robot_full_name} already exists", file=sys.stderr)
         # Get the robot's token
         robot_token = model.user.retrieve_robot_token(existing_robot)
         print(robot_token)
-    else:
+    except:
         print(f"Creating robot {robot_full_name}", file=sys.stderr)
-        # Create robot account
-        robot = model.user.create_robot(robot_short_name, org, "Mirror operator robot account")
-        robot_token = model.user.retrieve_robot_token(robot)
+        # Create robot account - returns (robot, token) tuple
+        robot_result = model.user.create_robot(robot_short_name, org, "Mirror operator robot account")
+        # Extract robot and token from tuple
+        if isinstance(robot_result, tuple):
+            robot, robot_token = robot_result
+        else:
+            robot = robot_result
+            robot_token = model.user.retrieve_robot_token(robot)
 
-        # Add robot to owners team for admin permissions
+        # Grant robot admin access to organization - two step process
         try:
             owners_team = model.team.get_organization_team(org_name, "owners")
-            model.team.add_user_to_team(robot, owners_team)
-            print(f"Added robot to owners team", file=sys.stderr)
+
+            # Step 1: Create team member entry
+            from data.database import TeamMember
+            team_member = TeamMember.create(user=robot, team=owners_team)
+            print(f"Created team member entry for robot", file=sys.stderr)
+
+            # Step 2: Set role to admin
+            from data.database import TeamRole
+            team_member.role = TeamRole.admin
+            team_member.save()
+            print(f"Set robot role to admin in owners team", file=sys.stderr)
         except Exception as e:
             print(f"Warning: Could not add robot to owners team: {e}", file=sys.stderr)
 
@@ -6992,6 +7088,771 @@ except Exception as e:
 	return token, nil
 }
 
+// reconcileArtifactFileServer creates a file server deployment/service/route to serve collection bundles
+// reconcileCollectionPipelineTemplate creates a reusable Pipeline template for collection workflows
+func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	// Only reconcile in connected mode
+	if platform.Spec.Mode != mirrorv1.PlatformModeConnected {
+		return nil
+	}
+
+	namespace := architectNamespace
+	pipelineName := "collection-pipeline-template"
+
+	// Import pipelinev1 types
+	pipeline := &unstructured.Unstructured{}
+	pipeline.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "tekton.dev",
+		Version: "v1",
+		Kind:    "Pipeline",
+	})
+	pipeline.SetName(pipelineName)
+	pipeline.SetNamespace(namespace)
+
+	// Define pipeline parameters
+	params := []map[string]interface{}{
+		{"name": "config-map-name", "type": "string", "description": "ConfigMap containing ImageSetConfiguration"},
+		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2"},
+		{"name": "working-pvc-name", "type": "string", "description": "PVC for working directory/cache"},
+		{"name": "artifacts-pvc-name", "type": "string", "description": "PVC for final artifacts"},
+		{"name": "intermediate-registry", "type": "string", "default": "", "description": "Intermediate registry for m2m workflow (empty = local cache)"},
+		{"name": "has-keyless-signing", "type": "string", "default": "false", "description": "Enable keyless signing"},
+		{"name": "fulcio-url", "type": "string", "default": ""},
+		{"name": "rekor-url", "type": "string", "default": ""},
+		{"name": "tuf-url", "type": "string", "default": ""},
+		{"name": "oidc-issuer", "type": "string", "default": ""},
+		{"name": "oidc-client-id", "type": "string", "default": ""},
+		{"name": "has-tpa", "type": "string", "default": "false"},
+		{"name": "tpa-host", "type": "string", "default": ""},
+		{"name": "tpa-oidc-issuer", "type": "string", "default": ""},
+		{"name": "tpa-oidc-client-id", "type": "string", "default": ""},
+	}
+
+	// Define workspaces
+	workspaces := []map[string]interface{}{
+		{"name": "config", "description": "ImageSetConfiguration ConfigMap"},
+		{"name": "pull-secret", "description": "Registry pull secret"},
+		{"name": "output", "description": "Working PVC for cache and temp files"},
+		{"name": "artifacts", "description": "Artifacts PVC for final .tar files"},
+		{"name": "oidc-secret", "description": "OIDC client secret for keyless signing", "optional": true},
+		{"name": "tpa-oidc-secret", "description": "TPA OIDC secret for SBOM upload", "optional": true},
+		{"name": "cosign-key", "description": "Cosign private key", "optional": true},
+	}
+
+	// Define tasks - I'll create a simplified version first, then we can expand
+	tasks := r.buildPipelineTasks()
+
+	pipelineSpec := map[string]interface{}{
+		"params":     params,
+		"workspaces": workspaces,
+		"tasks":      tasks,
+	}
+
+	// Marshal to JSON and back to convert []map[string]interface{} into a format unstructured can handle
+	specJSON, err := json.Marshal(pipelineSpec)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pipeline spec: %w", err)
+	}
+
+	var specMap map[string]interface{}
+	if err := json.Unmarshal(specJSON, &specMap); err != nil {
+		return fmt.Errorf("failed to unmarshal pipeline spec: %w", err)
+	}
+
+	pipeline.Object["spec"] = specMap
+
+	if err := ctrl.SetControllerReference(platform, pipeline, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on pipeline: %w", err)
+	}
+
+	// Create or update Pipeline
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(pipeline.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pipeline), existing); err == nil {
+		pipeline.SetResourceVersion(existing.GetResourceVersion())
+		if err := r.Update(ctx, pipeline); err != nil {
+			return fmt.Errorf("failed to update collection pipeline template: %w", err)
+		}
+		logger.Info("Updated collection pipeline template")
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, pipeline); err != nil {
+			return fmt.Errorf("failed to create collection pipeline template: %w", err)
+		}
+		logger.Info("Created collection pipeline template")
+	} else {
+		return err
+	}
+
+	return nil
+}
+
+// buildPipelineTasks constructs the task definitions for the collection pipeline
+// All tasks are defined with 'when' expressions - Tekton will skip tasks based on params
+func (r *DisconnectedPlatformReconciler) buildPipelineTasks() []map[string]interface{} {
+	return []map[string]interface{}{
+		// Task 1: dry-run (only for m2m workflow)
+		{
+			"name": "dry-run",
+			"when": []map[string]interface{}{
+				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "dry-run",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+oc-mirror \
+  --v2 \
+  --config=/workspace/config/imageset-config.yaml \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  --dry-run \
+  --workspace=file:///workspace/output \
+  docker://$(params.intermediate-registry)
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "config"},
+				{"name": "pull-secret"},
+				{"name": "output"},
+			},
+		},
+
+		// Task 2: mirror-to-intermediate (only for m2m workflow)
+		{
+			"name":     "mirror-to-intermediate",
+			"runAfter": []string{"dry-run"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "mirror-to-intermediate",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+
+MAX_RETRIES=3
+RETRY_COUNT=0
+SUCCESS=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $SUCCESS -eq 0 ]; do
+  if [ $RETRY_COUNT -gt 0 ]; then
+    echo "=== Retry attempt $RETRY_COUNT of $((MAX_RETRIES - 1)) ==="
+    sleep 10
+  fi
+
+  OUTPUT_FILE="/tmp/oc-mirror-output-$$.log"
+  oc-mirror \
+    --v2 \
+    --config=/workspace/config/imageset-config.yaml \
+    --authfile=/workspace/pull-secret/.dockerconfigjson \
+    --cache-dir=/workspace/output/.cache \
+    --workspace=file:///workspace/output \
+    docker://$(params.intermediate-registry) 2>&1 | tee "$OUTPUT_FILE" || true
+
+  if grep -q "✓.*release images mirrored successfully" "$OUTPUT_FILE" || \
+     grep -q "✓.*operator images mirrored successfully" "$OUTPUT_FILE" || \
+     grep -q "✓.*additional images mirrored successfully" "$OUTPUT_FILE"; then
+    echo "=== Mirror completed successfully (detected success message) ==="
+    SUCCESS=1
+    break
+  else
+    echo "=== Mirror may have failed, no success indicator found ==="
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+  fi
+
+  rm -f "$OUTPUT_FILE"
+done
+
+if [ $SUCCESS -eq 0 ]; then
+  echo "=== Mirror failed after $MAX_RETRIES attempts ==="
+  exit 1
+fi
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "config"},
+				{"name": "pull-secret"},
+				{"name": "output"},
+			},
+		},
+
+		// Task 3: syft-sbom (runs after mirror-to-intermediate for m2m, or oc-mirror for local)
+		{
+			"name":     "syft-sbom",
+			"runAfter": []string{"mirror-to-intermediate", "oc-mirror"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "generate-sbom",
+						"image":   "quay.io/mathianasj/syft:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Generating SBOM with Syft ==="
+
+MAPPING_FILE="/workspace/output/working-dir/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
+  echo "ERROR: mapping.txt not found"
+  exit 1
+fi
+
+mkdir -p /workspace/output/sboms
+
+# Determine registry source
+if [ -n "$(params.intermediate-registry)" ]; then
+  REGISTRY_SOURCE="$(params.intermediate-registry)"
+else
+  REGISTRY_SOURCE="oci-archive"
+fi
+
+# Generate SBOM for each image
+while IFS= read -r line; do
+  if echo "$line" | grep -q "^#"; then
+    continue
+  fi
+
+  SRC=$(echo "$line" | awk '{print $1}')
+  DST=$(echo "$line" | awk '{print $3}')
+
+  if [ -n "$REGISTRY_SOURCE" ] && [ "$REGISTRY_SOURCE" != "oci-archive" ]; then
+    IMAGE="${REGISTRY_SOURCE}/${DST#*/}"
+  else
+    DIGEST=$(echo "$SRC" | grep -oE 'sha256:[a-f0-9]{64}')
+    IMAGE="/workspace/output/.cache/blobs/sha256/${DIGEST#sha256:}"
+  fi
+
+  SAFE_NAME=$(echo "$DST" | tr '/:@' '_')
+  syft "$IMAGE" -o spdx-json=/workspace/output/sboms/${SAFE_NAME}.spdx.json || echo "Failed to scan $IMAGE"
+done < "$MAPPING_FILE"
+
+echo "=== SBOM generation complete ==="
+ls -lh /workspace/output/sboms/
+`},
+						"env": []map[string]interface{}{
+							{"name": "INTERMEDIATE_REGISTRY", "value": "$(params.intermediate-registry)"},
+						},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+
+		// Task 4: sign-images (only for keyless signing in m2m workflow)
+		{
+			"name":     "sign-images",
+			"runAfter": []string{"syft-sbom"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.has-keyless-signing)", "operator": "in", "values": []string{"true"}},
+				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "sign-images",
+						"image":   "quay.io/mathianasj/cosign:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Signing images with cosign keyless ==="
+
+MAPPING_FILE="/workspace/output/working-dir/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
+  echo "ERROR: mapping.txt not found"
+  exit 1
+fi
+
+# Get OIDC token
+OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
+  -d "client_id=$(params.oidc-client-id)" \
+  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
+  -d "grant_type=client_credentials" | jq -r '.access_token')
+
+export COSIGN_EXPERIMENTAL=1
+
+# Sign each image
+while IFS= read -r line; do
+  if echo "$line" | grep -q "^#"; then
+    continue
+  fi
+
+  DST=$(echo "$line" | awk '{print $3}')
+  IMAGE="$(params.intermediate-registry)/${DST#*/}"
+
+  echo "Signing $IMAGE"
+  cosign sign \
+    --fulcio-url=$(params.fulcio-url) \
+    --rekor-url=$(params.rekor-url) \
+    --oidc-issuer=$(params.oidc-issuer) \
+    --identity-token="$OIDC_TOKEN" \
+    --yes \
+    "$IMAGE" || echo "Failed to sign $IMAGE"
+done < "$MAPPING_FILE"
+
+echo "=== Image signing complete ==="
+`},
+						"env": []map[string]interface{}{
+							{"name": "COSIGN_EXPERIMENTAL", "value": "1"},
+						},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "oidc-secret"},
+			},
+		},
+
+		// Task 5: oc-mirror (local cache workflow - no intermediate registry)
+		{
+			"name": "oc-mirror",
+			"when": []map[string]interface{}{
+				{"input": "$(params.intermediate-registry)", "operator": "in", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "oc-mirror",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+oc-mirror \
+  --v2 \
+  --config=/workspace/config/imageset-config.yaml \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  --workspace=file:///workspace/output
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "config"},
+				{"name": "pull-secret"},
+				{"name": "output"},
+			},
+		},
+
+		// Task 6: mirror-from-intermediate (pull from intermediate to disk with signatures)
+		{
+			"name":     "mirror-from-intermediate",
+			"runAfter": []string{"sign-images"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "mirror-from-intermediate",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Creating ImageSetConfiguration to mirror FROM intermediate registry ==="
+
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
+if [ ! -f "$MAPPING_FILE" ]; then
+  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
+fi
+
+if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
+  echo "ERROR: mapping.txt not found from dry-run"
+  exit 1
+fi
+
+cat > /tmp/imageset-from-intermediate.yaml <<EOF
+apiVersion: mirror.openshift.io/v1alpha2
+kind: ImageSetConfiguration
+mirror:
+  platform:
+    graph: false
+    architectures:
+      - amd64
+  additionalImages:
+EOF
+
+while IFS= read -r line; do
+  if echo "$line" | grep -q "^#"; then
+    continue
+  fi
+  DST=$(echo "$line" | awk '{print $3}')
+  echo "    - name: $(params.intermediate-registry)/${DST#*/}" >> /tmp/imageset-from-intermediate.yaml
+done < "$MAPPING_FILE"
+
+echo "=== Generated ImageSetConfiguration ==="
+cat /tmp/imageset-from-intermediate.yaml
+
+echo "=== Mirroring FROM intermediate registry TO disk ==="
+oc-mirror \
+  --v2 \
+  --config=/tmp/imageset-from-intermediate.yaml \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  --workspace=file:///workspace/output
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "pull-secret"},
+			},
+		},
+
+		// Task 7: sign-bundles (sign the tar file)
+		{
+			"name":     "sign-bundles",
+			"runAfter": []string{"mirror-from-intermediate", "oc-mirror"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.has-keyless-signing)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "sign-bundles",
+						"image":   "quay.io/mathianasj/cosign:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Signing tar bundles with cosign ==="
+
+# Get OIDC token
+OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
+  -d "client_id=$(params.oidc-client-id)" \
+  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
+  -d "grant_type=client_credentials" | jq -r '.access_token')
+
+export COSIGN_EXPERIMENTAL=1
+
+# Find and sign all tar files
+find /workspace/output -name "*.tar" | while read tarfile; do
+  echo "Signing $tarfile"
+  cosign sign-blob \
+    --fulcio-url=$(params.fulcio-url) \
+    --rekor-url=$(params.rekor-url) \
+    --oidc-issuer=$(params.oidc-issuer) \
+    --identity-token="$OIDC_TOKEN" \
+    --yes \
+    --bundle="${tarfile}.bundle" \
+    "$tarfile" > "${tarfile}.sig" || echo "Failed to sign $tarfile"
+done
+
+echo "=== Bundle signing complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "oidc-secret"},
+			},
+		},
+
+		// Task 8: upload-sbom (upload SBOMs to TPA)
+		{
+			"name":     "upload-sbom",
+			"runAfter": []string{"sign-bundles"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "upload-sbom",
+						"image":   "quay.io/mathianasj/guac-cli:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Uploading SBOMs to TPA ==="
+
+# Get TPA OIDC token
+TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
+  -d "client_id=$(params.tpa-oidc-client-id)" \
+  -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)" \
+  -d "grant_type=client_credentials" | jq -r '.access_token')
+
+# Upload each SBOM
+find /workspace/output/sboms -name "*.spdx.json" | while read sbom; do
+  echo "Uploading $sbom"
+  curl -X POST \
+    -H "Authorization: Bearer $TPA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$sbom" \
+    "https://$(params.tpa-host)/api/v1/sbom" || echo "Failed to upload $sbom"
+done
+
+echo "=== SBOM upload complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "tpa-oidc-secret"},
+			},
+		},
+
+		// Task 9: copy-artifacts (copy final .tar files to artifacts PVC)
+		{
+			"name":     "copy-artifacts",
+			"runAfter": []string{"upload-sbom", "sign-bundles"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "copy-tgz-to-artifacts",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+echo "Copying .tar and .sig files to artifacts PVC..."
+find /workspace/output -name "*.tar" -o -name "*.sig" | while read file; do
+  cp -v "$file" /workspace/artifacts/
+done
+echo "Artifacts copied successfully"
+ls -lh /workspace/artifacts/
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "artifacts"},
+			},
+		},
+	}
+}
+
+// reconcileArtifactFileServer creates a single file server that mounts artifacts PVCs from completed CollectionPipelines
+func (r *DisconnectedPlatformReconciler) reconcileArtifactFileServer(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	namespace := architectNamespace
+	name := "artifact-fileserver"
+
+	// Get all CollectionPipelines to find completed ones
+	pipelines := &mirrorv1.CollectionPipelineList{}
+	if err := r.List(ctx, pipelines, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed to list CollectionPipelines: %w", err)
+	}
+
+	// Build volume mounts only for completed pipelines with artifacts PVCs
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
+
+	for _, pipeline := range pipelines.Items {
+		// Only mount if pipeline is Complete or Succeeded
+		if pipeline.Status.Phase != "Complete" && pipeline.Status.Phase != "Succeeded" {
+			continue
+		}
+
+		// Determine artifacts PVC name
+		var artifactsPVCName string
+		if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+			artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Spec.BaseVersion)
+		} else {
+			artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Name)
+		}
+
+		// Check if PVC exists and is Bound
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: artifactsPVCName, Namespace: namespace}, pvc); err != nil {
+			logger.Info("Skipping PVC (not found)", "pvc", artifactsPVCName, "pipeline", pipeline.Name)
+			continue
+		}
+
+		if pvc.Status.Phase != corev1.ClaimBound {
+			logger.Info("Skipping PVC (not bound)", "pvc", artifactsPVCName, "phase", pvc.Status.Phase)
+			continue
+		}
+
+		// Mount this PVC at /opt/app-root/src/<pipeline-name>
+		volumeName := fmt.Sprintf("artifacts-%s", pipeline.Name)
+		volumes = append(volumes, corev1.Volume{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: artifactsPVCName,
+					ReadOnly:  true,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      volumeName,
+			MountPath: fmt.Sprintf("/opt/app-root/src/%s", pipeline.Name),
+			ReadOnly:  true,
+		})
+	}
+
+	if len(volumes) == 0 {
+		logger.Info("No completed collections with bound artifacts PVCs, skipping file server")
+		// TODO: Delete existing file server deployment if it exists
+		return nil
+	}
+
+	// Create nginx deployment
+	replicas := int32(1)
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "nginx",
+							Image: "registry.access.redhat.com/ubi9/nginx-122:latest",
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+							},
+							VolumeMounts: volumeMounts,
+						},
+					},
+					Volumes: volumes,
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(platform, deployment, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on deployment: %w", err)
+	}
+
+	// Create or update deployment
+	existing := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(deployment), existing); err == nil {
+		deployment.SetResourceVersion(existing.GetResourceVersion())
+		if err := r.Update(ctx, deployment); err != nil {
+			return fmt.Errorf("failed to update artifact fileserver deployment: %w", err)
+		}
+		logger.Info("Updated artifact fileserver deployment", "volumes", len(volumes))
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, deployment); err != nil {
+			return fmt.Errorf("failed to create artifact fileserver deployment: %w", err)
+		}
+		logger.Info("Created artifact fileserver deployment", "volumes", len(volumes))
+	} else {
+		return err
+	}
+
+	// Create Service
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(platform, service, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on service: %w", err)
+	}
+
+	existingSvc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(service), existingSvc); err == nil {
+		service.SetResourceVersion(existingSvc.GetResourceVersion())
+		service.Spec.ClusterIP = existingSvc.Spec.ClusterIP
+		if err := r.Update(ctx, service); err != nil {
+			return fmt.Errorf("failed to update artifact fileserver service: %w", err)
+		}
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, service); err != nil {
+			return fmt.Errorf("failed to create artifact fileserver service: %w", err)
+		}
+	} else {
+		return err
+	}
+
+	// Create Route
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "route.openshift.io",
+		Version: "v1",
+		Kind:    "Route",
+	})
+	route.SetName(name)
+	route.SetNamespace(namespace)
+
+	routeSpec := map[string]interface{}{
+		"to": map[string]interface{}{
+			"kind": "Service",
+			"name": name,
+		},
+		"port": map[string]interface{}{
+			"targetPort": "http",
+		},
+		"tls": map[string]interface{}{
+			"termination": "edge",
+		},
+	}
+
+	if err := unstructured.SetNestedMap(route.Object, routeSpec, "spec"); err != nil {
+		return fmt.Errorf("failed to set route spec: %w", err)
+	}
+
+	if err := ctrl.SetControllerReference(platform, route, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on route: %w", err)
+	}
+
+	existingRoute := &unstructured.Unstructured{}
+	existingRoute.SetGroupVersionKind(route.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(route), existingRoute); err == nil {
+		route.SetResourceVersion(existingRoute.GetResourceVersion())
+		if err := r.Update(ctx, route); err != nil {
+			return fmt.Errorf("failed to update artifact fileserver route: %w", err)
+		}
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, route); err != nil {
+			return fmt.Errorf("failed to create artifact fileserver route: %w", err)
+		}
+	} else {
+		return err
+	}
+
+	return nil
+}
+
 func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mirrorv1.DisconnectedPlatform{}).
@@ -7008,5 +7869,6 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 			"kind":       "Route",
 		}}).
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
+		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
 		Complete(r)
 }

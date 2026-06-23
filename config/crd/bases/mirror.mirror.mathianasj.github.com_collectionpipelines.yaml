@@ -168,6 +168,8 @@ spec:
             type: object
           status:
             properties:
+              bundleUrl:
+                type: string
               completionTime:
                 format: date-time
                 type: string

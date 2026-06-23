@@ -13,6 +13,15 @@ spec:
     triggerTypes:
       - scheduled
       - manual
+    # Managed Quay as intermediate registry for signed image storage
+    quay:
+      managed:
+        enabled: true
+        organizationName: "mirror"
+        storage:
+          type: "filesystem"
+          size: "500Gi"
+          storageClass: "gp3-csi"
     operators:
       openshiftPipelines:
         disabled: false

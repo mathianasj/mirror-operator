@@ -79,6 +79,7 @@ type CollectionPipelineStatus struct {
 	ConfigMapRef   string             `json:"configMapRef,omitempty"`
 	StartTime      *metav1.Time       `json:"startTime,omitempty"`
 	CompletionTime *metav1.Time       `json:"completionTime,omitempty"`
+	BundleURL      string             `json:"bundleUrl,omitempty"`
 }
 
 // +kubebuilder:object:root=true
