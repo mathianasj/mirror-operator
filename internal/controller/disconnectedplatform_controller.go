@@ -7323,6 +7323,12 @@ if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
 fi
 
 echo "Found mapping file: $MAPPING_FILE"
+image_count=$(grep -c -v '^#' "$MAPPING_FILE" || echo 0)
+echo "Total images: $image_count"
+
+# Create SBOM cache and output directories
+SBOM_CACHE_DIR="/workspace/output/sbom-cache"
+mkdir -p "$SBOM_CACHE_DIR"
 mkdir -p /workspace/output/sboms
 
 # Determine if scanning from intermediate registry or local cache
@@ -7334,36 +7340,63 @@ else
   SCAN_FROM_REGISTRY=""
 fi
 
-# Generate SBOM for each image
+# Generate SBOM for each image with caching
+current=0
+cached=0
+scanned=0
 while IFS='=' read -r source dest; do
   [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
 
-  # Remove docker:// prefix from dest
+  current=$((current + 1))
   dest_no_proto="${dest#docker://}"
 
+  # Extract digest for cache lookup
+  DIGEST=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+  if [ -z "$DIGEST" ]; then
+    DIGEST=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+  fi
+
+  SAFE_NAME=$(echo "$dest_no_proto" | tr '/:@' '_')
+  OUTPUT_FILE="/workspace/output/sboms/${SAFE_NAME}.spdx.json"
+
+  # Check cache first if we have a digest
+  if [ -n "$DIGEST" ]; then
+    CACHE_FILE="$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
+    if [ -f "$CACHE_FILE" ]; then
+      cp "$CACHE_FILE" "$OUTPUT_FILE"
+      pkg_count=$(jq '.packages | length // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
+      echo "  [$current/$image_count] ✓ Cached: $dest_no_proto ($pkg_count packages)"
+      cached=$((cached + 1))
+      continue
+    fi
+  fi
+
+  # Scan image
   if [ -n "$SCAN_FROM_REGISTRY" ]; then
-    # Scan from intermediate registry - replace localhost:55000 with actual registry
     IMAGE="registry:${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
   else
-    # Scan from local cache using digest
-    DIGEST=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
     if [ -z "$DIGEST" ]; then
-      DIGEST=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
-    fi
-    if [ -z "$DIGEST" ]; then
-      echo "  Skipping (no digest): $source"
+      echo "  [$current/$image_count] Skipping (no digest): $source"
       continue
     fi
     IMAGE="/workspace/output/.cache/blobs/sha256/${DIGEST#sha256:}"
   fi
 
-  SAFE_NAME=$(echo "$dest_no_proto" | tr '/:@' '_')
-  echo "  Scanning: $IMAGE -> ${SAFE_NAME}.spdx.json"
-  syft "$IMAGE" -o spdx-json=/workspace/output/sboms/${SAFE_NAME}.spdx.json 2>/dev/null || echo "    Failed to scan"
+  echo "  [$current/$image_count] Scanning: $dest_no_proto"
+  if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" 2>/dev/null; then
+    scanned=$((scanned + 1))
+    # Cache the SBOM by digest for future runs
+    if [ -n "$DIGEST" ]; then
+      cp "$OUTPUT_FILE" "$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
+    fi
+  else
+    echo "    Failed to scan"
+  fi
 done < "$MAPPING_FILE"
 
 echo "=== SBOM generation complete ==="
-ls -lh /workspace/output/sboms/ || true
+echo "Total: $image_count | Cached: $cached | Scanned: $scanned"
+ls -lh /workspace/output/sboms/ | head -20
 `},
 						"env": []map[string]interface{}{
 							{"name": "INTERMEDIATE_REGISTRY", "value": "$(params.intermediate-registry)"},
