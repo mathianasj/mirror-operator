@@ -7514,12 +7514,14 @@ mirror:
   additionalImages:
 EOF
 
-while IFS= read -r line; do
-  if echo "$line" | grep -q "^#"; then
-    continue
-  fi
-  DST=$(echo "$line" | awk '{print $3}')
-  echo "    - name: $(params.intermediate-registry)/${DST#*/}" >> /tmp/imageset-from-intermediate.yaml
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  # Remove docker:// prefix from dest and replace localhost:55000 with intermediate registry
+  dest_no_proto="${dest#docker://}"
+  intermediate_ref="${dest_no_proto//localhost:55000/\$(params.intermediate-registry)}"
+
+  echo "    - name: $intermediate_ref" >> /tmp/imageset-from-intermediate.yaml
 done < "$MAPPING_FILE"
 
 echo "=== Generated ImageSetConfiguration ==="
