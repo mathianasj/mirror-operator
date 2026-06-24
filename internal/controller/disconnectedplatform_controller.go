@@ -251,6 +251,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile artifacts bucket")
 		}
+		// Sync S3 config from ConfigMap to Secret for backend
+		if err := r.syncS3ConfigToSecret(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to sync S3 config to secret")
+		}
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile collection pipeline template")
@@ -6451,6 +6455,80 @@ func (r *DisconnectedPlatformReconciler) reconcileArtifactsBucket(ctx context.Co
 	}
 
 	logger.Info("Created ObjectBucketClaim for collection artifacts")
+	return nil
+}
+
+// syncS3ConfigToSecret merges S3 configuration from ConfigMap into Secret
+func (r *DisconnectedPlatformReconciler) syncS3ConfigToSecret(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	namespace := architectNamespace
+
+	// Get the ConfigMap created by OBC
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: namespace}, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			// ConfigMap not created yet by OBC, skip
+			return nil
+		}
+		return fmt.Errorf("failed to get collection-artifacts ConfigMap: %w", err)
+	}
+
+	// Get the Secret created by OBC
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: namespace}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Secret not created yet by OBC, skip
+			return nil
+		}
+		return fmt.Errorf("failed to get collection-artifacts Secret: %w", err)
+	}
+
+	// Check if secret already has the required fields
+	if secret.Data == nil {
+		secret.Data = make(map[string][]byte)
+	}
+
+	needsUpdate := false
+
+	// Add S3_BUCKET from BUCKET_NAME
+	if bucketName, ok := cm.Data["BUCKET_NAME"]; ok && bucketName != "" {
+		if string(secret.Data["S3_BUCKET"]) != bucketName {
+			secret.Data["S3_BUCKET"] = []byte(bucketName)
+			needsUpdate = true
+		}
+	}
+
+	// Add S3_ENDPOINT from BUCKET_HOST and BUCKET_PORT
+	if bucketHost, ok := cm.Data["BUCKET_HOST"]; ok && bucketHost != "" {
+		bucketPort := cm.Data["BUCKET_PORT"]
+		if bucketPort == "" {
+			bucketPort = "443"
+		}
+		// Use https for external endpoint
+		s3Endpoint := fmt.Sprintf("https://%s:%s", bucketHost, bucketPort)
+		if string(secret.Data["S3_ENDPOINT"]) != s3Endpoint {
+			secret.Data["S3_ENDPOINT"] = []byte(s3Endpoint)
+			needsUpdate = true
+		}
+	}
+
+	// Add AWS_REGION from BUCKET_REGION (default to us-east-1 if empty)
+	region := cm.Data["BUCKET_REGION"]
+	if region == "" {
+		region = "us-east-1"
+	}
+	if string(secret.Data["AWS_REGION"]) != region {
+		secret.Data["AWS_REGION"] = []byte(region)
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		if err := r.Update(ctx, secret); err != nil {
+			return fmt.Errorf("failed to update collection-artifacts Secret: %w", err)
+		}
+		logger.Info("Updated collection-artifacts Secret with S3 configuration from ConfigMap")
+	}
+
 	return nil
 }
 
