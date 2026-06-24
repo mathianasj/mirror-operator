@@ -277,17 +277,14 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 	// Set bundle download URL when collection completes successfully
 	if phase == "Complete" || phase == "Succeeded" {
 		if pipeline.Status.BundleURL == "" {
-			// Get the global artifact file server route
-			route := &unstructured.Unstructured{}
-			route.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "route.openshift.io",
-				Version: "v1",
-				Kind:    "Route",
-			})
-			if err := r.Get(ctx, types.NamespacedName{Name: "artifact-fileserver", Namespace: pipeline.Namespace}, route); err == nil {
-				if host, found, _ := unstructured.NestedString(route.Object, "spec", "host"); found {
-					// Artifacts are mounted at /pipeline-name/ directory
-					pipeline.Status.BundleURL = fmt.Sprintf("https://%s/%s/", host, pipeline.Name)
+			// Get S3 bucket info from ObjectBucketClaim ConfigMap
+			obcConfigMap := &corev1.ConfigMap{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: pipeline.Namespace}, obcConfigMap); err == nil {
+				bucketName := obcConfigMap.Data["BUCKET_NAME"]
+				bucketHost := obcConfigMap.Data["BUCKET_HOST"]
+				if bucketName != "" && bucketHost != "" {
+					// S3 URL format: https://<bucket-host>/<bucket-name>/<collection-name>/
+					pipeline.Status.BundleURL = fmt.Sprintf("https://%s/%s/%s/", bucketHost, bucketName, pipeline.Name)
 				}
 			}
 		}
