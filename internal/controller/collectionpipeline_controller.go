@@ -391,17 +391,15 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 		return nil
 	}
 
-	// Determine PVC names with 1:1 mapping to pipeline
+	// Determine working PVC name with 1:1 mapping to pipeline
 	// For incremental collections, reuse the base version's PVC
-	var workingPVCName, artifactsPVCName string
+	var workingPVCName string
 	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
 		// Use the base version's PVC name for incremental builds
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
-		artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Spec.BaseVersion)
 	} else {
 		// Each CollectionPipeline gets its own PVC (1:1 mapping)
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
-		artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Name)
 	}
 
 	// Ensure working PVC exists
@@ -445,43 +443,6 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 		}
 	}
 
-	// Ensure artifacts PVC exists
-	existingArtifacts := &corev1.PersistentVolumeClaim{}
-	err = r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: artifactsPVCName}, existingArtifacts)
-	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-
-		artifactsPVC := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      artifactsPVCName,
-				Namespace: pipeline.Namespace,
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by":            "mirror-operator",
-					"app.kubernetes.io/component":             "collection-artifacts",
-					"mirror.mathianasj.github.com/collection": pipeline.Name,
-				},
-				OwnerReferences: []metav1.OwnerReference{
-					*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
-				},
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
-				},
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("10Gi"), // Smaller, only for .tgz files
-					},
-				},
-			},
-		}
-		if err := r.Create(ctx, artifactsPVC); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -504,14 +465,12 @@ func collectionPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, cm *corev1.ConfigMap) (*pipelinev1.PipelineRun, error) {
 	logger := log.FromContext(ctx)
 
-	// Determine PVC names
-	var workingPVCName, artifactsPVCName string
+	// Determine working PVC name
+	var workingPVCName string
 	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
-		artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Spec.BaseVersion)
 	} else {
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
-		artifactsPVCName = fmt.Sprintf("collection-artifacts-%s", pipeline.Name)
 	}
 
 	// Get runtime config from DisconnectedPlatform
@@ -525,7 +484,6 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		{Name: "config-map-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: cm.Name}},
 		{Name: "mirror-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getMirrorImage()}},
 		{Name: "working-pvc-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: workingPVCName}},
-		{Name: "artifacts-pvc-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: artifactsPVCName}},
 	}
 
 	// Determine intermediate registry (for m2m workflow)
@@ -580,6 +538,33 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "tpa-oidc-client-id", Value: pipelinev1.ParamValue{Type: "string", StringVal: tpaOidcClientID}},
 	)
 
+	// Read S3 configuration from ObjectBucketClaim ConfigMap and Secret
+	s3Bucket, s3Endpoint, s3Region, s3SecretName := "", "", "", ""
+	obcConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: pipeline.Namespace}, obcConfigMap); err == nil {
+		s3Bucket = obcConfigMap.Data["BUCKET_NAME"]
+		s3Endpoint = obcConfigMap.Data["BUCKET_HOST"]
+		s3Region = obcConfigMap.Data["BUCKET_REGION"]
+		if s3Region == "" {
+			s3Region = "us-east-1" // Default region for NooBaa
+		}
+		s3SecretName = "collection-artifacts" // OBC creates secret with same name as claim
+		logger.Info("Found S3 configuration from OBC", "bucket", s3Bucket, "endpoint", s3Endpoint)
+	}
+
+	hasS3 := "false"
+	if s3Bucket != "" {
+		hasS3 = "true"
+	}
+
+	params = append(params,
+		pipelinev1.Param{Name: "has-s3", Value: pipelinev1.ParamValue{Type: "string", StringVal: hasS3}},
+		pipelinev1.Param{Name: "s3-bucket", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3Bucket}},
+		pipelinev1.Param{Name: "s3-endpoint", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3Endpoint}},
+		pipelinev1.Param{Name: "s3-region", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3Region}},
+		pipelinev1.Param{Name: "s3-secret-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3SecretName}},
+	)
+
 	// Define workspaces
 	workspaces := []pipelinev1.WorkspaceBinding{
 		{
@@ -598,12 +583,6 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			Name: "output",
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 				ClaimName: workingPVCName,
-			},
-		},
-		{
-			Name: "artifacts",
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: artifactsPVCName,
 			},
 		},
 	}

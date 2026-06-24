@@ -247,9 +247,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
-		// Reconcile artifact file server for downloading collection bundles
-		if err := r.reconcileArtifactFileServer(ctx, platform); err != nil {
-			log.FromContext(ctx).Error(err, "failed to reconcile artifact file server")
+		// Reconcile ObjectBucketClaim for artifacts storage
+		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile artifacts bucket")
 		}
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
@@ -6369,6 +6369,52 @@ func (r *DisconnectedPlatformReconciler) ensureQuayCredentials(ctx context.Conte
 	return nil
 }
 
+// reconcileArtifactsBucket creates an ObjectBucketClaim for storing collection artifacts
+func (r *DisconnectedPlatformReconciler) reconcileArtifactsBucket(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	namespace := architectNamespace
+
+	// Define ObjectBucketClaim
+	obc := &unstructured.Unstructured{}
+	obc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "objectbucket.io",
+		Version: "v1alpha1",
+		Kind:    "ObjectBucketClaim",
+	})
+	obc.SetName("collection-artifacts")
+	obc.SetNamespace(namespace)
+
+	// Check if OBC already exists
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(obc.GroupVersionKind())
+	err := r.Get(ctx, client.ObjectKeyFromObject(obc), existing)
+	if err == nil {
+		// OBC exists, nothing to do
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get ObjectBucketClaim: %w", err)
+	}
+
+	// Create OBC
+	spec := map[string]interface{}{
+		"generateBucketName": "collection-artifacts",
+		"storageClassName":   "openshift-storage.noobaa.io",
+	}
+	obc.Object["spec"] = spec
+
+	if err := ctrl.SetControllerReference(platform, obc, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on OBC: %w", err)
+	}
+
+	if err := r.Create(ctx, obc); err != nil {
+		return fmt.Errorf("failed to create ObjectBucketClaim: %w", err)
+	}
+
+	logger.Info("Created ObjectBucketClaim for collection artifacts")
+	return nil
+}
+
 // ensureQuayRobotAccount creates or retrieves a robot account in Quay
 func (r *DisconnectedPlatformReconciler) ensureQuayRobotAccount(ctx context.Context, quayURL, hostname, orgName, robotShortName string) (string, error) {
 	logger := log.FromContext(ctx)
@@ -7116,7 +7162,6 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "config-map-name", "type": "string", "description": "ConfigMap containing ImageSetConfiguration"},
 		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2"},
 		{"name": "working-pvc-name", "type": "string", "description": "PVC for working directory/cache"},
-		{"name": "artifacts-pvc-name", "type": "string", "description": "PVC for final artifacts"},
 		{"name": "intermediate-registry", "type": "string", "default": "", "description": "Intermediate registry for m2m workflow (empty = local cache)"},
 		{"name": "has-keyless-signing", "type": "string", "default": "false", "description": "Enable keyless signing"},
 		{"name": "fulcio-url", "type": "string", "default": ""},
@@ -7129,8 +7174,10 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "tpa-oidc-issuer", "type": "string", "default": ""},
 		{"name": "tpa-oidc-client-id", "type": "string", "default": ""},
 		{"name": "has-s3", "type": "string", "default": "false", "description": "Enable S3 storage output"},
+		{"name": "s3-bucket", "type": "string", "default": ""},
 		{"name": "s3-endpoint", "type": "string", "default": ""},
 		{"name": "s3-region", "type": "string", "default": ""},
+		{"name": "s3-secret-name", "type": "string", "default": ""},
 	}
 
 	// Define workspaces
@@ -7138,11 +7185,9 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "config", "description": "ImageSetConfiguration ConfigMap"},
 		{"name": "pull-secret", "description": "Registry pull secret"},
 		{"name": "output", "description": "Working PVC for cache and temp files"},
-		{"name": "artifacts", "description": "Artifacts PVC for final .tar files"},
 		{"name": "oidc-secret", "description": "OIDC client secret for keyless signing", "optional": true},
 		{"name": "tpa-oidc-secret", "description": "TPA OIDC secret for SBOM upload", "optional": true},
 		{"name": "cosign-key", "description": "Cosign private key", "optional": true},
-		{"name": "s3-secret", "description": "S3 credentials (accessKeyId, secretAccessKey)", "optional": true},
 	}
 
 	// Define tasks - I'll create a simplified version first, then we can expand
@@ -7701,31 +7746,60 @@ echo "=== SBOM upload complete ==="
 			},
 		},
 
-		// Task 9: copy-artifacts (copy final .tar files to artifacts PVC)
+		// Task 9: upload-to-s3 (upload artifacts to S3 bucket)
 		{
-			"name":     "copy-artifacts",
+			"name":     "upload-to-s3",
 			"runAfter": []string{"upload-sbom", "sign-bundles"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
-						"name":    "copy-tgz-to-artifacts",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"name":    "upload-artifacts",
+						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
-echo "Copying .tar and .sig files to artifacts PVC..."
-find /workspace/output -name "*.tar" -o -name "*.sig" | while read file; do
-  cp -v "$file" /workspace/artifacts/
+echo "Uploading artifacts to S3..."
+
+# Collection name from working-pvc-name (format: collection-storage-<name>)
+COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+
+# Upload all .tar, .sig, and .bundle files
+find /workspace/output -maxdepth 1 \( -name "*.tar" -o -name "*.sig" -o -name "*.bundle" \) | while read file; do
+  FILENAME=$(basename "$file")
+  echo "Uploading $FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
+  aws s3 cp "$file" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
+    --endpoint-url="$(params.s3-endpoint)" \
+    --region="$(params.s3-region)"
 done
-echo "Artifacts copied successfully"
-ls -lh /workspace/artifacts/
+
+echo "=== Upload complete ==="
+aws s3 ls "s3://$(params.s3-bucket)/$COLLECTION_NAME/" --endpoint-url="$(params.s3-endpoint)" --region="$(params.s3-region)"
 `},
+						"env": []map[string]interface{}{
+							{
+								"name": "AWS_ACCESS_KEY_ID",
+								"valueFrom": map[string]interface{}{
+									"secretKeyRef": map[string]interface{}{
+										"name": "$(params.s3-secret-name)",
+										"key":  "AWS_ACCESS_KEY_ID",
+									},
+								},
+							},
+							{
+								"name": "AWS_SECRET_ACCESS_KEY",
+								"valueFrom": map[string]interface{}{
+									"secretKeyRef": map[string]interface{}{
+										"name": "$(params.s3-secret-name)",
+										"key":  "AWS_SECRET_ACCESS_KEY",
+									},
+								},
+							},
+						},
 					},
 				},
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
-				{"name": "artifacts"},
 			},
 		},
 	}
