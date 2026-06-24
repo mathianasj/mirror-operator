@@ -282,6 +282,23 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 			if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: pipeline.Namespace}, obcConfigMap); err == nil {
 				bucketName := obcConfigMap.Data["BUCKET_NAME"]
 				bucketHost := obcConfigMap.Data["BUCKET_HOST"]
+
+				// Use external S3 route instead of internal service endpoint
+				if bucketHost == "s3.openshift-storage.svc" {
+					// Get the external S3 route
+					s3Route := &unstructured.Unstructured{}
+					s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+						Group:   "route.openshift.io",
+						Version: "v1",
+						Kind:    "Route",
+					})
+					if err := r.Get(ctx, types.NamespacedName{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
+						if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
+							bucketHost = host
+						}
+					}
+				}
+
 				if bucketName != "" && bucketHost != "" {
 					// S3 URL format: https://<bucket-host>/<bucket-name>/<collection-name>/
 					pipeline.Status.BundleURL = fmt.Sprintf("https://%s/%s/%s/", bucketHost, bucketName, pipeline.Name)
@@ -383,10 +400,8 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 }
 
 func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) error {
-	output := pipeline.Spec.Storage.Output
-	if output == nil {
-		return nil
-	}
+	// Always create working PVC - it's needed for temporary storage during collection
+	// Even when using S3 for final storage, we need working space
 
 	// Determine working PVC name with 1:1 mapping to pipeline
 	// For incremental collections, reuse the base version's PVC
@@ -446,7 +461,7 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 func collectionPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 	if pr.Status.CompletionTime != nil {
 		for _, c := range pr.Status.Conditions {
-			if c.Reason == "Succeeded" {
+			if c.Type == "Succeeded" && c.Status == "True" {
 				return "Complete"
 			}
 		}
@@ -541,6 +556,10 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 	if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: pipeline.Namespace}, obcConfigMap); err == nil {
 		s3Bucket = obcConfigMap.Data["BUCKET_NAME"]
 		s3Endpoint = obcConfigMap.Data["BUCKET_HOST"]
+		// Add http:// scheme if not present (AWS CLI requires it)
+		if s3Endpoint != "" && !strings.HasPrefix(s3Endpoint, "http://") && !strings.HasPrefix(s3Endpoint, "https://") {
+			s3Endpoint = "http://" + s3Endpoint
+		}
 		s3Region = obcConfigMap.Data["BUCKET_REGION"]
 		if s3Region == "" {
 			s3Region = "us-east-1" // Default region for NooBaa

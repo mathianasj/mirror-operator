@@ -2351,6 +2351,7 @@ func (r *DisconnectedPlatformReconciler) configureKeycloakEmailMapper(ctx contex
 	// Check if mappers already exist
 	hasEmailMapper := false
 	hasEmailVerifiedMapper := false
+	hasAudienceMapper := false
 	for _, mapper := range mappers {
 		if name, ok := mapper["name"].(string); ok {
 			if name == "email-mapper" {
@@ -2358,6 +2359,9 @@ func (r *DisconnectedPlatformReconciler) configureKeycloakEmailMapper(ctx contex
 			}
 			if name == "email-verified-mapper" {
 				hasEmailVerifiedMapper = true
+			}
+			if name == "audience-mapper" {
+				hasAudienceMapper = true
 			}
 		}
 	}
@@ -2427,6 +2431,37 @@ func (r *DisconnectedPlatformReconciler) configureKeycloakEmailMapper(ctx contex
 		if mapperResp.StatusCode != http.StatusCreated && mapperResp.StatusCode != http.StatusNoContent {
 			body, _ := io.ReadAll(mapperResp.Body)
 			return fmt.Errorf("failed to create email_verified protocol mapper: status %d, body: %s", mapperResp.StatusCode, string(body))
+		}
+	}
+
+	// Add audience protocol mapper if missing
+	if !hasAudienceMapper {
+		mapperConfig := map[string]interface{}{
+			"name":            "audience-mapper",
+			"protocol":        "openid-connect",
+			"protocolMapper":  "oidc-audience-mapper",
+			"consentRequired": false,
+			"config": map[string]interface{}{
+				"included.client.audience": "trusted-artifact-signer",
+				"id.token.claim":           "false",
+				"access.token.claim":       "true",
+			},
+		}
+
+		mapperJSON, _ := json.Marshal(mapperConfig)
+		req, _ = http.NewRequest("POST", mappersURL, bytes.NewBuffer(mapperJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		mapperResp, err := httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create audience protocol mapper: %w", err)
+		}
+		defer mapperResp.Body.Close()
+
+		if mapperResp.StatusCode != http.StatusCreated && mapperResp.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(mapperResp.Body)
+			return fmt.Errorf("failed to create audience protocol mapper: status %d, body: %s", mapperResp.StatusCode, string(body))
 		}
 	}
 
@@ -7502,7 +7537,8 @@ fi
 OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
   -d "client_id=$(params.oidc-client-id)" \
   -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
-  -d "grant_type=client_credentials" | jq -r '.access_token')
+  -d "grant_type=client_credentials" \
+  -d "audience=trusted-artifact-signer" | jq -r '.access_token')
 
 if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
   echo "ERROR: Failed to get OIDC token"
@@ -7674,7 +7710,8 @@ echo "=== Signing tar bundles with cosign ==="
 OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
   -d "client_id=$(params.oidc-client-id)" \
   -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
-  -d "grant_type=client_credentials" | jq -r '.access_token')
+  -d "grant_type=client_credentials" \
+  -d "audience=trusted-artifact-signer" | jq -r '.access_token')
 
 export COSIGN_EXPERIMENTAL=1
 
@@ -7754,7 +7791,7 @@ echo "=== SBOM upload complete ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "upload-artifacts",
-						"image":   "$(params.mirror-image)",
+						"image":   "amazon/aws-cli:latest",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
