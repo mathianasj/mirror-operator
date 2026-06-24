@@ -7774,6 +7774,29 @@ func (r *DisconnectedPlatformReconciler) reconcileArtifactFileServer(ctx context
 			continue
 		}
 
+		// Check if any pods are currently using this PVC (to avoid conflicts with running tasks)
+		pods := &corev1.PodList{}
+		if err := r.List(ctx, pods, client.InNamespace(namespace)); err == nil {
+			pvcInUse := false
+			for _, pod := range pods.Items {
+				if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
+					for _, vol := range pod.Spec.Volumes {
+						if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == artifactsPVCName {
+							logger.Info("Skipping PVC (in use by pod)", "pvc", artifactsPVCName, "pod", pod.Name)
+							pvcInUse = true
+							break
+						}
+					}
+					if pvcInUse {
+						break
+					}
+				}
+			}
+			if pvcInUse {
+				continue
+			}
+		}
+
 		// Mount this PVC at /opt/app-root/src/<pipeline-name>
 		volumeName := fmt.Sprintf("artifacts-%s", pipeline.Name)
 		volumes = append(volumes, corev1.Volume{
