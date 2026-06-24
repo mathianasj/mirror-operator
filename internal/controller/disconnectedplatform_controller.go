@@ -7299,7 +7299,7 @@ fi
 				"steps": []map[string]interface{}{
 					{
 						"name":    "generate-sbom",
-						"image":   "quay.io/mathianasj/syft:latest",
+						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
@@ -7370,7 +7370,7 @@ ls -lh /workspace/output/sboms/
 				"steps": []map[string]interface{}{
 					{
 						"name":    "sign-images",
-						"image":   "quay.io/mathianasj/cosign:latest",
+						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
@@ -7533,7 +7533,7 @@ oc-mirror \
 				"steps": []map[string]interface{}{
 					{
 						"name":    "sign-bundles",
-						"image":   "quay.io/mathianasj/cosign:latest",
+						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
@@ -7582,7 +7582,7 @@ echo "=== Bundle signing complete ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "upload-sbom",
-						"image":   "quay.io/mathianasj/guac-cli:latest",
+						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
