@@ -6498,18 +6498,25 @@ func (r *DisconnectedPlatformReconciler) syncS3ConfigToSecret(ctx context.Contex
 		}
 	}
 
-	// Add S3_ENDPOINT from BUCKET_HOST and BUCKET_PORT
-	if bucketHost, ok := cm.Data["BUCKET_HOST"]; ok && bucketHost != "" {
-		bucketPort := cm.Data["BUCKET_PORT"]
-		if bucketPort == "" {
-			bucketPort = "443"
+	// Add S3_ENDPOINT - use external route instead of internal service
+	s3Endpoint := ""
+	if bucketHost, ok := cm.Data["BUCKET_HOST"]; ok && bucketHost == "s3.openshift-storage.svc" {
+		// Get the external S3 route for browser-accessible downloads
+		s3Route := &unstructured.Unstructured{}
+		s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "route.openshift.io",
+			Version: "v1",
+			Kind:    "Route",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
+			if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
+				s3Endpoint = fmt.Sprintf("https://%s", host)
+			}
 		}
-		// Use https for external endpoint
-		s3Endpoint := fmt.Sprintf("https://%s:%s", bucketHost, bucketPort)
-		if string(secret.Data["S3_ENDPOINT"]) != s3Endpoint {
-			secret.Data["S3_ENDPOINT"] = []byte(s3Endpoint)
-			needsUpdate = true
-		}
+	}
+	if s3Endpoint != "" && string(secret.Data["S3_ENDPOINT"]) != s3Endpoint {
+		secret.Data["S3_ENDPOINT"] = []byte(s3Endpoint)
+		needsUpdate = true
 	}
 
 	// Add AWS_REGION from BUCKET_REGION (default to us-east-1 if empty)
