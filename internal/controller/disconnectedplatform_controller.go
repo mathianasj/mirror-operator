@@ -7431,16 +7431,26 @@ ls -lh /workspace/output/sboms/ | head -20
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
+
+# Set up registry authentication
+export HOME=/tmp
+mkdir -p $HOME/.docker
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
+export DOCKER_CONFIG=$HOME/.docker
+
+echo "=== Initializing TUF root ==="
+cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
+
 echo "=== Signing images with cosign keyless ==="
 
-MAPPING_FILE="/workspace/output/working-dir/mapping.txt"
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
 if [ ! -f "$MAPPING_FILE" ]; then
   MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
 fi
 
 if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
-  echo "ERROR: mapping.txt not found"
-  exit 1
+  echo "No mapping.txt found, skipping image signing"
+  exit 0
 fi
 
 # Get OIDC token
@@ -7449,28 +7459,41 @@ OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/toke
   -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
   -d "grant_type=client_credentials" | jq -r '.access_token')
 
+if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+  echo "ERROR: Failed to get OIDC token"
+  exit 1
+fi
+
 export COSIGN_EXPERIMENTAL=1
 
-# Sign each image
-while IFS= read -r line; do
-  if echo "$line" | grep -q "^#"; then
-    continue
-  fi
+# Sign each image in intermediate registry
+signed_count=0
+total_images=$(grep -c -v '^#' "$MAPPING_FILE" || echo 0)
+echo "Processing $total_images images..."
 
-  DST=$(echo "$line" | awk '{print $3}')
-  IMAGE="$(params.intermediate-registry)/${DST#*/}"
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
 
-  echo "Signing $IMAGE"
-  cosign sign \
+  # Replace localhost:55000 with intermediate registry in dest path
+  dest_no_proto="${dest#docker://}"
+  image_ref="${dest_no_proto//localhost:55000/\$(params.intermediate-registry)}"
+
+  echo "Signing $image_ref"
+  if cosign sign \
     --fulcio-url=$(params.fulcio-url) \
     --rekor-url=$(params.rekor-url) \
     --oidc-issuer=$(params.oidc-issuer) \
     --identity-token="$OIDC_TOKEN" \
     --yes \
-    "$IMAGE" || echo "Failed to sign $IMAGE"
+    "$image_ref"; then
+    signed_count=$((signed_count + 1))
+  else
+    echo "Failed to sign $image_ref"
+  fi
 done < "$MAPPING_FILE"
 
 echo "=== Image signing complete ==="
+echo "Signed $signed_count of $total_images images"
 `},
 						"env": []map[string]interface{}{
 							{"name": "COSIGN_EXPERIMENTAL", "value": "1"},
@@ -7481,6 +7504,7 @@ echo "=== Image signing complete ==="
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
 				{"name": "oidc-secret"},
+				{"name": "pull-secret"},
 			},
 		},
 
