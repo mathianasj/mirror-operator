@@ -7570,7 +7570,6 @@ oc-mirror \
   --v2 \
   --config=/tmp/imageset-from-intermediate.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
-  --workspace=file:///workspace/output \
   file:///workspace/output
 `},
 					},
