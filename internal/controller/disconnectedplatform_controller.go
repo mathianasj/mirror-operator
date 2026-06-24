@@ -4746,6 +4746,10 @@ func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder 
 				"value": "true",
 			},
 			map[string]interface{}{
+				"name":  "S3_SECRET_NAME",
+				"value": "collection-artifacts",
+			},
+			map[string]interface{}{
 				"name":  "LOG_LEVEL",
 				"value": "debug",
 			},
