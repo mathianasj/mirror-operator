@@ -7128,6 +7128,9 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "tpa-host", "type": "string", "default": ""},
 		{"name": "tpa-oidc-issuer", "type": "string", "default": ""},
 		{"name": "tpa-oidc-client-id", "type": "string", "default": ""},
+		{"name": "has-s3", "type": "string", "default": "false", "description": "Enable S3 storage output"},
+		{"name": "s3-endpoint", "type": "string", "default": ""},
+		{"name": "s3-region", "type": "string", "default": ""},
 	}
 
 	// Define workspaces
@@ -7139,6 +7142,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "oidc-secret", "description": "OIDC client secret for keyless signing", "optional": true},
 		{"name": "tpa-oidc-secret", "description": "TPA OIDC secret for SBOM upload", "optional": true},
 		{"name": "cosign-key", "description": "Cosign private key", "optional": true},
+		{"name": "s3-secret", "description": "S3 credentials (accessKeyId, secretAccessKey)", "optional": true},
 	}
 
 	// Define tasks - I'll create a simplified version first, then we can expand
@@ -7400,6 +7404,7 @@ ls -lh /workspace/output/sboms/ | head -20
 `},
 						"env": []map[string]interface{}{
 							{"name": "INTERMEDIATE_REGISTRY", "value": "$(params.intermediate-registry)"},
+							{"name": "SYFT_CACHE_DIR", "value": "/workspace/output/syft-cache"},
 						},
 					},
 				},
@@ -7591,6 +7596,9 @@ oc-mirror \
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
+echo "=== Initializing TUF root ==="
+cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
+
 echo "=== Signing tar bundles with cosign ==="
 
 # Get OIDC token
