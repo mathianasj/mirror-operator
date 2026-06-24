@@ -7305,47 +7305,65 @@ fi
 set -e
 echo "=== Generating SBOM with Syft ==="
 
-MAPPING_FILE="/workspace/output/working-dir/mapping.txt"
+# Set up registry authentication
+export HOME=/tmp
+mkdir -p $HOME/.docker
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
+export DOCKER_CONFIG=$HOME/.docker
+
+MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
 if [ ! -f "$MAPPING_FILE" ]; then
   MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
 fi
 
 if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
-  echo "ERROR: mapping.txt not found"
-  exit 1
+  echo "No mapping.txt found, skipping SBOM generation"
+  mkdir -p /workspace/output/sboms
+  exit 0
 fi
 
+echo "Found mapping file: $MAPPING_FILE"
 mkdir -p /workspace/output/sboms
 
-# Determine registry source
+# Determine if scanning from intermediate registry or local cache
 if [ -n "$(params.intermediate-registry)" ]; then
-  REGISTRY_SOURCE="$(params.intermediate-registry)"
+  echo "Scanning from intermediate registry: $(params.intermediate-registry)"
+  SCAN_FROM_REGISTRY="$(params.intermediate-registry)"
 else
-  REGISTRY_SOURCE="oci-archive"
+  echo "Scanning from local cache"
+  SCAN_FROM_REGISTRY=""
 fi
 
 # Generate SBOM for each image
-while IFS= read -r line; do
-  if echo "$line" | grep -q "^#"; then
-    continue
-  fi
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
 
-  SRC=$(echo "$line" | awk '{print $1}')
-  DST=$(echo "$line" | awk '{print $3}')
+  # Remove docker:// prefix from dest
+  dest_no_proto="${dest#docker://}"
 
-  if [ -n "$REGISTRY_SOURCE" ] && [ "$REGISTRY_SOURCE" != "oci-archive" ]; then
-    IMAGE="${REGISTRY_SOURCE}/${DST#*/}"
+  if [ -n "$SCAN_FROM_REGISTRY" ]; then
+    # Scan from intermediate registry - replace localhost:55000 with actual registry
+    IMAGE="registry:${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
   else
-    DIGEST=$(echo "$SRC" | grep -oE 'sha256:[a-f0-9]{64}')
+    # Scan from local cache using digest
+    DIGEST=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+    if [ -z "$DIGEST" ]; then
+      DIGEST=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
+    fi
+    if [ -z "$DIGEST" ]; then
+      echo "  Skipping (no digest): $source"
+      continue
+    fi
     IMAGE="/workspace/output/.cache/blobs/sha256/${DIGEST#sha256:}"
   fi
 
-  SAFE_NAME=$(echo "$DST" | tr '/:@' '_')
-  syft "$IMAGE" -o spdx-json=/workspace/output/sboms/${SAFE_NAME}.spdx.json || echo "Failed to scan $IMAGE"
+  SAFE_NAME=$(echo "$dest_no_proto" | tr '/:@' '_')
+  echo "  Scanning: $IMAGE -> ${SAFE_NAME}.spdx.json"
+  syft "$IMAGE" -o spdx-json=/workspace/output/sboms/${SAFE_NAME}.spdx.json 2>/dev/null || echo "    Failed to scan"
 done < "$MAPPING_FILE"
 
 echo "=== SBOM generation complete ==="
-ls -lh /workspace/output/sboms/
+ls -lh /workspace/output/sboms/ || true
 `},
 						"env": []map[string]interface{}{
 							{"name": "INTERMEDIATE_REGISTRY", "value": "$(params.intermediate-registry)"},
