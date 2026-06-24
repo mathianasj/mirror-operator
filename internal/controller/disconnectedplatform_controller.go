@@ -7373,6 +7373,7 @@ ls -lh /workspace/output/sboms/ || true
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
+				{"name": "pull-secret"},
 			},
 		},
 
