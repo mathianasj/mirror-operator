@@ -168,6 +168,12 @@ spec:
             type: object
           status:
             properties:
+              architectBackendImageUrl:
+                type: string
+              architectFrontendImageUrl:
+                type: string
+              architectImportScriptUrl:
+                type: string
               bundleUrl:
                 type: string
               completionTime:
@@ -234,6 +240,10 @@ spec:
               phase:
                 type: string
               pipelineRunRef:
+                type: string
+              sbomUrl:
+                type: string
+              signatureUrl:
                 type: string
               startTime:
                 format: date-time

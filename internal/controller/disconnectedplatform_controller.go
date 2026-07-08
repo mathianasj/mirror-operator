@@ -179,16 +179,12 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 
 	keycloakReady := false
 	signingImages := false
-	verifyingIntegrity := false
 	for _, c := range platform.Status.Components {
 		if c.Name == "rhbk-operator" && c.Status == "Succeeded" {
 			keycloakReady = true
 		}
 		if c.Name == "trusted-artifact-signer" && c.Status == "Succeeded" {
 			signingImages = true
-		}
-		if c.Name == "trusted-profile-analyzer" && c.Status == "Succeeded" {
-			verifyingIntegrity = true
 		}
 	}
 	if keycloakReady {
@@ -230,7 +226,8 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			log.FromContext(ctx).Error(err, "failed to read Securesign health status")
 		}
 	}
-	if verifyingIntegrity {
+	// Reconcile RHTPA if configured (regardless of current status to ensure Keycloak clients exist)
+	if platform.Spec.Connected != nil && platform.Spec.Connected.RHTPA != nil {
 		if err := r.reconcileRHTPAConfig(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile RHTPA config")
 		}
@@ -625,6 +622,85 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 							log.FromContext(ctx).Error(err, "Failed to update Keycloak redirect URIs for RHTPA")
 						}
 					}
+
+					// Update S3 storage and importer sources configuration
+					needsUpdate := false
+
+					// Create OBC and configure S3 storage
+					obcName := "rhtpa-storage"
+					obcConfigMap := &corev1.ConfigMap{}
+					obcSecret := &corev1.Secret{}
+					if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcConfigMap); err == nil {
+						if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcSecret); err == nil {
+							bucketName := obcConfigMap.Data["BUCKET_NAME"]
+							accessKey := string(obcSecret.Data["AWS_ACCESS_KEY_ID"])
+							secretKey := string(obcSecret.Data["AWS_SECRET_ACCESS_KEY"])
+
+							// Get external S3 route - must have https:// prefix for trustify
+							s3Route := &unstructured.Unstructured{}
+							s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+								Group:   "route.openshift.io",
+								Version: "v1",
+								Kind:    "Route",
+							})
+							s3Endpoint := "https://s3.openshift-storage.svc"
+							if err := r.Get(ctx, client.ObjectKey{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
+								if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
+									s3Endpoint = "https://" + host
+								}
+							}
+
+							if err := unstructured.SetNestedMap(existingTPA.Object, map[string]interface{}{
+								"type":      "s3",
+								"bucket":    bucketName,
+								"region":    s3Endpoint,
+								"accessKey": accessKey,
+								"secretKey": secretKey,
+								"pathStyle": true,
+							}, "spec", "storage"); err == nil {
+								needsUpdate = true
+								log.FromContext(ctx).Info("Updated TPA storage to S3")
+							}
+						}
+					}
+
+					// Update importer sources
+					if err := unstructured.SetNestedMap(existingTPA.Object, map[string]interface{}{
+						"enabled": true,
+						"importers": map[string]interface{}{
+							"redhat-sboms": map[string]interface{}{
+								"sbom": map[string]interface{}{
+									"disabled": false,
+								},
+							},
+							"redhat-csaf": map[string]interface{}{
+								"csaf": map[string]interface{}{
+									"disabled": false,
+								},
+							},
+							"cve": map[string]interface{}{
+								"cve": map[string]interface{}{
+									"disabled": false,
+								},
+							},
+							"osv-github": map[string]interface{}{
+								"osv": map[string]interface{}{
+									"disabled": false,
+								},
+							},
+						},
+					}, "spec", "modules", "createImporters"); err == nil {
+						needsUpdate = true
+					}
+
+					if needsUpdate {
+						if updateErr := r.Update(ctx, existingTPA); updateErr != nil {
+							log.FromContext(ctx).Error(updateErr, "Failed to update TPA")
+						} else {
+							log.FromContext(ctx).Info("Updated TPA with S3 storage and importer sources")
+						}
+					}
+
 					return nil
 				}
 			}
@@ -731,6 +807,31 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 					},
 				},
 			},
+			"createImporters": map[string]interface{}{
+				"enabled": true,
+				"importers": map[string]interface{}{
+					"redhat-sboms": map[string]interface{}{
+						"sbom": map[string]interface{}{
+							"disabled": false,
+						},
+					},
+					"redhat-csaf": map[string]interface{}{
+						"csaf": map[string]interface{}{
+							"disabled": false,
+						},
+					},
+					"cve": map[string]interface{}{
+						"cve": map[string]interface{}{
+							"disabled": false,
+						},
+					},
+					"osv-github": map[string]interface{}{
+						"osv": map[string]interface{}{
+							"disabled": false,
+						},
+					},
+				},
+			},
 			"server": map[string]interface{}{
 				"enabled":  true,
 				"replicas": 1,
@@ -772,23 +873,67 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 
 	st := map[string]interface{}{}
 
-	// Map storage type: "local" -> "filesystem" for TPA Helm chart
-	storageType := cfg.Storage.Type
-	if storageType == "local" {
-		storageType = "filesystem"
+	// Create ObjectBucketClaim for S3 storage (avoids RWO PVC issues with multiple pods)
+	obcName := "rhtpa-storage"
+	obc := &unstructured.Unstructured{}
+	obc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "objectbucket.io",
+		Version: "v1alpha1",
+		Kind:    "ObjectBucketClaim",
+	})
+	obc.SetName(obcName)
+	obc.SetNamespace(architectNamespace)
+	obc.Object["spec"] = map[string]interface{}{
+		"generateBucketName": obcName,
+		"storageClassName":   "openshift-storage.noobaa.io",
 	}
-	st["type"] = storageType
 
-	if cfg.Storage.AccessKey != "" {
-		// S3 storage configuration
-		st["accessKey"] = cfg.Storage.AccessKey
-		st["secretKey"] = cfg.Storage.SecretKey
-		st["bucket"] = cfg.Storage.Bucket
-		st["region"] = cfg.Storage.Region
-	} else if cfg.Storage.Size != "" {
-		// Filesystem storage configuration requires size
-		st["size"] = cfg.Storage.Size
+	if getErr := r.Get(ctx, client.ObjectKeyFromObject(obc), obc); apierrors.IsNotFound(getErr) {
+		if createErr := r.Create(ctx, obc); createErr != nil {
+			return fmt.Errorf("failed to create RHTPA storage OBC: %w", createErr)
+		}
+		log.FromContext(ctx).Info("Created RHTPA storage ObjectBucketClaim")
 	}
+
+	// Get S3 credentials from OBC ConfigMap and Secret
+	obcConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcConfigMap); err != nil {
+		return fmt.Errorf("failed to get RHTPA storage OBC ConfigMap: %w", err)
+	}
+
+	obcSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcSecret); err != nil {
+		return fmt.Errorf("failed to get RHTPA storage OBC Secret: %w", err)
+	}
+
+	bucketName := obcConfigMap.Data["BUCKET_NAME"]
+	accessKey := string(obcSecret.Data["AWS_ACCESS_KEY_ID"])
+	secretKey := string(obcSecret.Data["AWS_SECRET_ACCESS_KEY"])
+
+	// Get external S3 route for TPA
+	// Per trustify code: region must start with http:// or https:// to be recognized as custom endpoint
+	s3Route := &unstructured.Unstructured{}
+	s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "route.openshift.io",
+		Version: "v1",
+		Kind:    "Route",
+	})
+	s3Endpoint := "https://s3.openshift-storage.svc" // fallback to internal with https://
+	if err := r.Get(ctx, client.ObjectKey{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
+		if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
+			s3Endpoint = "https://" + host // Must have https:// prefix for trustify to recognize as custom endpoint
+		}
+	}
+
+	// Configure S3 storage for TPA
+	// Region field with https:// prefix is interpreted as custom endpoint by trustify
+	st["type"] = "s3"
+	st["bucket"] = bucketName
+	st["region"] = s3Endpoint
+	st["accessKey"] = accessKey
+	st["secretKey"] = secretKey
+	st["pathStyle"] = true // NooBaa uses path-style URLs
+
 	spec["storage"] = st
 
 	newTPA := &unstructured.Unstructured{}
@@ -801,8 +946,28 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	newTPA.SetNamespace(architectNamespace)
 	newTPA.Object["spec"] = spec
 
-	if err := r.Create(ctx, newTPA); err != nil {
-		return err
+	// Create or update TPA
+	currentTPA := &unstructured.Unstructured{}
+	currentTPA.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "rhtpa.io",
+		Version: "v1",
+		Kind:    "TrustedProfileAnalyzer",
+	})
+
+	getErr := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-trusted-profile-analyzer", Namespace: architectNamespace}, currentTPA)
+	if getErr == nil {
+		// TPA exists, update it
+		newTPA.SetResourceVersion(currentTPA.GetResourceVersion())
+		if updateErr := r.Update(ctx, newTPA); updateErr != nil {
+			return updateErr
+		}
+	} else if apierrors.IsNotFound(getErr) {
+		// TPA doesn't exist, create it
+		if createErr := r.Create(ctx, newTPA); createErr != nil {
+			return createErr
+		}
+	} else {
+		return getErr
 	}
 
 	// Update Keycloak frontend client redirect URIs with actual RHTPA route hostname
@@ -1307,9 +1472,11 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 		// Update redirect URIs and client type
 		updateURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s", keycloakHost, realmName, clientUUID)
 		updateData := map[string]interface{}{
-			"redirectUris": []string{fmt.Sprintf("https://%s/*", actualAppDomain)},
-			"webOrigins":   []string{"*"},
-			"publicClient": isPublic,
+			"redirectUris":              []string{fmt.Sprintf("https://%s/*", actualAppDomain)},
+			"webOrigins":                []string{"*"},
+			"publicClient":              isPublic,
+			"serviceAccountsEnabled":    !isPublic, // Enable service accounts for confidential clients
+			"directAccessGrantsEnabled": !isPublic, // Enable direct access for confidential clients
 		}
 		updateJSON, _ := json.Marshal(updateData)
 		req, _ = http.NewRequest("PUT", updateURL, bytes.NewReader(updateJSON))
@@ -1499,13 +1666,12 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 			}
 		}
 
-		// For CLI client, assign trustify-manager role to its service account for create permissions
-		if clientID == "cli" {
-			serviceAccountUsername := "service-account-" + clientID
-			if err := r.assignRoleToServiceAccount(ctx, keycloakHost, realmName, serviceAccountUsername, "trustify-manager", adminToken, httpClient); err != nil {
-				logger.Error(err, "failed to assign trustify-manager role to service account", "clientId", clientID, "username", serviceAccountUsername)
+		// For CLI and sbom-uploader clients, assign trustify-manager role to their service accounts for create permissions
+		if clientID == "cli" || clientID == "sbom-uploader" {
+			if err := r.assignRoleToServiceAccountByClient(ctx, keycloakHost, realmName, clientUUID, "trustify-manager", adminToken, httpClient); err != nil {
+				logger.Error(err, "failed to assign trustify-manager role to service account", "clientId", clientID, "clientUUID", clientUUID)
 			} else {
-				logger.Info("Assigned trustify-manager role to service account", "clientId", clientID, "username", serviceAccountUsername)
+				logger.Info("Assigned trustify-manager role to service account", "clientId", clientID, "clientUUID", clientUUID)
 			}
 		}
 	}
@@ -1573,6 +1739,144 @@ func (r *DisconnectedPlatformReconciler) assignScopeToClient(ctx context.Context
 	}
 
 	logger.Info("Assigned read:document scope to client", "clientUUID", clientUUID)
+	return nil
+}
+
+// ensureTrustifyManagerRole ensures the trustify-manager realm role exists, creating it if necessary
+func (r *DisconnectedPlatformReconciler) ensureTrustifyManagerRole(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Check if role exists
+	roleURL := fmt.Sprintf("https://%s/admin/realms/%s/roles/trustify-manager", keycloakHost, realmName)
+	roleReq, _ := http.NewRequest("GET", roleURL, nil)
+	roleReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+	roleResp, err := httpClient.Do(roleReq)
+	if err != nil {
+		return fmt.Errorf("failed to check for trustify-manager role: %w", err)
+	}
+	defer roleResp.Body.Close()
+
+	if roleResp.StatusCode == 200 {
+		// Role already exists
+		logger.Info("trustify-manager role already exists", "realm", realmName)
+		return nil
+	}
+
+	if roleResp.StatusCode != 404 {
+		body, _ := io.ReadAll(roleResp.Body)
+		return fmt.Errorf("unexpected status checking role (status %d): %s", roleResp.StatusCode, string(body))
+	}
+
+	// Role doesn't exist, create it
+	logger.Info("Creating trustify-manager role", "realm", realmName)
+
+	createRoleURL := fmt.Sprintf("https://%s/admin/realms/%s/roles", keycloakHost, realmName)
+	roleData := map[string]interface{}{
+		"name":        "trustify-manager",
+		"description": "Trustify manager role with full access to Trustify/TPA APIs for creating and managing documents",
+		"composite":   false,
+		"clientRole":  false,
+	}
+	roleJSON, _ := json.Marshal(roleData)
+
+	createReq, _ := http.NewRequest("POST", createRoleURL, bytes.NewReader(roleJSON))
+	createReq.Header.Set("Authorization", "Bearer "+adminToken)
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createResp, err := httpClient.Do(createReq)
+	if err != nil {
+		return fmt.Errorf("failed to create trustify-manager role: %w", err)
+	}
+	defer createResp.Body.Close()
+
+	if createResp.StatusCode != 201 {
+		body, _ := io.ReadAll(createResp.Body)
+		return fmt.Errorf("failed to create role (status %d): %s", createResp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully created trustify-manager role", "realm", realmName)
+	return nil
+}
+
+// assignRoleToServiceAccountByClient assigns a realm role to a service account user for a given client UUID
+func (r *DisconnectedPlatformReconciler) assignRoleToServiceAccountByClient(ctx context.Context, keycloakHost, realmName, clientUUID, roleName, adminToken string, httpClient *http.Client) error {
+	logger := log.FromContext(ctx)
+
+	// Ensure the trustify-manager role exists before trying to assign it
+	if roleName == "trustify-manager" {
+		if err := r.ensureTrustifyManagerRole(ctx, keycloakHost, realmName, adminToken, httpClient); err != nil {
+			return fmt.Errorf("failed to ensure trustify-manager role exists: %w", err)
+		}
+	}
+
+	// Get the service account user for this client
+	saURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/service-account-user", keycloakHost, realmName, clientUUID)
+	saReq, _ := http.NewRequest("GET", saURL, nil)
+	saReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+	saResp, err := httpClient.Do(saReq)
+	if err != nil {
+		return fmt.Errorf("failed to get service account user: %w", err)
+	}
+	defer saResp.Body.Close()
+
+	if saResp.StatusCode != 200 {
+		body, _ := io.ReadAll(saResp.Body)
+		return fmt.Errorf("failed to get service account user (status %d): %s", saResp.StatusCode, string(body))
+	}
+
+	var saUser map[string]interface{}
+	if err := json.NewDecoder(saResp.Body).Decode(&saUser); err != nil {
+		return fmt.Errorf("failed to decode service account user: %w", err)
+	}
+
+	userUUID, ok := saUser["id"].(string)
+	if !ok {
+		return fmt.Errorf("service account user ID not found in response")
+	}
+
+	// Get the role
+	rolesURL := fmt.Sprintf("https://%s/admin/realms/%s/roles/%s", keycloakHost, realmName, roleName)
+	roleReq, _ := http.NewRequest("GET", rolesURL, nil)
+	roleReq.Header.Set("Authorization", "Bearer "+adminToken)
+
+	roleResp, err := httpClient.Do(roleReq)
+	if err != nil {
+		return fmt.Errorf("failed to get role: %w", err)
+	}
+	defer roleResp.Body.Close()
+
+	if roleResp.StatusCode == 404 {
+		return fmt.Errorf("role not found: %s", roleName)
+	}
+
+	var role map[string]interface{}
+	if err := json.NewDecoder(roleResp.Body).Decode(&role); err != nil {
+		return fmt.Errorf("failed to decode role: %w", err)
+	}
+
+	// Assign the role to the service account user
+	assignURL := fmt.Sprintf("https://%s/admin/realms/%s/users/%s/role-mappings/realm", keycloakHost, realmName, userUUID)
+	assignData := []map[string]interface{}{role}
+	assignJSON, _ := json.Marshal(assignData)
+
+	assignReq, _ := http.NewRequest("POST", assignURL, bytes.NewReader(assignJSON))
+	assignReq.Header.Set("Authorization", "Bearer "+adminToken)
+	assignReq.Header.Set("Content-Type", "application/json")
+
+	assignResp, err := httpClient.Do(assignReq)
+	if err != nil {
+		return fmt.Errorf("failed to assign role: %w", err)
+	}
+	defer assignResp.Body.Close()
+
+	if assignResp.StatusCode != 204 {
+		body, _ := io.ReadAll(assignResp.Body)
+		return fmt.Errorf("failed to assign role (status %d): %s", assignResp.StatusCode, string(body))
+	}
+
+	logger.Info("Successfully assigned role to service account", "userUUID", userUUID, "role", roleName)
 	return nil
 }
 
@@ -2810,11 +3114,11 @@ func (r *DisconnectedPlatformReconciler) ensureEmailVerifiedClientScope(ctx cont
 		log.FromContext(ctx).Info("Created email_verified client scope", "scopeID", scopeID)
 	}
 
-	// Add email_verified mapper to the client scope
+	// Add email and email_verified mappers to the client scope
 	scopeMappersURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes/%s/protocol-mappers/models",
 		keycloakHost, realmName, scopeID)
 
-	// Check if mapper already exists
+	// Check if mappers already exist
 	req, _ = http.NewRequest("GET", scopeMappersURL, nil)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 
@@ -2827,15 +3131,53 @@ func (r *DisconnectedPlatformReconciler) ensureEmailVerifiedClientScope(ctx cont
 	var scopeMappers []map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&scopeMappers)
 
-	hasMapper := false
+	hasEmailMapper := false
+	hasEmailVerifiedMapper := false
 	for _, mapper := range scopeMappers {
-		if name, ok := mapper["name"].(string); ok && name == "email-verified-scope-mapper" {
-			hasMapper = true
-			break
+		if name, ok := mapper["name"].(string); ok {
+			if name == "email-scope-mapper" {
+				hasEmailMapper = true
+			} else if name == "email-verified-scope-mapper" {
+				hasEmailVerifiedMapper = true
+			}
 		}
 	}
 
-	if !hasMapper {
+	// Create email mapper if it doesn't exist
+	if !hasEmailMapper {
+		emailMapperConfig := map[string]interface{}{
+			"name":           "email-scope-mapper",
+			"protocol":       "openid-connect",
+			"protocolMapper": "oidc-hardcoded-claim-mapper",
+			"config": map[string]interface{}{
+				"claim.name":           "email",
+				"claim.value":          "service-account-trusted-artifact-signer@keycloak.local",
+				"jsonType.label":       "String",
+				"id.token.claim":       "true",
+				"access.token.claim":   "true",
+				"userinfo.token.claim": "true",
+			},
+		}
+		emailMapperJSON, _ := json.Marshal(emailMapperConfig)
+		req, _ = http.NewRequest("POST", scopeMappersURL, bytes.NewBuffer(emailMapperJSON))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to create email scope mapper: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create email scope mapper: status %d, body: %s", resp.StatusCode, string(body))
+		}
+		log.FromContext(ctx).Info("Created email mapper in client scope")
+	}
+
+	// Create email_verified mapper if it doesn't exist
+	if !hasEmailVerifiedMapper {
 		mapperConfig := map[string]interface{}{
 			"name":           "email-verified-scope-mapper",
 			"protocol":       "openid-connect",
@@ -2867,6 +3209,24 @@ func (r *DisconnectedPlatformReconciler) ensureEmailVerifiedClientScope(ctx cont
 		log.FromContext(ctx).Info("Created email_verified mapper in client scope")
 	}
 
+	// Remove the built-in "email" client scope to prevent it from overriding our hardcoded email_verified claim
+	// The built-in email scope has a user-attribute mapper that doesn't work for service accounts
+	builtinEmailScopeID, err := r.getClientScopeIDByName(ctx, keycloakHost, realmName, "email", adminToken, httpClient)
+	if err == nil && builtinEmailScopeID != "" {
+		removeEmailScopeURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/default-client-scopes/%s",
+			keycloakHost, realmName, clientUUID, builtinEmailScopeID)
+		req, _ = http.NewRequest("DELETE", removeEmailScopeURL, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+				log.FromContext(ctx).Info("Removed built-in email client scope from client", "client", clientID)
+			}
+		}
+	}
+
 	// Assign the client scope to the client as a default scope
 	assignScopeURL := fmt.Sprintf("https://%s/admin/realms/%s/clients/%s/default-client-scopes/%s",
 		keycloakHost, realmName, clientUUID, scopeID)
@@ -2889,6 +3249,33 @@ func (r *DisconnectedPlatformReconciler) ensureEmailVerifiedClientScope(ctx cont
 
 	log.FromContext(ctx).Info("Assigned email_verified client scope to client", "client", clientID, "scope", scopeName)
 	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) getClientScopeIDByName(ctx context.Context, keycloakHost, realmName, scopeName, adminToken string, httpClient *http.Client) (string, error) {
+	clientScopesURL := fmt.Sprintf("https://%s/admin/realms/%s/client-scopes", keycloakHost, realmName)
+	req, _ := http.NewRequest("GET", clientScopesURL, nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get client scopes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var clientScopes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&clientScopes); err != nil {
+		return "", fmt.Errorf("failed to decode client scopes: %w", err)
+	}
+
+	for _, scope := range clientScopes {
+		if name, ok := scope["name"].(string); ok && name == scopeName {
+			if id, ok := scope["id"].(string); ok {
+				return id, nil
+			}
+		}
+	}
+
+	return "", nil // Not found
 }
 
 func (r *DisconnectedPlatformReconciler) updateKeycloakClientSecret(ctx context.Context, keycloakHost, clientID, realmName string) error {
@@ -7302,6 +7689,11 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "s3-endpoint", "type": "string", "default": ""},
 		{"name": "s3-region", "type": "string", "default": ""},
 		{"name": "s3-secret-name", "type": "string", "default": ""},
+		{"name": "architect-frontend-image", "type": "string", "description": "Airgap Architect frontend container image"},
+		{"name": "architect-backend-image", "type": "string", "description": "Airgap Architect backend container image"},
+		{"name": "oc-version", "type": "string", "default": "stable-4.16", "description": "OpenShift CLI version to download"},
+		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
+		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
 	}
 
 	// Define workspaces
@@ -7312,6 +7704,26 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "oidc-secret", "description": "OIDC client secret for keyless signing", "optional": true},
 		{"name": "tpa-oidc-secret", "description": "TPA OIDC secret for SBOM upload", "optional": true},
 		{"name": "cosign-key", "description": "Cosign private key", "optional": true},
+		{"name": "architect-script", "description": "Airgap Architect import script ConfigMap", "optional": true},
+	}
+
+	// Define pipeline results
+	results := []map[string]interface{}{
+		{
+			"name":        "bundle-url",
+			"description": "URL to the uploaded bundle in S3",
+			"value":       "$(tasks.upload-to-s3.results.bundle-url)",
+		},
+		{
+			"name":        "signature-url",
+			"description": "URL to the bundle signature in S3",
+			"value":       "$(tasks.upload-to-s3.results.signature-url)",
+		},
+		{
+			"name":        "sbom-url",
+			"description": "URL to view SBOMs in TPA",
+			"value":       "$(tasks.upload-sbom.results.sbom-url)",
+		},
 	}
 
 	// Define tasks - I'll create a simplified version first, then we can expand
@@ -7320,6 +7732,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 	pipelineSpec := map[string]interface{}{
 		"params":     params,
 		"workspaces": workspaces,
+		"results":    results,
 		"tasks":      tasks,
 	}
 
@@ -7429,7 +7842,7 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $SUCCESS -eq 0 ]; do
     --config=/workspace/config/imageset-config.yaml \
     --authfile=/workspace/pull-secret/.dockerconfigjson \
     --cache-dir=/workspace/output/.cache \
-    --workspace=file:///workspace/output \
+    --workspace=file:///workspace/output/workspace-to-intermediate \
     docker://$(params.intermediate-registry) 2>&1 | tee "$OUTPUT_FILE" || true
 
   if grep -q "✓.*release images mirrored successfully" "$OUTPUT_FILE" || \
@@ -7449,6 +7862,42 @@ done
 if [ $SUCCESS -eq 0 ]; then
   echo "=== Mirror failed after $MAX_RETRIES attempts ==="
   exit 1
+fi
+
+# Preserve IDMS and ITMS files for mirror-from-intermediate step
+# oc-mirror will delete working-dir when it starts, so save to persistent location
+IDMS_FILE="/workspace/output/workspace-to-intermediate/working-dir/cluster-resources/idms-oc-mirror.yaml"
+IDMS_BACKUP="/workspace/output/idms-oc-mirror.yaml"
+ITMS_FILE="/workspace/output/workspace-to-intermediate/working-dir/cluster-resources/itms-oc-mirror.yaml"
+ITMS_BACKUP="/workspace/output/itms-oc-mirror.yaml"
+
+if [ -f "$IDMS_FILE" ]; then
+  echo "=== Preserving IDMS file for mirror-from-intermediate ==="
+  cp "$IDMS_FILE" "$IDMS_BACKUP"
+  echo "IDMS file saved to: $IDMS_BACKUP"
+
+  # Show first few lines for debugging
+  echo "IDMS preview:"
+  head -30 "$IDMS_BACKUP"
+else
+  echo "WARNING: IDMS file not found at $IDMS_FILE"
+  echo "Checking for IDMS in other locations..."
+  find /workspace/output -name "idms-*.yaml" -type f 2>/dev/null | while read idms; do
+    echo "Found: $idms"
+    cp "$idms" "$IDMS_BACKUP"
+  done
+fi
+
+if [ -f "$ITMS_FILE" ]; then
+  echo "=== Preserving ITMS file for mirror-from-intermediate ==="
+  cp "$ITMS_FILE" "$ITMS_BACKUP"
+  echo "ITMS file saved to: $ITMS_BACKUP"
+
+  # Show first few lines for debugging
+  echo "ITMS preview:"
+  head -30 "$ITMS_BACKUP"
+else
+  echo "WARNING: ITMS file not found at $ITMS_FILE"
 fi
 `},
 					},
@@ -7636,8 +8085,15 @@ fi
 
 export COSIGN_EXPERIMENTAL=1
 
+# Initialize TUF root for our private Sigstore instance
+# This ensures cosign verify checks against OUR Rekor, not public Sigstore
+echo "=== Initializing TUF root for private Sigstore ==="
+cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
+
 # Sign each image in intermediate registry
 signed_count=0
+skipped_count=0
+failed_count=0
 total_images=$(grep -c -v '^#' "$MAPPING_FILE" || echo 0)
 echo "Processing $total_images images..."
 
@@ -7648,7 +8104,20 @@ while IFS='=' read -r source dest; do
   dest_no_proto="${dest#docker://}"
   image_ref="${dest_no_proto//localhost:55000/\$(params.intermediate-registry)}"
 
-  echo "Signing $image_ref"
+  # Check if image is already signed BY OUR PRIVATE SIGSTORE INSTANCE
+  # We must verify against OUR Rekor, not upstream public Sigstore
+  # This prevents skipping images that only have upstream Red Hat signatures
+  if cosign verify \
+    --rekor-url=$(params.rekor-url) \
+    --certificate-oidc-issuer=$(params.oidc-issuer) \
+    --certificate-identity-regexp=".*" \
+    "$image_ref" >/dev/null 2>&1; then
+    echo "  ✓ Already signed by our Sigstore: $image_ref (skipping)"
+    skipped_count=$((skipped_count + 1))
+    continue
+  fi
+
+  echo "  Signing $image_ref"
   if cosign sign \
     --fulcio-url=$(params.fulcio-url) \
     --rekor-url=$(params.rekor-url) \
@@ -7658,12 +8127,14 @@ while IFS='=' read -r source dest; do
     "$image_ref"; then
     signed_count=$((signed_count + 1))
   else
-    echo "Failed to sign $image_ref"
+    echo "  ✗ Failed to sign $image_ref"
+    failed_count=$((failed_count + 1))
   fi
 done < "$MAPPING_FILE"
 
+echo ""
 echo "=== Image signing complete ==="
-echo "Signed $signed_count of $total_images images"
+echo "Total: $total_images | Signed: $signed_count | Already signed: $skipped_count | Failed: $failed_count"
 `},
 						"env": []map[string]interface{}{
 							{"name": "COSIGN_EXPERIMENTAL", "value": "1"},
@@ -7721,64 +8192,412 @@ oc-mirror \
 						"name":    "mirror-from-intermediate",
 						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/sh", "-c"},
+						"env": []map[string]interface{}{
+							// Set TMPDIR to workspace to avoid using small ephemeral storage
+							{"name": "TMPDIR", "value": "/workspace/output/tmp"},
+							// Set HOME to workspace (oc-mirror defaults cache-dir to $HOME)
+							{"name": "HOME", "value": "/workspace/output"},
+							// Configure container storage to use workspace
+							{"name": "CONTAINERS_STORAGE_CONF", "value": "/workspace/output/storage.conf"},
+						},
 						"args": []string{`
 set -e
-echo "=== Creating ImageSetConfiguration to mirror FROM intermediate registry ==="
+echo "=== Mirroring FROM intermediate registry TO disk ==="
 
-MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
-if [ ! -f "$MAPPING_FILE" ]; then
-  MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
-fi
+# Setup temp and cache directories on PVC (not ephemeral storage)
+mkdir -p /workspace/output/tmp
+mkdir -p /workspace/output/.oc-mirror/.cache
+export TMPDIR=/workspace/output/tmp
+export HOME=/workspace/output
 
-if [ -z "$MAPPING_FILE" ] || [ ! -f "$MAPPING_FILE" ]; then
-  echo "ERROR: mapping.txt not found from dry-run"
+# Configure container storage to use workspace instead of /tmp or /var/tmp
+# This ensures the localhost:55000 internal registry uses the PVC
+mkdir -p /workspace/output/containers
+cat > /workspace/output/storage.conf <<STORAGE_EOF
+[storage]
+  driver = "overlay"
+  graphroot = "/workspace/output/containers/storage"
+  runroot = "/workspace/output/containers/run"
+
+[storage.options]
+  additionalimagestores = []
+
+[storage.options.overlay]
+  mountopt = "nodev,metacopy=on"
+STORAGE_EOF
+
+export CONTAINERS_STORAGE_CONF=/workspace/output/storage.conf
+
+echo "=== Container storage configured ==="
+echo "Storage root: /workspace/output/containers/storage"
+echo "Temp directory: $TMPDIR"
+echo "Cache directory: $HOME/.oc-mirror/.cache"
+df -h /workspace/output
+
+# Generate registries.conf from IDMS/ITMS files created by mirror-to-intermediate
+# This ensures we use the ACTUAL paths that oc-mirror created
+echo "=== Generating registries.conf from IDMS + ITMS ==="
+
+# IDMS file was saved by mirror-to-intermediate to persistent location
+# (oc-mirror deletes working-dir at startup, so we can't read it from there)
+IDMS_FILE="/workspace/output/idms-oc-mirror.yaml"
+
+if [ ! -f "$IDMS_FILE" ]; then
+  echo "ERROR: IDMS file not found at $IDMS_FILE"
+  echo "This file should have been saved by the mirror-to-intermediate step"
+  echo "Checking for IDMS files..."
+  find /workspace/output -name "idms-*.yaml" -type f 2>/dev/null || echo "No IDMS files found"
   exit 1
 fi
 
-cat > /tmp/imageset-from-intermediate.yaml <<EOF
-apiVersion: mirror.openshift.io/v1alpha2
-kind: ImageSetConfiguration
-mirror:
-  platform:
-    graph: false
-    architectures:
-      - amd64
-  additionalImages:
-EOF
+echo "Found IDMS file: $IDMS_FILE"
 
-while IFS='=' read -r source dest; do
-  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+# Output IDMS content to logs for debugging
+echo ""
+echo "=== IDMS File Content (for debugging parser) ==="
+cat "$IDMS_FILE"
+echo "=== End IDMS Content ==="
+echo ""
 
-  # Remove docker:// prefix from dest and replace localhost:55000 with intermediate registry
-  dest_no_proto="${dest#docker://}"
-  intermediate_ref="${dest_no_proto//localhost:55000/\$(params.intermediate-registry)}"
+# Create registries.conf directory
+mkdir -p /workspace/output/tmp/containers
 
-  echo "    - name: $intermediate_ref" >> /tmp/imageset-from-intermediate.yaml
-done < "$MAPPING_FILE"
+# Parse IDMS YAML to extract source -> mirror mappings
+# IDMS format:
+#   spec:
+#     imageDigestMirrors:
+#     - mirrors:
+#       - <mirror-registry>/<path>
+#       source: <source-registry>
+cat > /workspace/output/tmp/containers/registries.conf <<'REGCONF_HEADER'
+# Generated from IDMS/ITMS files created by oc-mirror
+# This ensures registry paths match what mirror-to-intermediate actually created
+REGCONF_HEADER
 
-echo "=== Generated ImageSetConfiguration ==="
-cat /tmp/imageset-from-intermediate.yaml
+# Extract unique source registries and their mirror paths from IDMS
+# Use yq/jq if available, otherwise fall back to grep/awk
+if command -v yq >/dev/null 2>&1; then
+  # Use yq to parse YAML properly
+  yq eval '.spec.imageDigestMirrors[] | .source as $source | .mirrors[] | [$source, .] | @tsv' "$IDMS_FILE" | \
+  awk -F'\t' '
+    !seen[$1]++ {
+      sources[++src_count] = $1
+      mirrors[$1] = $2
+    }
+    END {
+      for (i = 1; i <= src_count; i++) {
+        source = sources[i]
+        mirror = mirrors[source]
+        # Use FULL mirror path (not just registry hostname)
 
-echo "=== Mirroring FROM intermediate registry TO disk ==="
-oc-mirror \
+        print ""
+        print "[[registry]]"
+        print "location=\"" source "\""
+        print "blocked = true"
+        print "[[registry.mirror]]"
+        print "location=\"" mirror "\""
+      }
+    }
+  ' >> /workspace/output/tmp/containers/registries.conf
+else
+  # Fallback: Parse IDMS YAML without yq
+  # IDMS structure:
+  #   spec:
+  #     imageDigestMirrors:
+  #     - mirrors:
+  #       - mirror-registry/path/to/repo
+  #       source: source-registry/original/repo
+
+  # Use awk to parse the YAML structure
+  awk '
+    # Track indentation to know which section we are in
+    /^[[:space:]]*imageDigestMirrors:/ { in_mirrors_section = 1; next }
+
+    # New mirror entry starts with "- mirrors:" or "  - mirrors:"
+    /^[[:space:]]*-[[:space:]]*mirrors:/ {
+      if (in_mirrors_section) {
+        current_source = ""
+        current_mirror = ""
+        reading_mirrors = 1
+      }
+      next
+    }
+
+    # Mirror URL (under mirrors list)
+    /^[[:space:]]*-[[:space:]]+[^[:space:]]/ {
+      if (reading_mirrors && current_mirror == "") {
+        # Extract the mirror URL (everything after "- ")
+        sub(/^[[:space:]]*-[[:space:]]+/, "")
+        current_mirror = $0
+      }
+      next
+    }
+
+    # Source registry
+    /^[[:space:]]*source:/ {
+      if (reading_mirrors) {
+        # Extract source (everything after "source: ")
+        sub(/^[[:space:]]*source:[[:space:]]*/, "")
+        current_source = $0
+
+        # We have both source and mirror, output them
+        if (current_source != "" && current_mirror != "") {
+          if (!seen[current_source]++) {
+            sources[++src_count] = current_source
+            mirrors[current_source] = current_mirror
+          }
+        }
+        reading_mirrors = 0
+      }
+      next
+    }
+
+    END {
+      for (i = 1; i <= src_count; i++) {
+        source = sources[i]
+        mirror = mirrors[source]
+        # Use FULL mirror path (not just registry hostname)
+
+        print ""
+        print "[[registry]]"
+        print "location=\"" source "\""
+        print "blocked = true"
+        print "[[registry.mirror]]"
+        print "location=\"" mirror "\""
+      }
+    }
+  ' "$IDMS_FILE" >> /workspace/output/tmp/containers/registries.conf
+fi
+
+# Parse ITMS (ImageTagMirrorSet) for tag-based mirrors
+# ITMS format is similar to IDMS but for tags instead of digests
+ITMS_FILE="/workspace/output/itms-oc-mirror.yaml"
+
+if [ -f "$ITMS_FILE" ]; then
+  echo ""
+  echo "=== ITMS File Content (for debugging parser) ==="
+  cat "$ITMS_FILE"
+  echo "=== End ITMS Content ==="
+  echo ""
+
+  # Extract source -> mirror mappings from ITMS
+  if command -v yq >/dev/null 2>&1; then
+    # Use yq to parse YAML properly
+    yq eval '.spec.imageTagMirrors[] | .source as $source | .mirrors[] | [$source, .] | @tsv' "$ITMS_FILE" | \
+    awk -F'\t' '
+      !seen[$1]++ {
+        sources[++src_count] = $1
+        mirrors[$1] = $2
+      }
+      END {
+        for (i = 1; i <= src_count; i++) {
+          source = sources[i]
+          mirror = mirrors[source]
+          # Use FULL mirror path (not just registry hostname)
+
+          print ""
+          print "[[registry]]"
+          print "location=\"" source "\""
+          print "blocked = true"
+          print "[[registry.mirror]]"
+          print "location=\"" mirror "\""
+        }
+      }
+    ' >> /workspace/output/tmp/containers/registries.conf
+  else
+    # Fallback: Parse ITMS YAML without yq
+    # ITMS structure is similar to IDMS but uses imageTagMirrors instead
+    awk '
+      # Track indentation to know which section we are in
+      /^[[:space:]]*imageTagMirrors:/ { in_mirrors_section = 1; next }
+
+      # New mirror entry starts with "- mirrors:" or "  - mirrors:"
+      /^[[:space:]]*-[[:space:]]*mirrors:/ {
+        if (in_mirrors_section) {
+          current_source = ""
+          current_mirror = ""
+          reading_mirrors = 1
+        }
+        next
+      }
+
+      # Mirror URL (under mirrors list)
+      /^[[:space:]]*-[[:space:]]+[^[:space:]]/ {
+        if (reading_mirrors && current_mirror == "") {
+          # Extract the mirror URL (everything after "- ")
+          sub(/^[[:space:]]*-[[:space:]]+/, "")
+          current_mirror = $0
+        }
+        next
+      }
+
+      # Source registry
+      /^[[:space:]]*source:/ {
+        if (reading_mirrors) {
+          # Extract source (everything after "source: ")
+          sub(/^[[:space:]]*source:[[:space:]]*/, "")
+          current_source = $0
+
+          # We have both source and mirror, output them
+          if (current_source != "" && current_mirror != "") {
+            if (!seen[current_source]++) {
+              sources[++src_count] = current_source
+              mirrors[current_source] = current_mirror
+            }
+          }
+          reading_mirrors = 0
+        }
+        next
+      }
+
+      END {
+        for (i = 1; i <= src_count; i++) {
+          source = sources[i]
+          mirror = mirrors[source]
+          # Use FULL mirror path (not just registry hostname)
+
+          print ""
+          print "[[registry]]"
+          print "location=\"" source "\""
+          print "blocked = true"
+          print "[[registry.mirror]]"
+          print "location=\"" mirror "\""
+        }
+      }
+    ' "$ITMS_FILE" >> /workspace/output/tmp/containers/registries.conf
+  fi
+
+  echo "Added ITMS-based tag mirrors to registries.conf"
+else
+  echo "No ITMS file found (tag-based mirrors may not work)"
+fi
+
+# Block CDN access that Quay might redirect to
+cat >> /workspace/output/tmp/containers/registries.conf <<'REGCONF_CDN'
+
+# Block CDN access that Quay might redirect to
+[[registry]]
+location="cdn01.quay.io"
+blocked = true
+
+[[registry]]
+location="cdn02.quay.io"
+blocked = true
+
+[[registry]]
+location="cdn03.quay.io"
+blocked = true
+
+# Block other common upstream registries not in IDMS
+[[registry]]
+location="docker.io"
+blocked = true
+
+[[registry]]
+location="registry-1.docker.io"
+blocked = true
+
+[[registry]]
+location="gcr.io"
+blocked = true
+
+[[registry]]
+location="ghcr.io"
+blocked = true
+REGCONF_CDN
+
+echo "=== Generated registries.conf from IDMS + ITMS ==="
+cat /workspace/output/tmp/containers/registries.conf
+
+# Use standard mirror-to-disk workflow with registries.conf redirection
+# oc-mirror will pull from intermediate registry instead of internet
+export CONTAINERS_REGISTRIES_CONF=/workspace/output/tmp/containers/registries.conf
+
+# Also block network access to common upstream hosts via /etc/hosts
+# This provides defense-in-depth if registries.conf is bypassed
+cat >> /etc/hosts <<HOSTS_EOF
+# Block upstream registries - force use of intermediate registry only
+127.0.0.1 registry.redhat.io
+127.0.0.1 quay.io
+127.0.0.1 registry.access.redhat.com
+127.0.0.1 cdn01.quay.io
+127.0.0.1 cdn02.quay.io
+127.0.0.1 cdn03.quay.io
+127.0.0.1 docker.io
+127.0.0.1 registry-1.docker.io
+HOSTS_EOF
+
+echo "=== Blocked upstream registries in /etc/hosts ==="
+grep -E "(registry.redhat.io|quay.io|cdn.*quay.io)" /etc/hosts
+
+# Verify intermediate registry is accessible before starting mirror
+echo ""
+echo "=== Verifying intermediate registry access ==="
+if ! curl -f -k -s "https://$(params.intermediate-registry)/v2/" >/dev/null 2>&1 && \
+   ! curl -f -k -s "http://$(params.intermediate-registry)/v2/" >/dev/null 2>&1; then
+  echo "ERROR: Cannot reach intermediate registry: $(params.intermediate-registry)"
+  echo "Ensure the registry is accessible from this pod and contains mirrored content"
+  exit 1
+fi
+echo "✓ Intermediate registry is accessible"
+
+# List available repositories (helps debug missing content)
+echo ""
+echo "=== Checking intermediate registry content ==="
+if curl -f -k -s --user "$(cat /workspace/pull-secret/.dockerconfigjson | jq -r '.auths["$(params.intermediate-registry)"].auth' | base64 -d)" \
+  "https://$(params.intermediate-registry)/v2/_catalog?n=10" 2>/dev/null | jq -r '.repositories[]?' | head -5; then
+  echo "✓ Found repositories in intermediate registry"
+else
+  echo "⚠ Warning: Could not list repositories (may need authentication or different endpoint)"
+fi
+
+echo ""
+echo "=== Starting mirror from intermediate registry ==="
+echo "Source: $(params.intermediate-registry)"
+echo "Destination: file:///workspace/output"
+echo "Upstream access: BLOCKED (registries.conf + /etc/hosts)"
+echo ""
+
+# Run oc-mirror with verbose output and clear error handling
+if ! oc-mirror \
   --v2 \
-  --config=/tmp/imageset-from-intermediate.yaml \
+  --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
-  file:///workspace/output
+  --cache-dir=/workspace/output/.oc-mirror/.cache \
+  file:///workspace/output; then
+
+  echo ""
+  echo "=== Mirror from intermediate FAILED ==="
+  echo ""
+  echo "Common causes:"
+  echo "  1. Content not present in intermediate registry ($(params.intermediate-registry))"
+  echo "  2. Authentication failed (check pull secret)"
+  echo "  3. Network connectivity issues to intermediate registry"
+  echo "  4. Intermediate registry is proxying/redirecting to blocked upstream CDNs"
+  echo ""
+  echo "Check that the intermediate registry has been populated with:"
+  echo "  oc-mirror --v2 --config=imageset.yaml docker://$(params.intermediate-registry)/mirror"
+  echo ""
+  exit 1
+fi
+
+echo ""
+echo "=== Mirror from intermediate complete ==="
 `},
 					},
 				},
 			},
 			"workspaces": []map[string]interface{}{
+				{"name": "config"},
 				{"name": "output"},
 				{"name": "pull-secret"},
 			},
 		},
 
-		// Task 7: sign-bundles (sign the tar file)
+		// Task 7: sign-bundles (sign the complete repackaged bundle)
 		{
 			"name":     "sign-bundles",
-			"runAfter": []string{"mirror-from-intermediate", "oc-mirror"},
+			"runAfter": []string{"repackage-bundle"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-keyless-signing)", "operator": "in", "values": []string{"true"}},
 			},
@@ -7804,8 +8623,8 @@ OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/toke
 
 export COSIGN_EXPERIMENTAL=1
 
-# Find and sign all tar files
-find /workspace/output -name "*.tar" | while read tarfile; do
+# Find and sign all tar/tar.gz files
+find /workspace/output -maxdepth 1 \( -name "*.tar" -o -name "*.tar.gz" \) -type f | while read tarfile; do
   echo "Signing $tarfile"
   cosign sign-blob \
     --fulcio-url=$(params.fulcio-url) \
@@ -7816,6 +8635,21 @@ find /workspace/output -name "*.tar" | while read tarfile; do
     --bundle="${tarfile}.bundle" \
     "$tarfile" > "${tarfile}.sig" || echo "Failed to sign $tarfile"
 done
+
+# Sign bundle SBOM if it exists
+if [ -f /workspace/output/sboms/bundle-*.spdx.json ]; then
+  for sbomfile in /workspace/output/sboms/bundle-*.spdx.json; do
+    echo "Signing bundle SBOM: $(basename $sbomfile)"
+    cosign sign-blob \
+      --fulcio-url=$(params.fulcio-url) \
+      --rekor-url=$(params.rekor-url) \
+      --oidc-issuer=$(params.oidc-issuer) \
+      --identity-token="$OIDC_TOKEN" \
+      --yes \
+      --bundle="${sbomfile}.bundle" \
+      "$sbomfile" > "${sbomfile}.sig" || echo "Failed to sign $sbomfile"
+  done
+fi
 
 echo "=== Bundle signing complete ==="
 `},
@@ -7828,14 +8662,193 @@ echo "=== Bundle signing complete ==="
 			},
 		},
 
-		// Task 8: upload-sbom (upload SBOMs to TPA)
+		// Task 8: create-bundle-sbom (create contextual SBOM for the signed bundle)
 		{
-			"name":     "upload-sbom",
+			"name":     "create-bundle-sbom",
 			"runAfter": []string{"sign-bundles"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
 			},
 			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "create-bundle-sbom",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Creating Bundle SBOM (Contextual SBOM Pattern) ==="
+
+# Get collection name
+COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+
+# Find the complete bundle (created by repackage-bundle task)
+BUNDLE_FILE=$(find /workspace/output -maxdepth 1 -name "*-complete.tar.gz" -type f | head -1)
+if [ -z "$BUNDLE_FILE" ]; then
+  echo "No complete bundle file found, skipping bundle SBOM creation"
+  exit 0
+fi
+
+echo "Found complete bundle: $(basename "$BUNDLE_FILE")"
+
+# Use the complete bundle as-is (no rename)
+BUNDLE_FILENAME=$(basename "$BUNDLE_FILE")
+
+# Calculate bundle checksum
+BUNDLE_SHA256=$(sha256sum "$BUNDLE_FILE" | awk '{print $1}')
+echo "Bundle SHA256: $BUNDLE_SHA256"
+
+# Count image SBOMs
+SBOM_COUNT=$(find /workspace/output/sboms -name "*.spdx.json" -type f | wc -l)
+echo "Found $SBOM_COUNT image SBOMs to reference"
+
+# Generate unique SBOM IDs
+BUNDLE_SBOM_ID="SPDXRef-DOCUMENT"
+BUNDLE_PACKAGE_ID="SPDXRef-Package-Bundle-${COLLECTION_NAME}"
+
+# Create bundle SBOM in SPDX 2.3 format
+cat > /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<'HEADER'
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "OCI Mirror Bundle",
+HEADER
+
+# Add dynamic fields
+cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<EOF
+  "documentNamespace": "https://mirror-operator/bundles/${COLLECTION_NAME}/$(date -u +%Y%m%d%H%M%S)",
+  "creationInfo": {
+    "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "creators": [
+      "Tool: mirror-operator-collection-pipeline"
+    ],
+    "licenseListVersion": "3.21"
+  },
+  "packages": [
+    {
+      "SPDXID": "${BUNDLE_PACKAGE_ID}",
+      "name": "${BUNDLE_FILENAME}",
+      "versionInfo": "${COLLECTION_NAME}",
+      "downloadLocation": "s3://$(params.s3-bucket)/${COLLECTION_NAME}/${BUNDLE_FILENAME}",
+      "filesAnalyzed": false,
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "${BUNDLE_SHA256}"
+        }
+      ],
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:oci/mirror-bundle@${COLLECTION_NAME}?checksum=sha256:${BUNDLE_SHA256}"
+        }
+      ],
+      "primaryPackagePurpose": "CONTAINER",
+      "description": "OCI mirror bundle containing ${SBOM_COUNT} container images"
+    }
+EOF
+
+# Add each image as a package in the bundle SBOM
+# Syft puts the main container image as the first package
+find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
+  # Extract the first package (the container image itself)
+  package_info=$(jq -c '.packages[0]' "$sbom_file" 2>/dev/null)
+  if [ -n "$package_info" ] && [ "$package_info" != "{}" ] && [ "$package_info" != "null" ]; then
+    echo "," >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+    echo "$package_info" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+  fi
+done
+
+cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<PACKAGES_END
+  ],
+  "externalDocumentRefs": [
+PACKAGES_END
+
+# Add external document references for each image SBOM
+first=true
+find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
+  sbom_name=$(basename "$sbom_file" .spdx.json)
+  sbom_checksum=$(sha256sum "$sbom_file" | awk '{print $1}')
+
+  if [ "$first" = false ]; then
+    echo "," >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+  fi
+  first=false
+
+  cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<DOCREF
+    {
+      "externalDocumentId": "DocumentRef-${sbom_name}",
+      "spdxDocument": "https://mirror-operator/sboms/${sbom_name}",
+      "checksum": {
+        "algorithm": "SHA256",
+        "checksumValue": "${sbom_checksum}"
+      }
+    }
+DOCREF
+done
+
+# Add relationships
+cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<RELS
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "${BUNDLE_PACKAGE_ID}"
+    }
+RELS
+
+# Add CONTAINS relationships - both to packages in this SBOM and external documents for full context
+find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
+  sbom_name=$(basename "$sbom_file" .spdx.json)
+  # Get the first package ID (the container image)
+  main_package_id=$(jq -r '.packages[0].SPDXID // "SPDXRef-Package"' "$sbom_file" 2>/dev/null || echo "SPDXRef-Package")
+
+  # Create CONTAINS relationship to the package we included in this SBOM
+  cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<CONTAINS
+    ,
+    {
+      "spdxElementId": "${BUNDLE_PACKAGE_ID}",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "${main_package_id}"
+    }
+CONTAINS
+done
+
+# Close JSON
+echo "  ]" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+echo "}" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+
+echo "=== Bundle SBOM Created ==="
+echo "File: bundle-${COLLECTION_NAME}.spdx.json"
+jq -r '.packages[0] | "Bundle: \(.name) (\(.versionInfo))"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+jq -r '.externalDocumentRefs | length | "References: \(.) image SBOMs"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+jq -r '.relationships | map(select(.relationshipType == "CONTAINS")) | length | "Contains: \(.) images"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+
+		// Task 9: upload-sbom (upload SBOMs to TPA)
+		{
+			"name":     "upload-sbom",
+			"runAfter": []string{"create-bundle-sbom"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"results": []map[string]interface{}{
+					{
+						"name":        "sbom-url",
+						"description": "URL to view uploaded SBOMs in TPA",
+					},
+				},
 				"steps": []map[string]interface{}{
 					{
 						"name":    "upload-sbom",
@@ -7851,17 +8864,70 @@ TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/t
   -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)" \
   -d "grant_type=client_credentials" | jq -r '.access_token')
 
-# Upload each SBOM
-find /workspace/output/sboms -name "*.spdx.json" | while read sbom; do
-  echo "Uploading $sbom"
-  curl -X POST \
+# Get collection name from working PVC
+COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+
+# Upload image SBOMs first
+UPLOAD_COUNT=0
+find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" | while read sbom; do
+  echo "Uploading image SBOM: $(basename $sbom)"
+  RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
     -H "Authorization: Bearer $TPA_TOKEN" \
     -H "Content-Type: application/json" \
     -d @"$sbom" \
-    "https://$(params.tpa-host)/api/v1/sbom" || echo "Failed to upload $sbom"
+    "https://$(params.tpa-host)/api/v2/sbom")
+
+  HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+    UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+    echo "✓ Successfully uploaded: $(basename $sbom)"
+  else
+    echo "✗ Failed to upload $(basename $sbom) - HTTP $HTTP_CODE"
+  fi
+done
+
+# Upload bundle SBOM last and capture its ID for the result URL
+BUNDLE_SBOM_ID=""
+for bundle_sbom in /workspace/output/sboms/bundle-*.spdx.json; do
+  if [ -f "$bundle_sbom" ]; then
+    echo "Uploading bundle SBOM: $(basename $bundle_sbom)"
+    RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+      -H "Authorization: Bearer $TPA_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d @"$bundle_sbom" \
+      "https://$(params.tpa-host)/api/v2/sbom")
+
+    HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+    RESPONSE_BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
+
+    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+      UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+      # Extract bundle SBOM ID from response
+      BUNDLE_SBOM_ID=$(echo "$RESPONSE_BODY" | jq -r '.id // empty')
+      echo "✓ Successfully uploaded bundle SBOM"
+      echo "Bundle SBOM ID: $BUNDLE_SBOM_ID"
+    else
+      echo "✗ Failed to upload bundle SBOM - HTTP $HTTP_CODE"
+      echo "Response: $RESPONSE_BODY"
+    fi
+  fi
 done
 
 echo "=== SBOM upload complete ==="
+echo "Uploaded $UPLOAD_COUNT SBOMs to TPA"
+
+# Write SBOM URL result - use bundle SBOM ID if available
+if [ -n "$BUNDLE_SBOM_ID" ]; then
+  SBOM_URL="https://$(params.tpa-host)/sboms/${BUNDLE_SBOM_ID}"
+  echo -n "$SBOM_URL" > $(results.sbom-url.path)
+  echo "Bundle SBOM URL: $SBOM_URL"
+else
+  # Fallback to search if no bundle ID
+  SBOM_URL="https://$(params.tpa-host)/sboms?q=${COLLECTION_NAME}"
+  echo -n "$SBOM_URL" > $(results.sbom-url.path)
+  echo "Search URL: $SBOM_URL"
+fi
 `},
 					},
 				},
@@ -7872,11 +8938,312 @@ echo "=== SBOM upload complete ==="
 			},
 		},
 
-		// Task 9: upload-to-s3 (upload artifacts to S3 bucket)
+		// Task 10: export-architect-images (save frontend/backend/plugin images as tarballs from intermediate registry)
+		{
+			"name":     "export-architect-images",
+			"runAfter": []string{"sign-images"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "save-images",
+						"image":   "quay.io/skopeo/stable:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Exporting Airgap Architect images from intermediate registry ==="
+
+# Remove old architect image tarballs if they exist (docker-archive doesn't support overwriting)
+rm -f /workspace/output/airgap-architect-frontend.tar.gz
+rm -f /workspace/output/airgap-architect-backend.tar.gz
+
+# Export from intermediate registry (images were mirrored there as additionalImages)
+INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+
+# Use skopeo to copy images to docker-archive format (compatible with podman load)
+echo "Copying frontend image from intermediate registry..."
+# oc-mirror strips the source registry from the path (quay.io/mathianasj/... -> mathianasj/...)
+FRONTEND_PATH=$(echo "$(params.architect-frontend-image)" | sed 's|^[^/]*/||')
+skopeo copy \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  docker://${INTERMEDIATE_REGISTRY}/${FRONTEND_PATH} \
+  docker-archive:/workspace/output/airgap-architect-frontend.tar.gz:$(params.architect-frontend-image)
+
+echo "Copying backend image from intermediate registry..."
+BACKEND_PATH=$(echo "$(params.architect-backend-image)" | sed 's|^[^/]*/||')
+skopeo copy \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  docker://${INTERMEDIATE_REGISTRY}/${BACKEND_PATH} \
+  docker-archive:/workspace/output/airgap-architect-backend.tar.gz:$(params.architect-backend-image)
+
+echo "Images exported successfully:"
+ls -lh /workspace/output/airgap-architect-*.tar.gz
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "pull-secret"},
+			},
+		},
+
+		// Task 10.5: download-cli-tools (download OpenShift CLI binaries for airgapped use)
+		{
+			"name":     "download-cli-tools",
+			"runAfter": []string{"export-architect-images"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.cli-tools-enabled)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "download-tools",
+						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Downloading OpenShift CLI tools for airgapped bundle ==="
+
+# Create CLI tools directory
+CLI_DIR="/workspace/output/cli-tools"
+mkdir -p "$CLI_DIR"
+
+# Determine versions (default to latest stable if not specified)
+OC_VERSION="$(params.oc-version)"
+MIRROR_REGISTRY_VERSION="$(params.mirror-registry-version)"
+
+# Base URL for OpenShift clients
+MIRROR_BASE="https://mirror.openshift.com/pub/openshift-v4/clients"
+
+echo "Downloading oc CLI (version: $OC_VERSION)..."
+curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-client-linux.tar.gz" \
+  -o "$CLI_DIR/openshift-client-linux.tar.gz"
+
+echo "Downloading openshift-install (version: $OC_VERSION)..."
+curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-linux.tar.gz" \
+  -o "$CLI_DIR/openshift-install-linux.tar.gz"
+
+echo "Downloading oc-mirror standalone binary..."
+# oc-mirror is in a subdirectory with the version
+OC_MIRROR_URL="${MIRROR_BASE}/ocp/${OC_VERSION}/oc-mirror.tar.gz"
+if ! curl -f -L "$OC_MIRROR_URL" -o "$CLI_DIR/oc-mirror.tar.gz" 2>/dev/null; then
+  # Try alternative location in ocp-dev-preview
+  echo "WARNING: oc-mirror not found in stable, trying dev-preview..."
+  curl -f -L "${MIRROR_BASE}/ocp-dev-preview/latest/oc-mirror.tar.gz" \
+    -o "$CLI_DIR/oc-mirror.tar.gz" || echo "WARNING: oc-mirror download failed, skipping"
+fi
+
+echo "Downloading mirror-registry installer..."
+# mirror-registry is in the cgw path with architecture-specific naming
+if [ "$MIRROR_REGISTRY_VERSION" = "latest" ]; then
+  REGISTRY_URL="https://mirror.openshift.com/pub/cgw/mirror-registry/latest/mirror-registry-amd64.tar.gz"
+else
+  REGISTRY_URL="https://mirror.openshift.com/pub/cgw/mirror-registry/${MIRROR_REGISTRY_VERSION}/mirror-registry-amd64.tar.gz"
+fi
+
+curl -f -L "$REGISTRY_URL" -o "$CLI_DIR/mirror-registry.tar.gz"
+
+echo "Verifying downloads..."
+ls -lh "$CLI_DIR"
+du -sh "$CLI_DIR"
+
+# Validate downloaded files are not error pages (check file size)
+for file in "$CLI_DIR"/*.tar.gz; do
+  if [ -f "$file" ]; then
+    size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
+    if [ "$size" -lt 1000 ]; then
+      echo "WARNING: $(basename $file) is suspiciously small ($size bytes) - likely a download error"
+      echo "Contents:"
+      head -5 "$file"
+      rm -f "$file"
+    fi
+  fi
+done
+
+echo "Valid downloads:"
+ls -lh "$CLI_DIR"
+
+# Fail the task if critical tools are missing
+MISSING_TOOLS=""
+for tool in openshift-client-linux.tar.gz openshift-install-linux.tar.gz oc-mirror.tar.gz mirror-registry.tar.gz; do
+  if [ ! -f "$CLI_DIR/$tool" ]; then
+    MISSING_TOOLS="$MISSING_TOOLS $tool"
+  fi
+done
+
+if [ -n "$MISSING_TOOLS" ]; then
+  echo ""
+  echo "ERROR: Critical CLI tools failed to download:$MISSING_TOOLS"
+  echo "Please check the download URLs or network connectivity"
+  exit 1
+fi
+
+echo ""
+echo "✓ All CLI tools downloaded successfully"
+
+# Create versions manifest for documentation
+cat > "$CLI_DIR/VERSIONS.txt" <<EOF
+OpenShift CLI Tools Bundle
+Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+Included Tools:
+- oc: $OC_VERSION
+- openshift-install: $OC_VERSION
+- oc-mirror: dev-preview
+- mirror-registry: $MIRROR_REGISTRY_VERSION
+
+Usage:
+  Extract all tarballs to get the binaries:
+  tar -xzf openshift-client-linux.tar.gz
+  tar -xzf openshift-install-linux.tar.gz
+  tar -xzf oc-mirror.tar.gz
+  tar -xzf mirror-registry.tar.gz
+
+Mirror Registry Installation:
+  ./mirror-registry install --quayHostname <hostname>
+EOF
+
+echo "=== CLI tools download complete ==="
+cat "$CLI_DIR/VERSIONS.txt"
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+
+		// Task 11: copy-import-script (copy script from ConfigMap to output)
+		{
+			"name":     "copy-import-script",
+			"runAfter": []string{"download-cli-tools"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "copy-script",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Copying Airgap Architect import script to bundle ==="
+cp /workspace/architect-script/import-airgap-architect.sh /workspace/output/import-airgap-architect.sh
+chmod +x /workspace/output/import-airgap-architect.sh
+ls -lh /workspace/output/import-airgap-architect.sh
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "architect-script"},
+			},
+		},
+
+		// Task 12: repackage-bundle (combine oc-mirror output with architect artifacts)
+		{
+			"name":     "repackage-bundle",
+			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "repackage",
+						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Creating bundle with Airgap Architect artifacts ==="
+
+cd /workspace/output
+
+# Copy ImageSetConfiguration from config workspace to output
+if [ -f "/workspace/config/imageset-config.yaml" ]; then
+  echo "Copying ImageSetConfiguration to bundle..."
+  cp /workspace/config/imageset-config.yaml .
+fi
+
+COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar.gz"
+
+# Create archives directory structure
+echo "=== Creating archives directory structure ==="
+mkdir -p archives
+
+# Move mirror tar files to archives/
+echo "=== Moving mirror tar files to archives/ ==="
+OC_MIRROR_BUNDLE=$(ls -1 *.tar 2>/dev/null | head -1 || ls -1 mirror_seq*.tar 2>/dev/null | head -1 || echo "")
+if [ -n "$OC_MIRROR_BUNDLE" ]; then
+  echo "Found oc-mirror bundle: $OC_MIRROR_BUNDLE"
+  mv $OC_MIRROR_BUNDLE archives/
+  # Move all mirror_*.tar files
+  for tarfile in mirror_*.tar; do
+    if [ -f "$tarfile" ]; then
+      mv "$tarfile" archives/
+    fi
+  done
+else
+  echo "WARNING: No oc-mirror .tar bundle found"
+fi
+
+# Build bundle contents list
+# Note: Cache is NOT included - airgapped import builds its own cache
+BUNDLE_CONTENTS="archives airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
+
+# Include ImageSetConfiguration if present
+if [ -f "imageset-config.yaml" ]; then
+  echo "Including ImageSetConfiguration in bundle"
+  BUNDLE_CONTENTS="$BUNDLE_CONTENTS imageset-config.yaml"
+fi
+
+# Include IDMS/ITMS files if present
+if [ -f "idms-oc-mirror.yaml" ]; then
+  BUNDLE_CONTENTS="$BUNDLE_CONTENTS idms-oc-mirror.yaml"
+fi
+if [ -f "itms-oc-mirror.yaml" ]; then
+  BUNDLE_CONTENTS="$BUNDLE_CONTENTS itms-oc-mirror.yaml"
+fi
+
+# Include CLI tools if present
+if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
+  echo "Including CLI tools in bundle"
+  BUNDLE_CONTENTS="$BUNDLE_CONTENTS cli-tools"
+fi
+
+# Create final bundle
+echo "=== Creating final bundle ==="
+tar -czf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
+
+echo "Bundle structure:"
+tar -tzf "$FINAL_BUNDLE_NAME" | head -100
+
+echo "Final bundle created: $FINAL_BUNDLE_NAME"
+ls -lh "$FINAL_BUNDLE_NAME"
+echo "=== Bundle creation complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "config"},
+			},
+		},
+
+		// Task 13: upload-to-s3 (upload artifacts to S3 bucket)
 		{
 			"name":     "upload-to-s3",
-			"runAfter": []string{"upload-sbom", "sign-bundles"},
+			"runAfter": []string{"upload-sbom"},
 			"taskSpec": map[string]interface{}{
+				"results": []map[string]interface{}{
+					{
+						"name":        "bundle-url",
+						"description": "S3 URL to the uploaded bundle",
+					},
+					{
+						"name":        "signature-url",
+						"description": "S3 URL to the bundle signature",
+					},
+				},
 				"steps": []map[string]interface{}{
 					{
 						"name":    "upload-artifacts",
@@ -7889,17 +9256,85 @@ echo "Uploading artifacts to S3..."
 # Collection name from working-pvc-name (format: collection-storage-<name>)
 COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
 
-# Upload all .tar, .sig, and .bundle files
-find /workspace/output -maxdepth 1 \( -name "*.tar" -o -name "*.sig" -o -name "*.bundle" \) | while read file; do
-  FILENAME=$(basename "$file")
-  echo "Uploading $FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
-  aws s3 cp "$file" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
+# Upload only the final complete bundle and its signature/attestation
+BUNDLE_FILE=""
+SIG_FILE=""
+
+# The final bundle is named ${COLLECTION_NAME}-complete.tar.gz from repackage-bundle
+FINAL_BUNDLE="/workspace/output/${COLLECTION_NAME}-complete.tar.gz"
+
+if [ -f "$FINAL_BUNDLE" ]; then
+  BUNDLE_FILENAME="${COLLECTION_NAME}-complete.tar.gz"
+  echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
+  aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
     --region="$(params.s3-region)"
-done
+  BUNDLE_FILE="$BUNDLE_FILENAME"
+
+  # Upload signature if it exists
+  if [ -f "${FINAL_BUNDLE}.sig" ]; then
+    echo "Uploading bundle signature..."
+    aws s3 cp "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
+      --endpoint-url="$(params.s3-endpoint)" \
+      --region="$(params.s3-region)"
+    SIG_FILE="${BUNDLE_FILENAME}.sig"
+  fi
+
+  # Upload attestation bundle if it exists
+  if [ -f "${FINAL_BUNDLE}.bundle" ]; then
+    echo "Uploading bundle attestation..."
+    aws s3 cp "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
+      --endpoint-url="$(params.s3-endpoint)" \
+      --region="$(params.s3-region)"
+  fi
+else
+  echo "ERROR: Final bundle not found at $FINAL_BUNDLE"
+  ls -lh /workspace/output/
+  exit 1
+fi
+
+# Upload bundle SBOM and its signature if they exist
+if [ -f /workspace/output/sboms/bundle-*.spdx.json ]; then
+  for sbomfile in /workspace/output/sboms/bundle-*.spdx.json; do
+    FILENAME=$(basename "$sbomfile")
+    echo "Uploading bundle SBOM: $FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
+    aws s3 cp "$sbomfile" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
+      --endpoint-url="$(params.s3-endpoint)" \
+      --region="$(params.s3-region)"
+
+    # Upload signature if it exists
+    if [ -f "${sbomfile}.sig" ]; then
+      aws s3 cp "${sbomfile}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.sig" \
+        --endpoint-url="$(params.s3-endpoint)" \
+        --region="$(params.s3-region)"
+    fi
+
+    # Upload bundle if it exists
+    if [ -f "${sbomfile}.bundle" ]; then
+      aws s3 cp "${sbomfile}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.bundle" \
+        --endpoint-url="$(params.s3-endpoint)" \
+        --region="$(params.s3-region)"
+    fi
+  done
+fi
 
 echo "=== Upload complete ==="
 aws s3 ls "s3://$(params.s3-bucket)/$COLLECTION_NAME/" --endpoint-url="$(params.s3-endpoint)" --region="$(params.s3-region)"
+
+# Write result URLs
+# Construct S3 URL based on endpoint
+S3_BASE_URL="$(params.s3-endpoint)"
+if [ -n "$BUNDLE_FILE" ]; then
+  BUNDLE_URL="${S3_BASE_URL}/$(params.s3-bucket)/${COLLECTION_NAME}/${BUNDLE_FILE}"
+  echo -n "$BUNDLE_URL" > $(results.bundle-url.path)
+  echo "Bundle URL: $BUNDLE_URL"
+fi
+
+if [ -n "$SIG_FILE" ]; then
+  SIG_URL="${S3_BASE_URL}/$(params.s3-bucket)/${COLLECTION_NAME}/${SIG_FILE}"
+  echo -n "$SIG_URL" > $(results.signature-url.path)
+  echo "Signature URL: $SIG_URL"
+fi
 `},
 						"env": []map[string]interface{}{
 							{

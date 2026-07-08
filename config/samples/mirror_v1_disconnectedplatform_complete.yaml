@@ -1,0 +1,109 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: disconnected-platform-complete
+spec:
+  mode: connected
+  connected:
+    # Collection schedule (every Sunday at 2 AM)
+    collectionSchedule: "0 2 * * 0"
+
+    # Mirror registry destination
+    mirrorRegistry: "quay.example.com/mirror"
+
+    # Storage for collected artifacts (creates ObjectBucketClaim)
+    artifactStorage:
+      size: 500Gi
+      storageClass: openshift-storage.noobaa.io
+
+    # Trigger types for collection pipelines
+    triggerTypes:
+      - scheduled
+      - manual
+
+    # Operator installations via OLM
+    # Channels are set to correct defaults in operator code
+    # Only override if you need a specific version
+    operators:
+      openshiftPipelines:
+        approvalStrategy: Automatic
+
+      keycloak:
+        approvalStrategy: Automatic
+
+      rhtas:
+        approvalStrategy: Automatic
+
+      rhtpa:
+        approvalStrategy: Automatic
+
+      quayOperator:
+        approvalStrategy: Automatic
+
+    # Red Hat Trusted Artifact Signer configuration
+    # Operator manages database automatically
+    rhtas:
+      oidc:
+        # Use managed Keycloak instance
+        managed:
+          enabled: true
+          realm: trusted-artifact-signer
+          certIssuer:
+            name: letsencrypt-production-ec2
+            kind: ClusterIssuer
+
+    # Red Hat Trusted Profile Analyzer configuration
+    # Uses ObjectBucketClaim for S3 storage (created automatically)
+    # Operator manages database automatically
+    rhtpa:
+      storage:
+        type: local
+        size: 20Gi
+
+    # Quay intermediate registry configuration
+    # Operator manages database automatically
+    quay:
+      managed:
+        enabled: true
+        organizationName: mirror
+        storage:
+          type: filesystem
+          size: 100Gi
+          storageClass: gp3
+        certIssuer:
+          name: letsencrypt-production-ec2
+          kind: ClusterIssuer
+        clair:
+          useRedHatVEXOnly: true
+
+  # Airgap Architect console configuration
+  architect:
+    enabled: true
+    frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:latest
+    backendImage: quay.io/mathianasj/openshift-airgap-architect-backend:latest
+    replicas: 2
+    route:
+      host: architect.apps.example.com
+      tls:
+        termination: edge
+    # Optional: custom pull secret
+    # pullSecret:
+    #   name: my-custom-pull-secret
+    # Optional: GitHub token for backend API
+    # githubTokenSecret:
+    #   name: github-token-secret
+    consolePlugin:
+      enabled: true
+      image: quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
+
+  # GitOps configuration
+  gitOps:
+    enabled: true
+    repositoryURL: https://github.com/example/mirror-manifests.git
+    branch: main
+    path: clusters/production
+    credentials:
+      name: git-credentials

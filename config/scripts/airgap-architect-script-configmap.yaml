@@ -1,0 +1,1259 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airgap-architect-import-script
+  namespace: mirror-operator-system
+data:
+  import-airgap-architect.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BUNDLE_DIR="${BUNDLE_DIR:-${SCRIPT_DIR}}"
+    
+    FRONTEND_IMAGE_TAR="${BUNDLE_DIR}/airgap-architect-frontend.tar.gz"
+    BACKEND_IMAGE_TAR="${BUNDLE_DIR}/airgap-architect-backend.tar.gz"
+    
+    FRONTEND_IMAGE="localhost/openshift-airgap-architect-frontend:latest"
+    BACKEND_IMAGE="localhost/openshift-airgap-architect-backend:latest"
+    
+    DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/data}"
+    
+    # CLI tools configuration
+    CLI_TOOLS_DIR="${BUNDLE_DIR}/cli-tools"
+    CLI_INSTALL_DIR="${CLI_INSTALL_DIR:-${HOME}/.local/bin}"
+    
+    # Mirror-registry configuration
+    MIRROR_REGISTRY_INSTALL="${MIRROR_REGISTRY_INSTALL:-prompt}"  # "prompt" | "true" | "false"
+    MIRROR_REGISTRY_DATA_PATH="${MIRROR_REGISTRY_DATA_PATH:-}"
+    MIRROR_REGISTRY_HOSTNAME="${MIRROR_REGISTRY_HOSTNAME:-}"
+    MIRROR_REGISTRY_PORT="${MIRROR_REGISTRY_PORT:-}"
+    MIRROR_REGISTRY_INIT_PASSWORD="${MIRROR_REGISTRY_INIT_PASSWORD:-}"
+    MIRROR_REGISTRY_SSL_CERT="${MIRROR_REGISTRY_SSL_CERT:-}"  # Path to SSL certificate file
+    MIRROR_REGISTRY_SSL_KEY="${MIRROR_REGISTRY_SSL_KEY:-}"    # Path to SSL key file
+    MIRROR_REGISTRY_EXISTING="${MIRROR_REGISTRY_EXISTING:-false}"
+    EXISTING_REGISTRY_URL="${EXISTING_REGISTRY_URL:-}"
+    EXISTING_REGISTRY_USERNAME="${EXISTING_REGISTRY_USERNAME:-}"
+    EXISTING_REGISTRY_PASSWORD="${EXISTING_REGISTRY_PASSWORD:-}"
+    
+    usage() {
+        cat <<EOF
+    Import and run Airgap Architect containers for airgapped environments.
+    
+    Usage:
+        $0 [command] [options]
+    
+    Commands:
+        start           Start Airgap Architect containers (imports images if needed) [default]
+        stop            Stop Airgap Architect containers
+        restart         Restart Airgap Architect containers
+        status          Show status of Airgap Architect containers
+        logs            Show logs from containers
+        mirror          Mirror images from archives to registry using oc-mirror
+        clean           Remove containers and images (preserves data)
+    
+    Options:
+        --bundle-dir DIR    Directory containing image tarballs (default: script directory)
+        --data-dir DIR      Directory for persistent data (default: ~/.local/share/airgap-architect)
+        --help              Show this help message
+    
+    Environment Variables:
+        BUNDLE_DIR                    Same as --bundle-dir
+        DATA_DIR                      Same as --data-dir
+        CLI_INSTALL_DIR               Directory for CLI tools (default: ~/.local/bin)
+        MIRROR_REGISTRY_INSTALL       "prompt" (interactive), "true" (auto-install), "false" (skip) [default: prompt]
+        MIRROR_REGISTRY_HOSTNAME      Hostname for Quay (prompted if not set)
+        MIRROR_REGISTRY_PORT          Port for Quay (prompted if not set, default: 8443)
+        MIRROR_REGISTRY_DATA_PATH     Storage path for Quay data (prompted if not set, default: /opt/quay)
+        MIRROR_REGISTRY_INIT_PASSWORD Initial admin password (prompted if not set, auto-generated if empty)
+        MIRROR_REGISTRY_SSL_CERT      Path to custom SSL certificate file (optional, prompted if not set)
+        MIRROR_REGISTRY_SSL_KEY       Path to custom SSL key file (optional, prompted if not set)
+        MIRROR_REGISTRY_EXISTING      Use existing registry instead of installing (default: false)
+        EXISTING_REGISTRY_URL         URL of existing registry (e.g., registry.example.com:8443)
+        EXISTING_REGISTRY_USERNAME    Username for existing registry
+        EXISTING_REGISTRY_PASSWORD    Password for existing registry
+        MOCK_MODE                     Set to 'true' to enable mock mode (default: false)
+        FEEDBACK_MODE                 Feedback mode: 'github' or 'issue-tracker' (default: github)
+        APP_REPO                      GitHub repository for feedback (default: bstrauss84/openshift-airgap-architect)
+        APP_BRANCH                    Branch for feedback (default: main)
+        VITE_ALLOWED_HOSTS            Comma-separated hostnames for the UI (default: empty)
+    
+    Examples:
+        # Interactive mode (prompts for registry configuration)
+        $0 start
+    
+        # Auto-install mirror-registry with custom config
+        MIRROR_REGISTRY_INSTALL=true \\
+        MIRROR_REGISTRY_HOSTNAME=bastion.lab.local \\
+        MIRROR_REGISTRY_PORT=8443 \\
+        MIRROR_REGISTRY_INIT_PASSWORD=SecurePass123 \\
+        $0 start
+    
+        # Install with custom SSL certificates
+        MIRROR_REGISTRY_INSTALL=true \\
+        MIRROR_REGISTRY_HOSTNAME=registry.example.com \\
+        MIRROR_REGISTRY_SSL_CERT=/path/to/cert.pem \\
+        MIRROR_REGISTRY_SSL_KEY=/path/to/key.pem \\
+        $0 start
+    
+        # Use existing registry (non-interactive)
+        MIRROR_REGISTRY_EXISTING=true \\
+        EXISTING_REGISTRY_URL=registry.example.com:8443 \\
+        EXISTING_REGISTRY_USERNAME=admin \\
+        EXISTING_REGISTRY_PASSWORD=mypassword \\
+        $0 start
+    
+        # Skip registry setup entirely
+        MIRROR_REGISTRY_INSTALL=false $0 start
+    
+        # Install CLI tools to custom directory
+        CLI_INSTALL_DIR=/opt/ocp-tools $0 start
+    
+        # Use custom data directory
+        DATA_DIR=/mnt/large-drive/architect $0 start
+    
+        # View logs
+        $0 logs
+    
+        # Stop and clean up
+        $0 stop
+        $0 clean
+    
+    After starting, the Airgap Architect UI will be available at:
+        http://localhost:5173
+    
+    The backend API will be available at:
+        http://localhost:4000
+    
+    EOF
+    }
+    
+    log() {
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+    }
+    
+    error() {
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
+    }
+    
+    check_podman() {
+        if ! command -v podman &>/dev/null; then
+            error "podman is not installed or not in PATH"
+            error "Install podman: https://podman.io/getting-started/installation"
+            exit 1
+        fi
+    }
+    
+    check_cli_tools() {
+        if [ -d "${CLI_TOOLS_DIR}" ]; then
+            log "CLI tools found in bundle"
+            return 0
+        else
+            log "No CLI tools found in bundle (optional)"
+            return 1
+        fi
+    }
+    
+    install_cli_tools() {
+        if ! check_cli_tools; then
+            return 0
+        fi
+    
+        log "Installing CLI tools to ${CLI_INSTALL_DIR}..."
+    
+        # Create install directory if it doesn't exist
+        mkdir -p "${CLI_INSTALL_DIR}"
+    
+        local temp_dir=$(mktemp -d)
+        local overwrite_all=false
+    
+        # Function to check and prompt for overwriting existing tool
+        check_existing_tool() {
+            local tool_name=$1
+            if command -v "${tool_name}" &>/dev/null && [ "${overwrite_all}" = false ]; then
+                local existing_path=$(which "${tool_name}")
+                log "Found existing '${tool_name}' in PATH: ${existing_path}"
+                echo ""
+                echo "Options:"
+                echo "  [o] Overwrite with bundled version"
+                echo "  [s] Skip installation of ${tool_name}"
+                echo "  [a] Overwrite all (don't ask again)"
+                echo "  [c] Cancel installation"
+                echo ""
+                read -p "Choice [o/s/a/c]: " choice
+                case "${choice}" in
+                    o|O) return 0 ;;
+                    s|S) return 1 ;;
+                    a|A) overwrite_all=true; return 0 ;;
+                    c|C) log "Installation cancelled by user"; return 2 ;;
+                    *) log "Invalid choice, skipping ${tool_name}"; return 1 ;;
+                esac
+            fi
+            return 0
+        }
+    
+        # Extract and install oc and kubectl
+        if [ -f "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" ]; then
+            check_existing_tool "oc"
+            local oc_choice=$?
+            if [ ${oc_choice} -eq 2 ]; then
+                rm -rf "$temp_dir"
+                exit 0
+            fi
+    
+            if [ ${oc_choice} -eq 0 ]; then
+                tar -xzf "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" -C "$temp_dir"
+                if [ -f "$temp_dir/oc" ]; then
+                    cp "$temp_dir/oc" "${CLI_INSTALL_DIR}/oc"
+                    chmod +x "${CLI_INSTALL_DIR}/oc"
+                    log "Installed oc: $(${CLI_INSTALL_DIR}/oc version --client 2>/dev/null || echo 'version check failed')"
+                fi
+                if [ -f "$temp_dir/kubectl" ]; then
+                    cp "$temp_dir/kubectl" "${CLI_INSTALL_DIR}/kubectl"
+                    chmod +x "${CLI_INSTALL_DIR}/kubectl"
+                fi
+                rm -f "$temp_dir/oc" "$temp_dir/kubectl"
+            fi
+        fi
+    
+        # Extract and install openshift-install
+        if [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
+            check_existing_tool "openshift-install"
+            local install_choice=$?
+            if [ ${install_choice} -eq 2 ]; then
+                rm -rf "$temp_dir"
+                exit 0
+            fi
+    
+            if [ ${install_choice} -eq 0 ]; then
+                tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir"
+                if [ -f "$temp_dir/openshift-install" ]; then
+                    cp "$temp_dir/openshift-install" "${CLI_INSTALL_DIR}/openshift-install"
+                    chmod +x "${CLI_INSTALL_DIR}/openshift-install"
+                    log "Installed openshift-install: $(${CLI_INSTALL_DIR}/openshift-install version 2>/dev/null | head -1 || echo 'version check failed')"
+                fi
+                rm -f "$temp_dir/openshift-install"
+            fi
+        fi
+    
+        # Extract and install oc-mirror
+        if [ -f "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" ]; then
+            check_existing_tool "oc-mirror"
+            local mirror_choice=$?
+            if [ ${mirror_choice} -eq 2 ]; then
+                rm -rf "$temp_dir"
+                exit 0
+            fi
+    
+            if [ ${mirror_choice} -eq 0 ]; then
+                # Try different extraction methods
+                if tar -xzf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                    : # Success with gzip
+                elif tar -xf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                    log "Note: oc-mirror.tar.gz was not gzipped"
+                elif file "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" 2>/dev/null | grep -q "executable"; then
+                    # It's actually just the binary, not a tar at all
+                    cp "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" "$temp_dir/oc-mirror"
+                    log "Note: oc-mirror.tar.gz was the binary itself, not an archive"
+                else
+                    log "WARNING: Could not extract oc-mirror.tar.gz, skipping"
+                fi
+    
+                if [ -f "$temp_dir/oc-mirror" ]; then
+                    cp "$temp_dir/oc-mirror" "${CLI_INSTALL_DIR}/oc-mirror"
+                    chmod +x "${CLI_INSTALL_DIR}/oc-mirror"
+                    log "Installed oc-mirror"
+                fi
+                rm -f "$temp_dir/oc-mirror"
+            fi
+        fi
+    
+        rm -rf "$temp_dir"
+    
+        # Check if CLI_INSTALL_DIR is in PATH
+        if ! echo "$PATH" | grep -q "${CLI_INSTALL_DIR}"; then
+            log ""
+            log "WARNING: ${CLI_INSTALL_DIR} is not in your PATH"
+            echo ""
+            echo "To use the CLI tools, add ${CLI_INSTALL_DIR} to your PATH:"
+            echo ""
+    
+            # Detect shell
+            if [ -n "${BASH_VERSION}" ] && [ -f "${HOME}/.bashrc" ]; then
+                read -p "Add to ~/.bashrc? [y/N]: " add_path
+                if [ "${add_path}" = "y" ] || [ "${add_path}" = "Y" ]; then
+                    echo "" >> "${HOME}/.bashrc"
+                    echo "# Added by airgap-architect import script" >> "${HOME}/.bashrc"
+                    echo "export PATH=\"${CLI_INSTALL_DIR}:\$PATH\"" >> "${HOME}/.bashrc"
+                    log "Added to ~/.bashrc - run 'source ~/.bashrc' or restart your shell"
+                fi
+            elif [ -n "${ZSH_VERSION}" ] && [ -f "${HOME}/.zshrc" ]; then
+                read -p "Add to ~/.zshrc? [y/N]: " add_path
+                if [ "${add_path}" = "y" ] || [ "${add_path}" = "Y" ]; then
+                    echo "" >> "${HOME}/.zshrc"
+                    echo "# Added by airgap-architect import script" >> "${HOME}/.zshrc"
+                    echo "export PATH=\"${CLI_INSTALL_DIR}:\$PATH\"" >> "${HOME}/.zshrc"
+                    log "Added to ~/.zshrc - run 'source ~/.zshrc' or restart your shell"
+                fi
+            else
+                echo "  export PATH=\"${CLI_INSTALL_DIR}:\$PATH\""
+                echo ""
+            fi
+        fi
+    
+        log "CLI tools installation complete"
+    }
+    
+    create_cli_symlinks() {
+        log "Creating symbolic links to CLI tools in script directory..."
+    
+        local created_links=false
+    
+        # Create symlinks for each installed tool
+        for tool in oc kubectl openshift-install oc-mirror; do
+            if command -v "${tool}" &>/dev/null; then
+                local tool_path=$(which "${tool}")
+                local link_path="${SCRIPT_DIR}/${tool}"
+    
+                # Remove existing symlink or file if it exists
+                if [ -L "${link_path}" ] || [ -f "${link_path}" ]; then
+                    rm -f "${link_path}"
+                fi
+    
+                # Create symlink
+                if ln -s "${tool_path}" "${link_path}" 2>/dev/null; then
+                    log "  Created symlink: ${tool} -> ${tool_path}"
+                    created_links=true
+                else
+                    log "  WARNING: Could not create symlink for ${tool}"
+                fi
+            fi
+        done
+    
+        if [ "${created_links}" = false ]; then
+            log "  No CLI tools found to link"
+        fi
+    }
+    
+    check_images_exist() {
+        local frontend_exists=false
+        local backend_exists=false
+    
+        if podman images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${FRONTEND_IMAGE}\$"; then
+            frontend_exists=true
+        fi
+    
+        if podman images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${BACKEND_IMAGE}\$"; then
+            backend_exists=true
+        fi
+    
+        if [ "$frontend_exists" = true ] && [ "$backend_exists" = true ]; then
+            return 0
+        else
+            return 1
+        fi
+    }
+    
+    import_images() {
+        log "Importing Airgap Architect images from tarballs..."
+    
+        if [ ! -f "${FRONTEND_IMAGE_TAR}" ]; then
+            error "Frontend image tarball not found: ${FRONTEND_IMAGE_TAR}"
+            exit 1
+        fi
+    
+        if [ ! -f "${BACKEND_IMAGE_TAR}" ]; then
+            error "Backend image tarball not found: ${BACKEND_IMAGE_TAR}"
+            exit 1
+        fi
+    
+        log "Importing frontend image..."
+        LOADED_FRONTEND=$(podman load -i "${FRONTEND_IMAGE_TAR}" | grep -oP 'Loaded image: \K.*' | head -1)
+        if [ -n "$LOADED_FRONTEND" ] && [ "$LOADED_FRONTEND" != "$FRONTEND_IMAGE" ]; then
+            log "Tagging $LOADED_FRONTEND as $FRONTEND_IMAGE"
+            podman tag "$LOADED_FRONTEND" "$FRONTEND_IMAGE"
+        fi
+    
+        log "Importing backend image..."
+        LOADED_BACKEND=$(podman load -i "${BACKEND_IMAGE_TAR}" | grep -oP 'Loaded image: \K.*' | head -1)
+        if [ -n "$LOADED_BACKEND" ] && [ "$LOADED_BACKEND" != "$BACKEND_IMAGE" ]; then
+            log "Tagging $LOADED_BACKEND as $BACKEND_IMAGE"
+            podman tag "$LOADED_BACKEND" "$BACKEND_IMAGE"
+        fi
+    
+        log "Images imported and tagged successfully"
+    }
+    
+    load_existing_registry_config() {
+        # Check both collection folder and user's home config directory
+        local config_file=""
+        local config_dir="${HOME}/.config/airgap-architect"
+    
+        # Try user's home config first (persists even if collection folder deleted)
+        if [ -f "${config_dir}/mirror-registry-config.json" ]; then
+            config_file="${config_dir}/mirror-registry-config.json"
+            log "Found existing registry configuration in user config: ${config_file}"
+        elif [ -f "${DATA_DIR}/mirror-registry-config.json" ]; then
+            config_file="${DATA_DIR}/mirror-registry-config.json"
+            log "Found existing registry configuration in collection folder: ${config_file}"
+        else
+            return 1
+        fi
+    
+        # Parse JSON config using grep/sed (avoid jq dependency)
+        MIRROR_REGISTRY_HOSTNAME=$(grep -o '"hostname": *"[^"]*"' "${config_file}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+        MIRROR_REGISTRY_PORT=$(grep -o '"port": *[0-9]*' "${config_file}" | sed 's/.*: *\([0-9]*\).*/\1/')
+        local registry_type=$(grep -o '"type": *"[^"]*"' "${config_file}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+    
+        if [ -n "${MIRROR_REGISTRY_HOSTNAME}" ] && [ -n "${MIRROR_REGISTRY_PORT}" ]; then
+            if [ "${registry_type}" = "external" ]; then
+                log "Loaded external registry config: ${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}"
+                MIRROR_REGISTRY_EXISTING="true"
+                MIRROR_REGISTRY_INSTALL="false"
+            else
+                log "Loaded mirror-registry config: ${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}"
+                MIRROR_REGISTRY_INSTALL="false"  # Don't reinstall
+            fi
+            return 0
+        fi
+    
+        return 1
+    }
+    
+    check_mirror_registry() {
+        # Check if mirror-registry is already running
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet quay-pod.service 2>/dev/null; then
+            log "Mirror-registry is already running (systemd)"
+            return 0
+        fi
+    
+        # Check if podman containers exist
+        if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^quay$'; then
+            log "Mirror-registry container exists"
+            return 0
+        fi
+    
+        return 1
+    }
+    
+    prompt_for_registry_config() {
+        if [ "${MIRROR_REGISTRY_INSTALL}" != "prompt" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "=== Container Registry Configuration ==="
+        log ""
+        log "This bundle requires a container registry to store mirrored images."
+        log ""
+        echo "Options:"
+        echo "  [i] Install mirror-registry (Quay) on this host"
+        echo "  [e] Use an existing registry"
+        echo "  [s] Skip registry setup (configure manually later)"
+        echo ""
+        read -p "Choice [i/e/s]: " registry_choice
+    
+        case "${registry_choice}" in
+            i|I)
+                log "--- Installing Mirror-Registry ---"
+                log ""
+    
+                # Prompt for configuration
+                read -p "Hostname [$(hostname -f)]: " input_hostname
+                MIRROR_REGISTRY_HOSTNAME="${input_hostname:-$(hostname -f)}"
+    
+                read -p "Port [8443]: " input_port
+                MIRROR_REGISTRY_PORT="${input_port:-8443}"
+    
+                read -p "Data storage path [/opt/quay]: " input_path
+                MIRROR_REGISTRY_DATA_PATH="${input_path:-/opt/quay}"
+    
+                read -s -p "Initial admin password (leave empty to auto-generate): " input_password
+                echo ""
+                MIRROR_REGISTRY_INIT_PASSWORD="${input_password}"
+    
+                # Ask about SSL certificates
+                echo ""
+                read -p "Provide custom SSL certificate? (y/N): " use_custom_ssl
+                if [ "${use_custom_ssl}" = "y" ] || [ "${use_custom_ssl}" = "Y" ]; then
+                    read -p "Path to SSL certificate file: " MIRROR_REGISTRY_SSL_CERT
+                    read -p "Path to SSL key file: " MIRROR_REGISTRY_SSL_KEY
+    
+                    # Validate certificate files exist
+                    if [ ! -f "${MIRROR_REGISTRY_SSL_CERT}" ]; then
+                        error "Certificate file not found: ${MIRROR_REGISTRY_SSL_CERT}"
+                        exit 1
+                    fi
+                    if [ ! -f "${MIRROR_REGISTRY_SSL_KEY}" ]; then
+                        error "Key file not found: ${MIRROR_REGISTRY_SSL_KEY}"
+                        exit 1
+                    fi
+                    log "Will use custom SSL certificate"
+                else
+                    log "Will use self-signed certificate (auto-generated)"
+                fi
+    
+                MIRROR_REGISTRY_INSTALL="true"
+                ;;
+    
+            e|E)
+                log "--- Configure Existing Registry ---"
+                log ""
+    
+                local retry_count=0
+                local max_retries=3
+    
+                while [ ${retry_count} -lt ${max_retries} ]; do
+                    read -p "Registry URL (hostname:port): " EXISTING_REGISTRY_URL
+                    read -p "Username: " EXISTING_REGISTRY_USERNAME
+                    read -s -p "Password: " EXISTING_REGISTRY_PASSWORD
+                    echo ""
+    
+                    log "Testing connection..."
+                    if podman login --tls-verify=false "${EXISTING_REGISTRY_URL}" \
+                        -u "${EXISTING_REGISTRY_USERNAME}" \
+                        -p "${EXISTING_REGISTRY_PASSWORD}" &>/dev/null; then
+                        log "✓ Successfully authenticated to ${EXISTING_REGISTRY_URL}"
+                        MIRROR_REGISTRY_EXISTING="true"
+                        MIRROR_REGISTRY_INSTALL="false"
+                        return 0
+                    else
+                        retry_count=$((retry_count + 1))
+                        if [ ${retry_count} -lt ${max_retries} ]; then
+                            error "Authentication failed. Please try again (${retry_count}/${max_retries})"
+                        else
+                            error "Authentication failed after ${max_retries} attempts"
+                            log "Exiting..."
+                            exit 1
+                        fi
+                    fi
+                done
+                ;;
+    
+            s|S)
+                log ""
+                log "⚠ WARNING: No registry configured."
+                log "You will need to configure a container registry manually before importing images."
+                log ""
+                read -p "Continue anyway? [y/N]: " confirm
+                if [ "${confirm}" != "y" ] && [ "${confirm}" != "Y" ]; then
+                    log "Exiting..."
+                    exit 0
+                fi
+                MIRROR_REGISTRY_INSTALL="false"
+                ;;
+    
+            *)
+                error "Invalid choice"
+                exit 1
+                ;;
+        esac
+    }
+    
+    install_mirror_registry() {
+        if [ "${MIRROR_REGISTRY_INSTALL}" != "true" ]; then
+            return 0
+        fi
+    
+        if ! check_cli_tools; then
+            log "CLI tools not found, skipping mirror-registry installation"
+            return 0
+        fi
+    
+        if [ ! -f "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" ]; then
+            log "mirror-registry.tar.gz not found, skipping installation"
+            MIRROR_REGISTRY_INSTALL="false"  # Set to false so we don't wait for it
+            return 0
+        fi
+    
+        if check_mirror_registry; then
+            log "Mirror-registry already installed, skipping"
+            return 0
+        fi
+    
+        log ""
+        log "=== Installing Mirror-Registry ==="
+        log ""
+    
+        # Extract mirror-registry installer
+        local temp_dir=$(mktemp -d)
+    
+        # Try different extraction methods
+        if tar -xzf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+            log "Extracted mirror-registry (gzipped tar)"
+        elif tar -xf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+            log "Extracted mirror-registry (uncompressed tar)"
+        elif file "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" 2>/dev/null | grep -q "executable"; then
+            # It's the binary itself
+            cp "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" "$temp_dir/mirror-registry"
+            log "mirror-registry.tar.gz was the binary itself"
+        else
+            error "Failed to extract mirror-registry.tar.gz"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    
+        # Use prompted or environment-configured values
+        MIRROR_REGISTRY_HOSTNAME="${MIRROR_REGISTRY_HOSTNAME:-$(hostname -f)}"
+        MIRROR_REGISTRY_PORT="${MIRROR_REGISTRY_PORT:-8443}"
+        MIRROR_REGISTRY_DATA_PATH="${MIRROR_REGISTRY_DATA_PATH:-/opt/quay}"
+    
+        # Generate init password if not provided
+        if [ -z "${MIRROR_REGISTRY_INIT_PASSWORD}" ]; then
+            MIRROR_REGISTRY_INIT_PASSWORD=$(openssl rand -base64 12 2>/dev/null || cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 12 | head -n 1)
+            log "Generated random init password for Quay"
+        fi
+    
+        log "Running mirror-registry installer..."
+        log "  Hostname: ${MIRROR_REGISTRY_HOSTNAME}"
+        log "  Port: ${MIRROR_REGISTRY_PORT}"
+        log "  Data path: ${MIRROR_REGISTRY_DATA_PATH}"
+    
+        # Prepare SSL certificate arguments
+        local ssl_cert_arg=""
+        local ssl_key_arg=""
+        local using_custom_ssl=false
+    
+        if [ -n "${MIRROR_REGISTRY_SSL_CERT}" ] && [ -f "${MIRROR_REGISTRY_SSL_CERT}" ] && \
+           [ -n "${MIRROR_REGISTRY_SSL_KEY}" ] && [ -f "${MIRROR_REGISTRY_SSL_KEY}" ]; then
+            ssl_cert_arg="${MIRROR_REGISTRY_SSL_CERT}"
+            ssl_key_arg="${MIRROR_REGISTRY_SSL_KEY}"
+            using_custom_ssl=true
+            log "  SSL: Custom certificate"
+        else
+            ssl_cert_arg=""
+            ssl_key_arg=""
+            log "  SSL: Self-signed (auto-generated)"
+        fi
+    
+        cd "$temp_dir"
+    
+        # Make mirror-registry executable if it exists
+        if [ -f "./mirror-registry" ]; then
+            chmod +x ./mirror-registry
+        fi
+    
+        if ! ./mirror-registry install \
+            --quayHostname "${MIRROR_REGISTRY_HOSTNAME}" \
+            --quayRoot "${MIRROR_REGISTRY_DATA_PATH}" \
+            --initPassword "${MIRROR_REGISTRY_INIT_PASSWORD}" \
+            --sslCert "${ssl_cert_arg}" \
+            --sslKey "${ssl_key_arg}"; then
+            error "Mirror-registry installation failed"
+            cd -
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    
+        cd -
+        rm -rf "$temp_dir"
+    
+        log ""
+        log "✓ Mirror-registry installed successfully"
+        log "  Admin user: init"
+        log "  Admin password: ${MIRROR_REGISTRY_INIT_PASSWORD}"
+        log "  URL: https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}"
+        log ""
+    
+        # Define config directory in user's home (persists even if collection folder deleted)
+        local config_dir="${HOME}/.config/airgap-architect"
+        mkdir -p "${config_dir}"
+    
+        # Save credentials and connection details to both locations
+        # 1. Collection folder (DATA_DIR) - accessible to backend container
+        # 2. User's home config - persists even if collection folder deleted
+        mkdir -p "${DATA_DIR}"
+    
+        # Save credentials in text format to BOTH locations
+        for target_dir in "${DATA_DIR}" "${config_dir}"; do
+            cat > "${target_dir}/mirror-registry-credentials.txt" <<EOF
+    Mirror Registry Credentials
+    Generated: $(date)
+    
+    URL: https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}
+    Username: init
+    Password: ${MIRROR_REGISTRY_INIT_PASSWORD}
+    
+    Podman login command:
+    podman login --tls-verify=false ${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT} -u init -p ${MIRROR_REGISTRY_INIT_PASSWORD}
+    EOF
+            chmod 600 "${target_dir}/mirror-registry-credentials.txt"
+        done
+    
+        # Create JSON file for Airgap Architect to consume in BOTH locations
+        for target_dir in "${DATA_DIR}" "${config_dir}"; do
+            cat > "${target_dir}/mirror-registry-config.json" <<EOF
+    {
+      "url": "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}",
+      "hostname": "${MIRROR_REGISTRY_HOSTNAME}",
+      "port": ${MIRROR_REGISTRY_PORT},
+      "username": "init",
+      "password": "${MIRROR_REGISTRY_INIT_PASSWORD}",
+      "tlsVerify": false,
+      "installedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+      "dataPath": "${MIRROR_REGISTRY_DATA_PATH}",
+      "type": "quay"
+    }
+    EOF
+            chmod 600 "${target_dir}/mirror-registry-config.json"
+        done
+    
+        # Copy CA certificate if it exists (mirror-registry generates it)
+        local ca_cert_path=""
+        local tls_verify="false"
+        local ssl_type="self-signed"
+    
+        if [ "${using_custom_ssl}" = true ]; then
+            ssl_type="custom"
+            tls_verify="true"
+            # Copy custom certificate for reference to BOTH locations
+            if [ -f "${MIRROR_REGISTRY_SSL_CERT}" ]; then
+                cp "${MIRROR_REGISTRY_SSL_CERT}" "${DATA_DIR}/mirror-registry-cert.pem"
+                cp "${MIRROR_REGISTRY_SSL_CERT}" "${config_dir}/mirror-registry-cert.pem"
+                ca_cert_path="${DATA_DIR}/mirror-registry-cert.pem"
+            fi
+        elif [ -f "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" ]; then
+            cp "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" "${DATA_DIR}/mirror-registry-ca.pem"
+            cp "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" "${config_dir}/mirror-registry-ca.pem"
+            ca_cert_path="${DATA_DIR}/mirror-registry-ca.pem"
+            log "CA certificate copied to ${DATA_DIR}/mirror-registry-ca.pem"
+            log "CA certificate also saved to ${config_dir}/mirror-registry-ca.pem"
+        fi
+    
+        # Write JSON config with CA path if available to BOTH locations
+        if [ -n "${ca_cert_path}" ]; then
+            for target_dir in "${DATA_DIR}" "${config_dir}"; do
+                local target_ca_path="${target_dir}/mirror-registry-ca.pem"
+                if [ "${using_custom_ssl}" = true ]; then
+                    target_ca_path="${target_dir}/mirror-registry-cert.pem"
+                fi
+                cat > "${target_dir}/mirror-registry-config.json" <<EOF
+    {
+      "url": "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}",
+      "hostname": "${MIRROR_REGISTRY_HOSTNAME}",
+      "port": ${MIRROR_REGISTRY_PORT},
+      "username": "init",
+      "password": "${MIRROR_REGISTRY_INIT_PASSWORD}",
+      "tlsVerify": ${tls_verify},
+      "caCertPath": "${target_ca_path}",
+      "sslType": "${ssl_type}",
+      "installedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+      "dataPath": "${MIRROR_REGISTRY_DATA_PATH}",
+      "type": "quay"
+    }
+    EOF
+            done
+        fi
+    
+        log "Registry configuration saved to multiple locations:"
+        log "  Collection folder:"
+        log "    - Credentials: ${DATA_DIR}/mirror-registry-credentials.txt"
+        log "    - JSON config: ${DATA_DIR}/mirror-registry-config.json"
+        if [ -f "${DATA_DIR}/mirror-registry-ca.pem" ]; then
+            log "    - CA cert: ${DATA_DIR}/mirror-registry-ca.pem"
+        fi
+        log "  User config (persists if collection folder deleted):"
+        log "    - Credentials: ${config_dir}/mirror-registry-credentials.txt"
+        log "    - JSON config: ${config_dir}/mirror-registry-config.json"
+        if [ -f "${config_dir}/mirror-registry-ca.pem" ]; then
+            log "    - CA cert: ${config_dir}/mirror-registry-ca.pem"
+        fi
+    
+        return 0
+    }
+    
+    configure_existing_registry() {
+        if [ "${MIRROR_REGISTRY_EXISTING}" != "true" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "=== Configuring Existing Registry Connection ==="
+        log ""
+    
+        # Test connection with podman login (already done in prompt, but verify)
+        if ! podman login --tls-verify=false "${EXISTING_REGISTRY_URL}" \
+            -u "${EXISTING_REGISTRY_USERNAME}" \
+            -p "${EXISTING_REGISTRY_PASSWORD}" &>/dev/null; then
+            error "Failed to authenticate to existing registry"
+            return 1
+        fi
+    
+        log "✓ Connected to existing registry: ${EXISTING_REGISTRY_URL}"
+    
+        # Define config directory in user's home (persists even if collection folder deleted)
+        local config_dir="${HOME}/.config/airgap-architect"
+        mkdir -p "${config_dir}"
+        mkdir -p "${DATA_DIR}"
+    
+        # Save reference for documentation to BOTH locations
+        for target_dir in "${DATA_DIR}" "${config_dir}"; do
+            cat > "${target_dir}/mirror-registry-external.txt" <<EOF
+    External Mirror Registry Configuration
+    Connected: $(date)
+    
+    Registry URL: ${EXISTING_REGISTRY_URL}
+    Username: ${EXISTING_REGISTRY_USERNAME}
+    
+    Note: Credentials are stored in podman auth.json
+    EOF
+            chmod 600 "${target_dir}/mirror-registry-external.txt"
+        done
+    
+        # Create JSON file for Airgap Architect to consume
+        # Parse hostname and port from URL
+        REGISTRY_HOST=$(echo "${EXISTING_REGISTRY_URL}" | cut -d: -f1)
+        REGISTRY_PORT=$(echo "${EXISTING_REGISTRY_URL}" | cut -d: -f2)
+        if [ "${REGISTRY_PORT}" = "${REGISTRY_HOST}" ]; then
+            REGISTRY_PORT="443"  # Default HTTPS port
+        fi
+    
+        # Save to BOTH locations
+        for target_dir in "${DATA_DIR}" "${config_dir}"; do
+            cat > "${target_dir}/mirror-registry-config.json" <<EOF
+    {
+      "url": "https://${EXISTING_REGISTRY_URL}",
+      "hostname": "${REGISTRY_HOST}",
+      "port": ${REGISTRY_PORT},
+      "username": "${EXISTING_REGISTRY_USERNAME}",
+      "tlsVerify": false,
+      "connectedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+      "type": "external",
+      "note": "Credentials stored in podman auth.json"
+    }
+    EOF
+            chmod 600 "${target_dir}/mirror-registry-config.json"
+        done
+    
+        log "Registry configuration saved to multiple locations:"
+        log "  Collection folder:"
+        log "    - Details: ${DATA_DIR}/mirror-registry-external.txt"
+        log "    - JSON config: ${DATA_DIR}/mirror-registry-config.json"
+        log "  User config (persists if collection folder deleted):"
+        log "    - Details: ${config_dir}/mirror-registry-external.txt"
+        log "    - JSON config: ${config_dir}/mirror-registry-config.json"
+    
+        return 0
+    }
+    
+    wait_for_mirror_registry() {
+        if [ "${MIRROR_REGISTRY_INSTALL}" != "true" ] && [ "${MIRROR_REGISTRY_EXISTING}" != "true" ]; then
+            return 0
+        fi
+    
+        # Only wait if we just installed (not for existing registry)
+        if [ "${MIRROR_REGISTRY_INSTALL}" != "true" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "Waiting for mirror-registry to be ready..."
+        log "This may take 5-10 minutes for initial startup..."
+        local max_wait=600  # 10 minutes
+        local waited=0
+    
+        while [ $waited -lt $max_wait ]; do
+            if curl -k -s "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}/health/instance" >/dev/null 2>&1; then
+                echo ""
+                log "✓ Mirror-registry is ready (took ${waited} seconds)"
+                return 0
+            fi
+            sleep 10
+            waited=$((waited + 10))
+            # Show progress every minute
+            if [ $((waited % 60)) -eq 0 ]; then
+                echo ""
+                log "  Still waiting... ${waited}/${max_wait} seconds elapsed"
+            else
+                echo -n "."
+            fi
+        done
+    
+        echo ""
+        error "Mirror-registry did not become ready within ${max_wait} seconds (${max_wait}/60 minutes)"
+        log "You can check the status with: podman ps -a | grep quay"
+        log "View logs with: podman logs <container-name>"
+        return 1
+    }
+    
+    start_containers() {
+        log "Starting Airgap Architect containers..."
+    
+        # Install CLI tools first
+        install_cli_tools
+    
+        # Create symlinks to CLI tools in script directory
+        create_cli_symlinks
+    
+        # Try to load existing registry configuration from data directory
+        if load_existing_registry_config; then
+            log "Using existing registry configuration - skipping prompts"
+        else
+            # Prompt for registry configuration if needed
+            prompt_for_registry_config
+        fi
+    
+        # Either install mirror-registry or configure existing registry
+        if [ "${MIRROR_REGISTRY_INSTALL}" = "true" ]; then
+            install_mirror_registry
+        elif [ "${MIRROR_REGISTRY_EXISTING}" = "true" ]; then
+            configure_existing_registry
+        fi
+    
+        # Wait for registry to be ready
+        wait_for_mirror_registry
+    
+        # Check if images exist, import if not
+        if ! check_images_exist; then
+            log "Images not found, importing from tarballs..."
+            import_images
+        else
+            log "Images already imported, skipping import"
+        fi
+    
+        mkdir -p "${DATA_DIR}"
+    
+        # Ensure all directories have proper permissions for container to write (recursive)
+        find "${SCRIPT_DIR}" -type d -exec chmod 777 {} \;
+    
+        # Set SELinux context so container can write to script directory
+        if command -v chcon &>/dev/null; then
+            log "Setting SELinux context on ${SCRIPT_DIR} for container access..."
+            chcon -Rt container_file_t "${SCRIPT_DIR}" || log "Warning: chcon failed (SELinux may not be enabled)"
+        fi
+    
+        log "Mounting script directory as backend /data: ${SCRIPT_DIR}"
+    
+        log "Starting backend container..."
+        podman run -d \
+            --name airgap-architect-backend \
+            --replace \
+            --user "$(id -u):$(id -g)" \
+            -e PORT=4000 \
+            -e DATA_DIR=/data \
+            -e MOCK_MODE="${MOCK_MODE:-false}" \
+            -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
+            -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
+            -e APP_BRANCH="${APP_BRANCH:-main}" \
+            -v "${SCRIPT_DIR}:/data:z" \
+            -p 127.0.0.1:4000:4000 \
+            --stop-timeout 3 \
+            "${BACKEND_IMAGE}"
+    
+        log "Waiting for backend to be ready..."
+        sleep 2
+    
+        log "Starting frontend container..."
+        podman run -d \
+            --name airgap-architect-frontend \
+            --replace \
+            -e VITE_API_BASE=http://localhost:4000 \
+            -e VITE_ALLOWED_HOSTS="${VITE_ALLOWED_HOSTS:-}" \
+            -p 127.0.0.1:5173:5173 \
+            --stop-timeout 3 \
+            "${FRONTEND_IMAGE}"
+    
+        log "Containers started successfully"
+        log ""
+        log "Airgap Architect is now running:"
+        log "  Frontend UI: http://localhost:5173"
+        log "  Backend API: http://localhost:4000"
+        log ""
+        log "To view logs: $0 logs"
+        log "To stop:      $0 stop"
+    }
+    
+    stop_containers() {
+        log "Stopping Airgap Architect containers..."
+    
+        if podman ps -a --format '{{.Names}}' | grep -q '^airgap-architect-frontend$'; then
+            log "Stopping frontend..."
+            podman stop airgap-architect-frontend || true
+            podman rm airgap-architect-frontend || true
+        fi
+    
+        if podman ps -a --format '{{.Names}}' | grep -q '^airgap-architect-backend$'; then
+            log "Stopping backend..."
+            podman stop airgap-architect-backend || true
+            podman rm airgap-architect-backend || true
+        fi
+    
+        log "Containers stopped"
+    }
+    
+    restart_containers() {
+        stop_containers
+        start_containers
+    }
+    
+    show_status() {
+        log "Airgap Architect container status:"
+        echo ""
+    
+        if podman ps --format '{{.Names}}' | grep -q '^airgap-architect-backend$'; then
+            echo "✓ Backend:  Running"
+            podman ps --filter name=airgap-architect-backend --format "  - Container: {{.Names}} ({{.Status}})"
+            echo "  - API:       http://localhost:4000"
+        else
+            echo "✗ Backend:  Not running"
+        fi
+    
+        echo ""
+    
+        if podman ps --format '{{.Names}}' | grep -q '^airgap-architect-frontend$'; then
+            echo "✓ Frontend: Running"
+            podman ps --filter name=airgap-architect-frontend --format "  - Container: {{.Names}} ({{.Status}})"
+            echo "  - UI:        http://localhost:5173"
+        else
+            echo "✗ Frontend: Not running"
+        fi
+    
+        echo ""
+    }
+    
+    show_logs() {
+        local container="${1:-}"
+    
+        if [ -z "${container}" ]; then
+            log "Showing logs from all containers..."
+            echo ""
+            echo "=== Backend logs ==="
+            podman logs --tail 50 airgap-architect-backend 2>&1 || echo "Backend not running"
+            echo ""
+            echo "=== Frontend logs ==="
+            podman logs --tail 50 airgap-architect-frontend 2>&1 || echo "Frontend not running"
+        else
+            podman logs -f "airgap-architect-${container}"
+        fi
+    }
+    
+    mirror_to_registry() {
+        log "Mirroring images from archives to registry..."
+    
+        # Check if oc-mirror is available
+        if ! command -v oc-mirror &>/dev/null; then
+            error "oc-mirror is not installed or not in PATH"
+            error "Run '$0 start' first to install CLI tools"
+            exit 1
+        fi
+    
+        # Check if archives directory exists
+        if [ ! -d "${SCRIPT_DIR}/archives" ]; then
+            error "Archives directory not found: ${SCRIPT_DIR}/archives"
+            error "This bundle may not contain mirrored images"
+            exit 1
+        fi
+    
+        # Load registry configuration
+        local registry_config=""
+        local config_dir="${HOME}/.config/airgap-architect"
+    
+        if [ -f "${SCRIPT_DIR}/data/mirror-registry-config.json" ]; then
+            registry_config="${SCRIPT_DIR}/data/mirror-registry-config.json"
+        elif [ -f "${config_dir}/mirror-registry-config.json" ]; then
+            registry_config="${config_dir}/mirror-registry-config.json"
+        else
+            error "No registry configuration found"
+            error "Run '$0 start' first to configure a registry"
+            exit 1
+        fi
+    
+        # Parse registry configuration
+        local registry_hostname=$(grep -o '"hostname": *"[^"]*"' "${registry_config}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+        local registry_port=$(grep -o '"port": *[0-9]*' "${registry_config}" | sed 's/.*: *\([0-9]*\).*/\1/')
+        local registry_url="${registry_hostname}:${registry_port}"
+        local ca_cert_path=$(grep -o '"caCertPath": *"[^"]*"' "${registry_config}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+    
+        log "Using registry: ${registry_url}"
+    
+        # Prepare oc-mirror arguments for TLS and authentication
+        local oc_mirror_args=""
+    
+        # Check for CA certificate - prefer data directory first
+        local ca_cert=""
+        if [ -f "${SCRIPT_DIR}/data/mirror-registry-ca.pem" ]; then
+            ca_cert="${SCRIPT_DIR}/data/mirror-registry-ca.pem"
+        elif [ -f "${config_dir}/mirror-registry-ca.pem" ]; then
+            ca_cert="${config_dir}/mirror-registry-ca.pem"
+        elif [ -n "$ca_cert_path" ] && [ -f "$ca_cert_path" ]; then
+            ca_cert="$ca_cert_path"
+        fi
+    
+        if [ -z "$ca_cert" ]; then
+            error "No CA certificate found for registry"
+            error "Expected CA certificate at: ${SCRIPT_DIR}/data/mirror-registry-ca.pem"
+            error "Cannot proceed without proper TLS verification"
+            exit 1
+        fi
+    
+        log "Using CA certificate for TLS verification: ${ca_cert}"
+    
+        # Set SSL_CERT_FILE environment variable for oc-mirror to use the CA cert
+        export SSL_CERT_FILE="${ca_cert}"
+    
+        # Get credentials from registry config and login to podman
+        local registry_username=$(grep -o '"username": *"[^"]*"' "${registry_config}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+        local registry_password=$(grep -o '"password": *"[^"]*"' "${registry_config}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+    
+        if [ -z "$registry_username" ] || [ -z "$registry_password" ]; then
+            error "Registry credentials not found in ${registry_config}"
+            error "Cannot authenticate to registry"
+            exit 1
+        fi
+    
+        log "Authenticating to registry..."
+        if ! echo "${registry_password}" | podman login --tls-verify=false "${registry_url}" -u "${registry_username}" --password-stdin 2>/dev/null; then
+            error "Failed to authenticate to registry ${registry_url}"
+            error "Username: ${registry_username}"
+            exit 1
+        fi
+    
+        # Find podman auth file for oc-mirror
+        local auth_file=""
+        if [ -f "${XDG_RUNTIME_DIR}/containers/auth.json" ]; then
+            auth_file="${XDG_RUNTIME_DIR}/containers/auth.json"
+        elif [ -f "${HOME}/.config/containers/auth.json" ]; then
+            auth_file="${HOME}/.config/containers/auth.json"
+        elif [ -f "${HOME}/.docker/config.json" ]; then
+            auth_file="${HOME}/.docker/config.json"
+        fi
+    
+        if [ -n "$auth_file" ] && [ -f "$auth_file" ]; then
+            log "Using auth file: ${auth_file}"
+            oc_mirror_args="${oc_mirror_args} --authfile ${auth_file}"
+        else
+            error "Auth file not found after podman login"
+            exit 1
+        fi
+    
+        # Check if archives directory exists and has tar files
+        if [ ! -d "${SCRIPT_DIR}/archives" ]; then
+            error "Archives directory not found: ${SCRIPT_DIR}/archives"
+            exit 1
+        fi
+    
+        # Verify there are mirror tar files
+        local mirror_tar=$(ls -1 "${SCRIPT_DIR}/archives"/mirror_*.tar 2>/dev/null | head -1)
+        if [ -z "$mirror_tar" ]; then
+            error "No oc-mirror tar files found in archives/"
+            exit 1
+        fi
+    
+        log "Found mirror archives in: ${SCRIPT_DIR}/archives"
+        local archives_dir="${SCRIPT_DIR}/archives"
+    
+        # Check if ImageSetConfiguration exists
+        local imageset_config="${SCRIPT_DIR}/imageset-config.yaml"
+        if [ ! -f "${imageset_config}" ]; then
+            error "ImageSetConfiguration not found: ${imageset_config}"
+            error "This file is required for oc-mirror"
+            exit 1
+        fi
+    
+        # Create working directory for mirror
+        local work_dir="${SCRIPT_DIR}/data/oc-mirror-workspace"
+        mkdir -p "${work_dir}"
+    
+        log "Mirroring to ${registry_url}..."
+        log "This may take several minutes depending on the number of images..."
+    
+        # Run oc-mirror from the archives directory to the registry
+        cd "${work_dir}"
+        if oc-mirror --v2 --from "file://${archives_dir}" --config "${imageset_config}" ${oc_mirror_args} "docker://${registry_url}"; then
+            log "✓ Successfully mirrored images to ${registry_url}"
+    
+            # Check for IDMS/ITMS files and display instructions
+            if [ -f "${SCRIPT_DIR}/idms-oc-mirror.yaml" ] || [ -f "${SCRIPT_DIR}/itms-oc-mirror.yaml" ]; then
+                log ""
+                log "Mirror complete! To configure your cluster to use the mirrored content:"
+                log ""
+                if [ -f "${SCRIPT_DIR}/idms-oc-mirror.yaml" ]; then
+                    log "  kubectl apply -f ${SCRIPT_DIR}/idms-oc-mirror.yaml"
+                fi
+                if [ -f "${SCRIPT_DIR}/itms-oc-mirror.yaml" ]; then
+                    log "  kubectl apply -f ${SCRIPT_DIR}/itms-oc-mirror.yaml"
+                fi
+                log ""
+            fi
+        else
+            error "oc-mirror failed"
+            return 1
+        fi
+    
+        cd "${SCRIPT_DIR}"
+    }
+    
+    clean_up() {
+        log "Cleaning up Airgap Architect (preserving data in script directory)..."
+    
+        stop_containers
+    
+        log "Removing images..."
+        podman rmi "${FRONTEND_IMAGE}" 2>/dev/null || true
+        podman rmi "${BACKEND_IMAGE}" 2>/dev/null || true
+    
+        log "Cleanup complete (data preserved in ${SCRIPT_DIR})"
+    }
+    
+    # Parse arguments
+    COMMAND=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --bundle-dir)
+                BUNDLE_DIR="$2"
+                shift 2
+                ;;
+            --data-dir)
+                DATA_DIR="$2"
+                shift 2
+                ;;
+            --help)
+                usage
+                exit 0
+                ;;
+            start|stop|restart|status|logs|mirror|clean)
+                COMMAND="$1"
+                shift
+                break
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Default to start if no command specified
+    COMMAND="${COMMAND:-start}"
+    
+    check_podman
+    
+    case "${COMMAND}" in
+        start)
+            start_containers
+            ;;
+        stop)
+            stop_containers
+            ;;
+        restart)
+            restart_containers
+            ;;
+        status)
+            show_status
+            ;;
+        logs)
+            show_logs "$@"
+            ;;
+        mirror)
+            mirror_to_registry
+            ;;
+        clean)
+            clean_up
+            ;;
+        *)
+            error "Unknown command: ${COMMAND}"
+            usage
+            exit 1
+            ;;
+    esac

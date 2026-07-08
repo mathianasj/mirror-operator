@@ -160,13 +160,21 @@ type RHTPAOIDCConfig struct {
 	ClientSecret string `json:"clientSecret,omitempty"`
 }
 
+type MirrorRegistryConfig struct {
+	// DataPath is the storage path for Quay data (default: /opt/quay)
+	DataPath string `json:"dataPath,omitempty"`
+	// Port is the Quay service port (default: 8443)
+	Port int32 `json:"port,omitempty"`
+}
+
 type AirgappedConfig struct {
-	ManagementCluster   bool                         `json:"managementCluster"`
-	MirrorRegistry      string                       `json:"mirrorRegistry"`
-	BootstrapEnabled    bool                         `json:"bootstrapEnabled"`
-	ImportPath          string                       `json:"importPath,omitempty"`
-	RegistryCredentials *corev1.LocalObjectReference `json:"registryCredentials,omitempty"`
-	RHTAS               *AirgappedRHTASConfig        `json:"rhtas,omitempty"`
+	ManagementCluster    bool                         `json:"managementCluster"`
+	MirrorRegistry       string                       `json:"mirrorRegistry"`
+	BootstrapEnabled     bool                         `json:"bootstrapEnabled"`
+	ImportPath           string                       `json:"importPath,omitempty"`
+	RegistryCredentials  *corev1.LocalObjectReference `json:"registryCredentials,omitempty"`
+	RHTAS                *AirgappedRHTASConfig        `json:"rhtas,omitempty"`
+	MirrorRegistryConfig *MirrorRegistryConfig        `json:"mirrorRegistryConfig,omitempty"`
 }
 
 type AirgappedRHTASConfig struct {

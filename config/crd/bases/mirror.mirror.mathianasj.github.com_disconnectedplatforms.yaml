@@ -49,6 +49,17 @@ spec:
                     type: boolean
                   mirrorRegistry:
                     type: string
+                  mirrorRegistryConfig:
+                    properties:
+                      dataPath:
+                        description: 'DataPath is the storage path for Quay data (default:
+                          /opt/quay)'
+                        type: string
+                      port:
+                        description: 'Port is the Quay service port (default: 8443)'
+                        format: int32
+                        type: integer
+                    type: object
                   registryCredentials:
                     description: |-
                       LocalObjectReference contains enough information to let you locate the

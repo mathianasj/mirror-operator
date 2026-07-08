@@ -254,6 +254,7 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	pr := &pipelinev1.PipelineRun{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: pipeline.Status.PipelineRunRef}, pr)
 	if err != nil {
@@ -276,6 +277,38 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 
 	// Set bundle download URL when collection completes successfully
 	if phase == "Complete" || phase == "Succeeded" {
+		// Always try to get URLs from pipeline results first (to get latest results)
+		bundleURL := ""
+		signatureURL := ""
+		sbomUrl := ""
+
+		// Check for task results in PipelineRun status
+		if pr.Status.Results != nil {
+			for _, result := range pr.Status.Results {
+				if result.Name == "bundle-url" {
+					bundleURL = result.Value.StringVal
+				} else if result.Name == "signature-url" {
+					signatureURL = result.Value.StringVal
+				} else if result.Name == "sbom-url" {
+					sbomUrl = result.Value.StringVal
+					logger.Info("Read sbom-url from PipelineRun result", "sbomUrl", sbomUrl)
+				}
+			}
+		}
+
+		// If results are available, use them (always update from latest PipelineRun)
+		if bundleURL != "" {
+			pipeline.Status.BundleURL = bundleURL
+		}
+		if signatureURL != "" {
+			pipeline.Status.SignatureURL = signatureURL
+		}
+		if sbomUrl != "" {
+			pipeline.Status.SbomUrl = sbomUrl
+			logger.Info("Set pipeline status sbomUrl", "sbomUrl", sbomUrl)
+		}
+
+		// Fallback: construct URL from OBC config if results are not available
 		if pipeline.Status.BundleURL == "" {
 			// Get S3 bucket info from ObjectBucketClaim ConfigMap
 			obcConfigMap := &corev1.ConfigMap{}
@@ -300,8 +333,10 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 				}
 
 				if bucketName != "" && bucketHost != "" {
-					// S3 URL format: https://<bucket-host>/<bucket-name>/<collection-name>/
-					pipeline.Status.BundleURL = fmt.Sprintf("https://%s/%s/%s/", bucketHost, bucketName, pipeline.Name)
+					// S3 URL format for the bundle file
+					bundleName := fmt.Sprintf("%s.tar.gz", pipeline.Name)
+					pipeline.Status.BundleURL = fmt.Sprintf("https://%s/%s/%s/%s", bucketHost, bucketName, pipeline.Name, bundleName)
+					pipeline.Status.SignatureURL = fmt.Sprintf("https://%s/%s/%s/%s.sig", bucketHost, bucketName, pipeline.Name, bundleName)
 				}
 			}
 		}
@@ -386,6 +421,12 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 		return nil, err
 	}
 
+	// Inject Airgap Architect images into the ImageSetConfiguration as additionalImages
+	enrichedConfig, err := r.injectArchitectImages(ctx, pipeline.Spec.ImageSetConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inject architect images: %w", err)
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -394,7 +435,7 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 				*metav1.NewControllerRef(pipeline, mirrorv1.GroupVersion.WithKind("CollectionPipeline")),
 			},
 		},
-		Data: map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+		Data: map[string]string{configMapKey: enrichedConfig},
 	}
 	return cm, r.Create(ctx, cm)
 }
@@ -581,6 +622,47 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "s3-secret-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3SecretName}},
 	)
 
+	// Add Airgap Architect image parameters
+	params = append(params,
+		pipelinev1.Param{Name: "architect-frontend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getArchitectFrontendImage(ctx)}},
+		pipelinev1.Param{Name: "architect-backend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getArchitectBackendImage(ctx)}},
+	)
+
+	// Auto-detect CLI tool versions from ImageSetConfiguration
+	ocVersion := "stable-4.16" // default fallback
+	mirrorRegistryVersion := "latest"
+
+	// Parse the ImageSetConfiguration YAML to find the OCP version
+	var imageSetConfig map[string]interface{}
+	if err := yaml.Unmarshal([]byte(pipeline.Spec.ImageSetConfig), &imageSetConfig); err == nil {
+		// Navigate to mirror.platform.channels[0] for OCP version
+		if mirror, ok := imageSetConfig["mirror"].(map[string]interface{}); ok {
+			if platformConfig, ok := mirror["platform"].(map[string]interface{}); ok {
+				if channels, ok := platformConfig["channels"].([]interface{}); ok && len(channels) > 0 {
+					if channel, ok := channels[0].(map[string]interface{}); ok {
+						// Check for minVersion first (more specific)
+						if minVersion, ok := channel["minVersion"].(string); ok && minVersion != "" {
+							ocVersion = minVersion // e.g., "4.16.15"
+							logger.Info("Detected OCP version from ImageSetConfig minVersion", "version", ocVersion)
+						} else if name, ok := channel["name"].(string); ok {
+							ocVersion = name // e.g., "stable-4.16"
+							logger.Info("Detected OCP version from ImageSetConfig channel name", "version", ocVersion)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		logger.Info("Failed to parse ImageSetConfig for version detection, using default", "error", err, "default", ocVersion)
+	}
+
+	// Add CLI tool version parameters
+	params = append(params,
+		pipelinev1.Param{Name: "oc-version", Value: pipelinev1.ParamValue{Type: "string", StringVal: ocVersion}},
+		pipelinev1.Param{Name: "mirror-registry-version", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRegistryVersion}},
+		pipelinev1.Param{Name: "cli-tools-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: "true"}},
+	)
+
 	// Define workspaces
 	workspaces := []pipelinev1.WorkspaceBinding{
 		{
@@ -633,6 +715,16 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		})
 	}
 
+	// Add Airgap Architect import script workspace
+	workspaces = append(workspaces, pipelinev1.WorkspaceBinding{
+		Name: "architect-script",
+		ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: "airgap-architect-import-script",
+			},
+		},
+	})
+
 	// Set timeout
 	timeout := &metav1.Duration{Duration: 12 * time.Hour}
 	if pipeline.Spec.Timeout != nil {
@@ -678,6 +770,71 @@ func (r *CollectionPipelineReconciler) getMirrorImage() string {
 		return r.MirrorImage
 	}
 	return defaultMirrorImage
+}
+
+func (r *CollectionPipelineReconciler) getArchitectFrontendImage(ctx context.Context) string {
+	platform, err := r.findPlatform(ctx)
+	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.FrontendImage != "" {
+		return platform.Spec.Architect.FrontendImage
+	}
+	return "quay.io/mirror-operator/airgap-architect-frontend:latest"
+}
+
+func (r *CollectionPipelineReconciler) getArchitectBackendImage(ctx context.Context) string {
+	platform, err := r.findPlatform(ctx)
+	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.BackendImage != "" {
+		return platform.Spec.Architect.BackendImage
+	}
+	return "quay.io/mirror-operator/airgap-architect-backend:latest"
+}
+
+func (r *CollectionPipelineReconciler) getArchitectConsolePluginImage(ctx context.Context) string {
+	platform, err := r.findPlatform(ctx)
+	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.ConsolePlugin.Image != "" {
+		return platform.Spec.Architect.ConsolePlugin.Image
+	}
+	return "quay.io/mirror-operator/airgap-architect-console-plugin:latest"
+}
+
+func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context, originalConfigYAML string) (string, error) {
+	// Parse the original ImageSetConfiguration
+	var config ImageSetConfiguration
+	if err := yaml.Unmarshal([]byte(originalConfigYAML), &config); err != nil {
+		return "", fmt.Errorf("failed to parse ImageSetConfiguration: %w", err)
+	}
+
+	// Get architect images from DisconnectedPlatform
+	frontendImage := r.getArchitectFrontendImage(ctx)
+	backendImage := r.getArchitectBackendImage(ctx)
+	pluginImage := r.getArchitectConsolePluginImage(ctx)
+
+	// Initialize additionalImages if nil
+	if config.Mirror.AdditionalImages == nil {
+		config.Mirror.AdditionalImages = []ImageConfig{}
+	}
+
+	// Add architect images if not already present
+	architectImages := []string{frontendImage, backendImage, pluginImage}
+	for _, img := range architectImages {
+		found := false
+		for _, existing := range config.Mirror.AdditionalImages {
+			if existing.Name == img {
+				found = true
+				break
+			}
+		}
+		if !found {
+			config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: img})
+		}
+	}
+
+	// Serialize back to YAML
+	enrichedYAML, err := yaml.Marshal(&config)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal enriched config: %w", err)
+	}
+
+	return string(enrichedYAML), nil
 }
 
 func (r *CollectionPipelineReconciler) getClusterDomain(ctx context.Context) string {
@@ -726,7 +883,6 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 
 	tpa := tpaList.Items[0]
 	tpaUID := tpa.GetUID()
-	tpaNamespace := tpa.GetNamespace()
 
 	// Find TPA Ingress
 	ingressList := &unstructured.UnstructuredList{}
@@ -765,23 +921,17 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 		return "", "", ""
 	}
 
-	// Get Keycloak hostname
-	ingress := &unstructured.Unstructured{}
-	ingress.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "config.openshift.io",
-		Version: "v1",
-		Kind:    "Ingress",
-	})
-	ingress.SetName("cluster")
-	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
-		logger.Error(err, "failed to get cluster ingress")
-		return tpaHostname, "", tpaNamespace
+	// Get OIDC issuer URL from TPA spec
+	oidcIssuer, found, err := unstructured.NestedString(tpa.Object, "spec", "oidc", "issuerUrl")
+	if err != nil || !found || oidcIssuer == "" {
+		logger.Error(err, "failed to get OIDC issuer from TPA spec")
+		return tpaHostname, "", ""
 	}
 
-	domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
-	keycloakHost := "keycloak." + domain
+	// TPA CLI client ID is "cli"
+	oidcClientID := "cli"
 
-	return tpaHostname, keycloakHost, tpaNamespace
+	return tpaHostname, oidcIssuer, oidcClientID
 }
 
 // ImageSetConfiguration represents the oc-mirror v2 configuration structure
