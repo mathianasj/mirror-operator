@@ -1,5 +1,7 @@
 # Reference Architecture Mapping
 
+> See also: [Architecture Guide](architecture.md) for a visual overview of the operator, and the [Documentation Index](README.md) for all available docs.
+
 This document maps the [OCP Disconnected Pipeline Reference Architecture](https://github.com/mathianasj/ocp-disco-pipeline-arch) to the `mirror-operator` implementation. It explains how each concept, component, and pattern from the reference architecture is realized in this operator.
 
 ---
