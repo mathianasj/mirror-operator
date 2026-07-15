@@ -8488,7 +8488,29 @@ blocked = true
 location="cdn03.quay.io"
 blocked = true
 
-# Block other common upstream registries not in IDMS
+# Top-level fallback mirrors for upstream registries blocked in /etc/hosts.
+# Specific IDMS/ITMS entries above take priority (more-specific wins).
+# These catch any references NOT covered by IDMS/ITMS (e.g. catalog indexes
+# referenced by tag that only appear in ITMS, which may not be generated).
+[[registry]]
+location="registry.redhat.io"
+blocked = true
+[[registry.mirror]]
+location="$(params.intermediate-registry)"
+
+[[registry]]
+location="registry.access.redhat.com"
+blocked = true
+[[registry.mirror]]
+location="$(params.intermediate-registry)"
+
+[[registry]]
+location="quay.io"
+blocked = true
+[[registry.mirror]]
+location="$(params.intermediate-registry)"
+
+# Block CDN and other registries (no mirror needed, just block)
 [[registry]]
 location="docker.io"
 blocked = true
