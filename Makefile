@@ -143,7 +143,7 @@ kill: ## Kill any running operator instances
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run ./cmd/main.go || true
 
 .PHONY: restart
 restart: kill run ## Kill existing instances and restart the operator

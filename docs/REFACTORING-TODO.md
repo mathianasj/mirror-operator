@@ -189,7 +189,74 @@ grep -rn "return nil, err$" internal/controller/
 
 ## LOW Priority Tasks
 
-### 5. Group Related Constants into Structs
+### 5. Fix Remaining Reconcile Loops (External System Conflicts)
+
+**Problem**: After fixing unconditional update loops, remaining loops are caused by external systems (OpenShift, Keycloak, Tekton) reverting the operator's changes.
+
+**Date Fixed**: 2026-07-08 (major loops), remaining issues documented below
+
+**Fixed Issues** ✅:
+1. Health probe definitions - Added missing Kubernetes default fields
+2. Client secrets - Compare before updating
+3. OIDC secrets - Compare before updating
+4. OpenShift identity provider - Fixed logic bug (was modifying then comparing)
+5. OIDC redirect URIs - Compare before updating
+6. TPA storage & importers - Compare before updating
+7. Clair VEX config - Compare before updating
+8. Pipeline template - JSON comparison before updating
+9. ConsolePlugin - JSON comparison before updating
+
+**Remaining Issues** 🔍 (need investigation):
+
+#### 5.1. ConsolePlugin CA Certificate Removal
+- **Symptom**: CA certificate keeps getting added by operator, then removed by OpenShift
+- **Current**: No `caCertificate` field
+- **Desired**: Has `caCertificate` with service-ca cert
+- **Location**: `reconcileArchitect()` around line 5630
+- **Next Steps**:
+  - Check if ConsolePlugin API supports caCertificate in this OpenShift version
+  - May need ConfigMap-based CA trust instead
+
+#### 5.2. Keycloak Identity Provider Settings Reset
+- **Symptom**: `clientSecretChanged: true` and `profileModeChanged: true` every reconcile
+- **Current**: Keycloak reverts `clientSecret` and `updateProfileFirstLoginMode`
+- **Location**: `ensureKeycloakIdentityProvider()` around line 6639
+- **Next Steps**:
+  - Check if Keycloak auto-resets these fields
+  - May need to read from Keycloak instead of trying to set
+  - Consider if these updates are necessary
+
+#### 5.3. RHTPA Ingress Hostname Inconsistency ✅ FIXED
+- **Symptom**: Hostname flips between `rhtpa.apps...` and `serverrhtpa.apps...`
+- **Root Cause**: `ensureTrustifyOIDCClient` used wrong GVK (`charts.trustification.dev/v1alpha1`) instead of `rhtpa.io/v1`, causing TPA lookup to fail and falling back to incorrect `appDomain`
+- **Fix**: Updated GVK to `rhtpa.io/v1`, also extended `updateTrustifyRedirectURIs` to cover all OIDC clients (frontend, cli, sbom-uploader)
+- **Date Fixed**: 2026-07-13
+
+#### 5.4. Pipeline Template Spec Size Changes
+- **Symptom**: Spec fluctuates between 55365 and 54645 bytes (720 byte diff)
+- **Location**: `reconcileCollectionPipelineTemplate()` around line 7850
+- **Next Steps**:
+  - Enable verbose logging: `logger.V(2).Info("Pipeline spec diff", ...)`
+  - May be whitespace, ordering, or Tekton adding defaults
+
+**Debug Tools Added**:
+```go
+// Enable verbose logging
+logger.V(1).Info("=== Reconcile triggered ===")
+logger.V(2).Info("Pipeline spec diff", "existing", string(existingJSON), "desired", string(desiredJSON))
+```
+
+**Why This Matters**:
+- Idempotent reconciliation is a Kubernetes operator best practice
+- Reduces unnecessary API calls
+- Prevents race conditions
+- Easier debugging
+
+**Estimated Effort**: 2-3 days
+
+---
+
+### 7. Group Related Constants into Structs
 
 **Problem**: 20+ scattered constants hard to manage.
 
@@ -258,7 +325,39 @@ var Namespaces = NamespaceConfig{
 
 ---
 
-### 6. Add Package Documentation and godoc Comments
+### 8. Make RHTPA PostgreSQL PVC Size Configurable via CRD
+
+**Problem**: The RHTPA PostgreSQL PVC size is hardcoded to 20Gi in `ensureRHTPAPostgreSQL()`. Users should be able to configure this via the `DisconnectedPlatform` CRD spec.
+
+**Current (Hardcoded)**:
+```go
+corev1.ResourceStorage: resource.MustParse("20Gi"),
+```
+
+**Proposed CRD Change**:
+```go
+type RHTPAConfig struct {
+    Storage *RHTPAStorageConfig `json:"storage,omitempty"`
+    // ...existing fields...
+}
+
+type RHTPAStorageConfig struct {
+    // DatabaseSize is the PVC size for the RHTPA PostgreSQL database
+    // +kubebuilder:default="20Gi"
+    DatabaseSize string `json:"databaseSize,omitempty"`
+    // ...existing S3 fields...
+}
+```
+
+**Controller Change**: Read `spec.connected.rhtpa.storage.databaseSize` instead of hardcoded value, with `20Gi` default.
+
+**Context**: The previous 10Gi default caused a disk-full crash loop requiring manual PVC expansion (2026-07-13).
+
+**Estimated Effort**: 0.5 days
+
+---
+
+### 9. Add Package Documentation and godoc Comments
 
 **Problem**: Missing package-level and exported function documentation.
 
@@ -358,9 +457,10 @@ make run
 ### Phase 2: Major Refactor (2-3 weeks)
 4. **Task #1**: Split disconnectedplatform_controller.go (requires planning)
 
-### Phase 3: Polish (1 week)
-5. **Task #5**: Group constants
-6. **Task #6**: Add documentation
+### Phase 3: Polish (1-2 weeks)
+5. **Task #5**: Fix remaining reconcile loops
+6. **Task #7**: Group constants
+7. **Task #8**: Add documentation
 
 **Total Estimated Effort**: 4-6 weeks
 
