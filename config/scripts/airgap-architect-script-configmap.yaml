@@ -21,7 +21,77 @@ data:
     
     # CLI tools configuration
     CLI_TOOLS_DIR="${BUNDLE_DIR}/cli-tools"
-    CLI_INSTALL_DIR="${CLI_INSTALL_DIR:-${HOME}/.local/bin}"
+    
+    # STIG/FIPS compliance settings
+    STIG_MODE="${STIG_MODE:-auto}"  # "auto" | "true" | "false"
+    STIG_DETECTED=false
+    FAPOLICYD_WAS_ACTIVE=false
+    ORIGINAL_UMASK=""
+    
+    # Detect if /home is mounted noexec (DISA STIG FIPS mode)
+    detect_home_noexec() {
+        if mount | grep -E "^.* on ${HOME%/*} " | grep -q noexec; then
+            return 0  # noexec detected
+        fi
+        return 1  # no noexec
+    }
+    
+    # Detect STIG-hardened system
+    detect_stig_mode() {
+        local indicators=0
+    
+        # Check for noexec on /home
+        if detect_home_noexec; then
+            ((indicators++))
+        fi
+    
+        # Check umask (STIG sets to 0077)
+        local current_umask=$(umask)
+        if [ "${current_umask}" = "0077" ]; then
+            ((indicators++))
+        fi
+    
+        # Check if fapolicyd is installed
+        if command -v fapolicyd &>/dev/null || systemctl list-unit-files | grep -q fapolicyd; then
+            ((indicators++))
+        fi
+    
+        # Check max_user_namespaces (STIG sets to 0)
+        if [ -f /proc/sys/user/max_user_namespaces ]; then
+            local max_ns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo "0")
+            if [ "${max_ns}" -eq 0 ] || [ "${max_ns}" -lt 1000 ]; then
+                ((indicators++))
+            fi
+        fi
+    
+        # If 2 or more indicators, likely STIG system
+        if [ ${indicators} -ge 2 ]; then
+            return 0
+        fi
+        return 1
+    }
+    
+    # Apply STIG mode detection
+    if [ "${STIG_MODE}" = "auto" ]; then
+        if detect_stig_mode; then
+            STIG_DETECTED=true
+            STIG_MODE="true"
+        else
+            STIG_MODE="false"
+        fi
+    elif [ "${STIG_MODE}" = "true" ]; then
+        STIG_DETECTED=true
+    fi
+    
+    # Skip ~/.local/bin if /home is noexec or STIG mode
+    if detect_home_noexec || [ "${STIG_DETECTED}" = true ]; then
+        # In STIG mode, prefer /usr/local/bin (requires sudo but works with fapolicyd)
+        CLI_INSTALL_DIR="${CLI_INSTALL_DIR:-/usr/local/bin}"
+        NOEXEC_DETECTED=true
+    else
+        CLI_INSTALL_DIR="${CLI_INSTALL_DIR:-${HOME}/.local/bin}"
+        NOEXEC_DETECTED=false
+    fi
     
     # Mirror-registry configuration
     MIRROR_REGISTRY_INSTALL="${MIRROR_REGISTRY_INSTALL:-prompt}"  # "prompt" | "true" | "false"
@@ -44,13 +114,14 @@ data:
         $0 [command] [options]
     
     Commands:
-        start           Start Airgap Architect containers (imports images if needed) [default]
-        stop            Stop Airgap Architect containers
-        restart         Restart Airgap Architect containers
-        status          Show status of Airgap Architect containers
-        logs            Show logs from containers
-        mirror          Mirror images from archives to registry using oc-mirror
-        clean           Remove containers and images (preserves data)
+        start                   Start Airgap Architect containers (imports images if needed) [default]
+        stop                    Stop Airgap Architect containers
+        restart                 Restart Airgap Architect containers
+        status                  Show status of Airgap Architect containers
+        logs                    Show logs from containers
+        mirror                  Mirror images from archives to registry using oc-mirror
+        clean                   Remove containers and images (preserves data)
+        uninstall-mirror-registry  Uninstall mirror-registry (Quay) from this host
     
     Options:
         --bundle-dir DIR    Directory containing image tarballs (default: script directory)
@@ -60,7 +131,8 @@ data:
     Environment Variables:
         BUNDLE_DIR                    Same as --bundle-dir
         DATA_DIR                      Same as --data-dir
-        CLI_INSTALL_DIR               Directory for CLI tools (default: ~/.local/bin)
+        CLI_INSTALL_DIR               Directory for CLI tools (default: ~/.local/bin, /usr/local/bin in STIG mode)
+        STIG_MODE                     "auto" (detect), "true" (force), "false" (disable) [default: auto]
         MIRROR_REGISTRY_INSTALL       "prompt" (interactive), "true" (auto-install), "false" (skip) [default: prompt]
         MIRROR_REGISTRY_HOSTNAME      Hostname for Quay (prompted if not set)
         MIRROR_REGISTRY_PORT          Port for Quay (prompted if not set, default: 8443)
@@ -109,6 +181,17 @@ data:
         # Install CLI tools to custom directory
         CLI_INSTALL_DIR=/opt/ocp-tools $0 start
     
+        # DISA STIG / FIPS mode (auto-detected)
+        # The script automatically detects STIG-hardened systems and:
+        #   - Installs CLI tools to /usr/local/bin (requires sudo)
+        #   - Temporarily stops/starts fapolicyd
+        #   - Adds tools to fapolicyd trust list
+        #   - Fixes max_user_namespaces for podman
+        #   - Adjusts umask during installation
+        # To force STIG mode on or off:
+        STIG_MODE=true $0 start
+        STIG_MODE=false $0 start
+    
         # Use custom data directory
         DATA_DIR=/mnt/large-drive/architect $0 start
     
@@ -136,6 +219,305 @@ data:
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
     }
     
+    # STIG/FIPS compliance functions
+    
+    # Global variable for sudo keepalive process
+    SUDO_KEEPER_PID=""
+    
+    # Cleanup function on exit
+    cleanup_sudo() {
+        stop_sudo_keepalive
+    }
+    
+    # Register cleanup on exit
+    trap cleanup_sudo EXIT
+    
+    # Prompt user to confirm sudo operation
+    # Usage: confirm_sudo "description" "what it changes"
+    confirm_sudo() {
+        local description="$1"
+        local what_changes="$2"
+    
+        log ""
+        log "Sudo operation required:"
+        log "  What: ${description}"
+        log "  Changes: ${what_changes}"
+        echo -n "Proceed with sudo? [Y/n]: "
+        read -r response
+    
+        case "${response}" in
+            n|N|no|No|NO)
+                log "Skipped by user"
+                return 1
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    }
+    
+    # Wrapper for sudo - just uses regular sudo
+    # Usage: run_sudo <command> [args...]
+    run_sudo() {
+        sudo "$@"
+    }
+    
+    # Execute multiple commands under a single sudo session
+    # Usage: run_sudo_batch <<'EOF'
+    #   command1
+    #   command2
+    #   command3
+    # EOF
+    run_sudo_batch() {
+        sudo bash
+    }
+    
+    # Request and cache sudo credentials upfront in STIG mode
+    request_sudo_access() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "=== Sudo Access Required ==="
+        log "STIG mode requires sudo for the following operations:"
+        log "  • Installing CLI tools to /usr/local/bin"
+        log "  • Managing fapolicyd service"
+        log "  • Configuring user namespaces for podman"
+        log "  • Setting SELinux contexts"
+        log ""
+    
+        # Check if sudo caching is disabled (STIG requirement)
+        local timeout_setting=$(sudo grep -E "^Defaults.*timestamp_timeout" /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep "timestamp_timeout=0" || true)
+    
+        if [ -n "${timeout_setting}" ]; then
+            log "⚠ DETECTED: Sudo credential caching is DISABLED (DISA STIG requirement)"
+            log "  Setting: timestamp_timeout=0"
+            log ""
+            log "This means you will be prompted for your password for EACH sudo operation."
+            log "This is a security requirement and cannot be bypassed."
+            log ""
+            log "Estimated number of password prompts: 10-15"
+            log ""
+            read -p "Continue with multiple password prompts? [Y/n]: " continue_choice
+    
+            if [ "${continue_choice}" = "n" ] || [ "${continue_choice}" = "N" ]; then
+                log "Installation cancelled by user"
+                exit 0
+            fi
+    
+            log ""
+            log "Note: Each sudo operation will prompt for your password."
+        else
+            log "You will be prompted for your sudo password when needed."
+            log "Your password will be cached for subsequent operations."
+            log ""
+        fi
+    
+        # Validate sudo access
+        if ! sudo -v; then
+            error "Failed to obtain sudo access"
+            return 1
+        fi
+    
+        log "✓ Sudo access granted"
+        log ""
+    
+        # Only start keepalive if caching is enabled
+        if [ -z "${timeout_setting}" ]; then
+            # Start a background process to keep sudo alive
+            (
+                while true; do
+                    sleep 30
+                    sudo -n -v 2>/dev/null || exit
+                done
+            ) &
+            SUDO_KEEPER_PID=$!
+            sleep 1
+        else
+            log "Note: Sudo credential caching is disabled - keepalive not started"
+            log ""
+        fi
+    
+        return 0
+    }
+    
+    # Stop the sudo keepalive process
+    stop_sudo_keepalive() {
+        if [ -n "${SUDO_KEEPER_PID}" ]; then
+            kill "${SUDO_KEEPER_PID}" 2>/dev/null || true
+            wait "${SUDO_KEEPER_PID}" 2>/dev/null || true
+            SUDO_KEEPER_PID=""
+        fi
+    }
+    
+    # Temporarily stop fapolicyd if running
+    disable_fapolicyd() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        if systemctl is-active --quiet fapolicyd.service 2>/dev/null; then
+            if confirm_sudo "Stop fapolicyd service" "Temporarily disables file execution policy (will be restarted later)"; then
+                if run_sudo systemctl stop fapolicyd.service; then
+                    FAPOLICYD_WAS_ACTIVE=true
+                    log "✓ fapolicyd stopped"
+                else
+                    error "Failed to stop fapolicyd - installation may fail"
+                    return 1
+                fi
+            else
+                log "WARNING: fapolicyd is still running - installation may fail"
+            fi
+        fi
+        return 0
+    }
+    
+    # Re-enable fapolicyd if it was active
+    enable_fapolicyd() {
+        if [ "${FAPOLICYD_WAS_ACTIVE}" = true ]; then
+            log "STIG mode: Restarting fapolicyd service..."
+            run_sudo systemctl start fapolicyd.service
+            log "✓ fapolicyd restarted"
+        fi
+    }
+    
+    # Add tools to fapolicyd trust list
+    configure_fapolicyd_trust() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        if ! command -v fapolicyd-cli &>/dev/null; then
+            log "fapolicyd not installed, skipping trust configuration"
+            return 0
+        fi
+    
+        log "STIG mode: Adding tools to fapolicyd trust list..."
+    
+        local tools_to_trust=(
+            "/usr/local/bin/oc"
+            "/usr/local/bin/oc-mirror"
+            "/usr/local/bin/openshift-install"
+        )
+    
+        if confirm_sudo "Add CLI tools to fapolicyd trust" "Allows oc, oc-mirror, openshift-install to execute from /usr/local/bin"; then
+            log "  Adding tools to fapolicyd trust..."
+            # Batch all fapolicyd operations in one sudo session
+            sudo bash <<'EOFAP'
+                for tool in /usr/local/bin/oc /usr/local/bin/oc-mirror /usr/local/bin/openshift-install; do
+                    if [ -f "${tool}" ]; then
+                        if fapolicyd-cli --file add "${tool}" 2>&1; then
+                            echo "  ✓ Added: ${tool}"
+                        else
+                            echo "  Warning: Could not add ${tool} (may already exist)"
+                        fi
+                    fi
+                done
+                echo "  Updating fapolicyd database..."
+                if fapolicyd-cli --update 2>&1; then
+                    echo "  ✓ Database updated"
+                else
+                    echo "  Warning: Could not update database (fapolicyd may not be running)"
+                fi
+    EOFAP
+            log "✓ fapolicyd trust configuration complete"
+        fi
+    
+        return 0
+    }
+    
+    # Set temporary umask for file creation
+    set_install_umask() {
+        if [ "${STIG_DETECTED}" = true ]; then
+            ORIGINAL_UMASK=$(umask)
+            # Set umask to 0022 for installation (allows group/other read)
+            umask 0022
+            log "STIG mode: Set umask to 0022 for installation (was ${ORIGINAL_UMASK})"
+        fi
+    }
+    
+    # Restore original umask
+    restore_umask() {
+        if [ -n "${ORIGINAL_UMASK}" ]; then
+            umask "${ORIGINAL_UMASK}"
+            log "STIG mode: Restored umask to ${ORIGINAL_UMASK}"
+        fi
+    }
+    
+    # Fix max_user_namespaces for podman (STIG sets to 0)
+    fix_user_namespaces() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        if [ ! -f /proc/sys/user/max_user_namespaces ]; then
+            return 0
+        fi
+    
+        local max_ns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo "0")
+        if [ "${max_ns}" -lt 62372 ]; then
+            if confirm_sudo "Set user.max_user_namespaces=62372" "Increases kernel limit from ${max_ns} to 62372 (required for rootless podman)"; then
+                if run_sudo sysctl -w user.max_user_namespaces=62372 2>/dev/null; then
+                    log "✓ Set user.max_user_namespaces=62372"
+                else
+                    error "Failed to set max_user_namespaces - podman may fail"
+                    return 1
+                fi
+    
+                # Make it persistent
+                if [ ! -f /etc/sysctl.d/99-user-namespaces.conf ]; then
+                    if confirm_sudo "Create /etc/sysctl.d/99-user-namespaces.conf" "Makes user namespace setting persistent across reboots"; then
+                        echo "user.max_user_namespaces = 62372" | run_sudo tee /etc/sysctl.d/99-user-namespaces.conf >/dev/null
+                        log "✓ Persisted max_user_namespaces configuration"
+                    fi
+                fi
+            else
+                log "WARNING: user namespaces not increased - podman may fail"
+            fi
+        fi
+        return 0
+    }
+    
+    # Run all STIG preparation steps
+    prepare_stig_environment() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "=== DISA STIG / FIPS Mode Detected ==="
+        log "Applying compliance-friendly configuration..."
+        log ""
+    
+        # Request sudo access upfront (single password prompt)
+        request_sudo_access || return 1
+    
+        set_install_umask
+        fix_user_namespaces
+        disable_fapolicyd
+    
+        return 0
+    }
+    
+    # Cleanup STIG environment changes
+    cleanup_stig_environment() {
+        if [ "${STIG_DETECTED}" != "true" ]; then
+            return 0
+        fi
+    
+        log ""
+        log "=== Restoring STIG Environment ==="
+    
+        configure_fapolicyd_trust
+        enable_fapolicyd
+        restore_umask
+        stop_sudo_keepalive
+    
+        log "✓ STIG environment restored"
+        log ""
+    }
+    
     check_podman() {
         if ! command -v podman &>/dev/null; then
             error "podman is not installed or not in PATH"
@@ -159,10 +541,33 @@ data:
             return 0
         fi
     
+        # In STIG mode, inform user about the requirement
+        if [ "${STIG_DETECTED}" = "true" ]; then
+            log "STIG/FIPS mode detected - CLI tools will be installed to ${CLI_INSTALL_DIR}"
+            log "Note: Installation to /usr/local/bin requires sudo for fapolicyd trust"
+        fi
+    
         log "Installing CLI tools to ${CLI_INSTALL_DIR}..."
     
         # Create install directory if it doesn't exist
-        mkdir -p "${CLI_INSTALL_DIR}"
+        local needs_sudo=false
+        if [ ! -d "${CLI_INSTALL_DIR}" ]; then
+            # Check if we need sudo to create the directory
+            local parent_dir=$(dirname "${CLI_INSTALL_DIR}")
+            if [ ! -w "${parent_dir}" ] 2>/dev/null; then
+                needs_sudo=true
+                if confirm_sudo "Create directory ${CLI_INSTALL_DIR}" "Creates system directory for CLI tools"; then
+                    run_sudo mkdir -p "${CLI_INSTALL_DIR}"
+                else
+                    error "Cannot proceed without ${CLI_INSTALL_DIR}"
+                    return 1
+                fi
+            else
+                mkdir -p "${CLI_INSTALL_DIR}"
+            fi
+        elif [ ! -w "${CLI_INSTALL_DIR}" ]; then
+            needs_sudo=true
+        fi
     
         local temp_dir=$(mktemp -d)
         local overwrite_all=false
@@ -203,20 +608,48 @@ data:
     
             if [ ${oc_choice} -eq 0 ]; then
                 tar -xzf "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" -C "$temp_dir"
-                if [ -f "$temp_dir/oc" ]; then
-                    cp "$temp_dir/oc" "${CLI_INSTALL_DIR}/oc"
-                    chmod +x "${CLI_INSTALL_DIR}/oc"
-                    log "Installed oc: $(${CLI_INSTALL_DIR}/oc version --client 2>/dev/null || echo 'version check failed')"
-                fi
-                if [ -f "$temp_dir/kubectl" ]; then
-                    cp "$temp_dir/kubectl" "${CLI_INSTALL_DIR}/kubectl"
-                    chmod +x "${CLI_INSTALL_DIR}/kubectl"
+                # Install oc and kubectl together with a single sudo session
+                if [ -f "$temp_dir/oc" ] || [ -f "$temp_dir/kubectl" ]; then
+                    if [ "${needs_sudo}" = true ]; then
+                        if confirm_sudo "Install oc and kubectl to ${CLI_INSTALL_DIR}" "Copies binaries, sets ownership, applies SELinux labels"; then
+                            # Batch all sudo commands together
+                            sudo bash <<EOSUDO
+                                set -e
+                                if [ -f "$temp_dir/oc" ]; then
+                                    cp "$temp_dir/oc" "${CLI_INSTALL_DIR}/oc"
+                                    chmod +x "${CLI_INSTALL_DIR}/oc"
+                                    if [ "${STIG_DETECTED}" = true ]; then
+                                        chown root:root "${CLI_INSTALL_DIR}/oc"
+                                        chcon -t bin_t "${CLI_INSTALL_DIR}/oc" 2>/dev/null || true
+                                    fi
+                                fi
+                                if [ -f "$temp_dir/kubectl" ]; then
+                                    cp "$temp_dir/kubectl" "${CLI_INSTALL_DIR}/kubectl"
+                                    chmod +x "${CLI_INSTALL_DIR}/kubectl"
+                                    if [ "${STIG_DETECTED}" = true ]; then
+                                        chown root:root "${CLI_INSTALL_DIR}/kubectl"
+                                        chcon -t bin_t "${CLI_INSTALL_DIR}/kubectl" 2>/dev/null || true
+                                    fi
+                                fi
+    EOSUDO
+                            [ -f "$temp_dir/oc" ] && log "✓ Installed oc: $(${CLI_INSTALL_DIR}/oc version --client 2>/dev/null || echo 'version check failed')"
+                            [ -f "$temp_dir/kubectl" ] && log "✓ Installed kubectl"
+                        fi
+                    else
+                        [ -f "$temp_dir/oc" ] && cp "$temp_dir/oc" "${CLI_INSTALL_DIR}/oc" && chmod +x "${CLI_INSTALL_DIR}/oc"
+                        [ -f "$temp_dir/kubectl" ] && cp "$temp_dir/kubectl" "${CLI_INSTALL_DIR}/kubectl" && chmod +x "${CLI_INSTALL_DIR}/kubectl"
+                        [ -f "$temp_dir/oc" ] && log "✓ Installed oc: $(${CLI_INSTALL_DIR}/oc version --client 2>/dev/null || echo 'version check failed')"
+                        [ -f "$temp_dir/kubectl" ] && log "✓ Installed kubectl"
+                    fi
                 fi
                 rm -f "$temp_dir/oc" "$temp_dir/kubectl"
             fi
         fi
     
-        # Extract and install openshift-install
+        # Extract openshift-install and oc-mirror
+        local has_openshift_install=false
+        local has_oc_mirror=false
+    
         if [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
             check_existing_tool "openshift-install"
             local install_choice=$?
@@ -224,19 +657,12 @@ data:
                 rm -rf "$temp_dir"
                 exit 0
             fi
-    
             if [ ${install_choice} -eq 0 ]; then
                 tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir"
-                if [ -f "$temp_dir/openshift-install" ]; then
-                    cp "$temp_dir/openshift-install" "${CLI_INSTALL_DIR}/openshift-install"
-                    chmod +x "${CLI_INSTALL_DIR}/openshift-install"
-                    log "Installed openshift-install: $(${CLI_INSTALL_DIR}/openshift-install version 2>/dev/null | head -1 || echo 'version check failed')"
-                fi
-                rm -f "$temp_dir/openshift-install"
+                [ -f "$temp_dir/openshift-install" ] && has_openshift_install=true
             fi
         fi
     
-        # Extract and install oc-mirror
         if [ -f "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" ]; then
             check_existing_tool "oc-mirror"
             local mirror_choice=$?
@@ -244,7 +670,6 @@ data:
                 rm -rf "$temp_dir"
                 exit 0
             fi
-    
             if [ ${mirror_choice} -eq 0 ]; then
                 # Try different extraction methods
                 if tar -xzf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
@@ -252,23 +677,61 @@ data:
                 elif tar -xf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
                     log "Note: oc-mirror.tar.gz was not gzipped"
                 elif file "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" 2>/dev/null | grep -q "executable"; then
-                    # It's actually just the binary, not a tar at all
                     cp "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" "$temp_dir/oc-mirror"
                     log "Note: oc-mirror.tar.gz was the binary itself, not an archive"
                 else
                     log "WARNING: Could not extract oc-mirror.tar.gz, skipping"
                 fi
+                [ -f "$temp_dir/oc-mirror" ] && has_oc_mirror=true
+            fi
+        fi
     
-                if [ -f "$temp_dir/oc-mirror" ]; then
+        # Install openshift-install and oc-mirror together with single sudo
+        if [ "${has_openshift_install}" = true ] || [ "${has_oc_mirror}" = true ]; then
+            if [ "${needs_sudo}" = true ]; then
+                # Batch both installations in one sudo session
+                sudo bash <<EOSUDO2
+                    set -e
+                    if [ -f "$temp_dir/openshift-install" ]; then
+                        cp "$temp_dir/openshift-install" "${CLI_INSTALL_DIR}/openshift-install"
+                        chmod +x "${CLI_INSTALL_DIR}/openshift-install"
+                        if [ "${STIG_DETECTED}" = true ]; then
+                            chown root:root "${CLI_INSTALL_DIR}/openshift-install"
+                            chcon -t bin_t "${CLI_INSTALL_DIR}/openshift-install" 2>/dev/null || true
+                        fi
+                    fi
+                    if [ -f "$temp_dir/oc-mirror" ]; then
+                        cp "$temp_dir/oc-mirror" "${CLI_INSTALL_DIR}/oc-mirror"
+                        chmod +x "${CLI_INSTALL_DIR}/oc-mirror"
+                        if [ "${STIG_DETECTED}" = true ]; then
+                            chown root:root "${CLI_INSTALL_DIR}/oc-mirror"
+                            chcon -t bin_t "${CLI_INSTALL_DIR}/oc-mirror" 2>/dev/null || true
+                        fi
+                    fi
+    EOSUDO2
+                [ "${has_openshift_install}" = true ] && log "Installed openshift-install: $(${CLI_INSTALL_DIR}/openshift-install version 2>/dev/null | head -1 || echo 'version check failed')"
+                [ "${has_oc_mirror}" = true ] && log "Installed oc-mirror"
+            else
+                if [ "${has_openshift_install}" = true ]; then
+                    cp "$temp_dir/openshift-install" "${CLI_INSTALL_DIR}/openshift-install"
+                    chmod +x "${CLI_INSTALL_DIR}/openshift-install"
+                    log "Installed openshift-install: $(${CLI_INSTALL_DIR}/openshift-install version 2>/dev/null | head -1 || echo 'version check failed')"
+                fi
+                if [ "${has_oc_mirror}" = true ]; then
                     cp "$temp_dir/oc-mirror" "${CLI_INSTALL_DIR}/oc-mirror"
                     chmod +x "${CLI_INSTALL_DIR}/oc-mirror"
                     log "Installed oc-mirror"
                 fi
-                rm -f "$temp_dir/oc-mirror"
             fi
+            rm -f "$temp_dir/openshift-install" "$temp_dir/oc-mirror"
         fi
     
         rm -rf "$temp_dir"
+    
+        # Configure fapolicyd trust in STIG mode
+        if [ "${STIG_DETECTED}" = true ]; then
+            configure_fapolicyd_trust
+        fi
     
         # Check if CLI_INSTALL_DIR is in PATH
         if ! echo "$PATH" | grep -q "${CLI_INSTALL_DIR}"; then
@@ -304,35 +767,213 @@ data:
         log "CLI tools installation complete"
     }
     
+    configure_fapolicyd_trust_for_script_dir() {
+        # Add fapolicyd trust for CLI tools in script directory (STIG mode)
+        if [ "${STIG_DETECTED}" != true ]; then
+            return 0
+        fi
+    
+        if ! command -v fapolicyd-cli &>/dev/null; then
+            log "  fapolicyd not installed, skipping script directory trust configuration"
+            return 0
+        fi
+    
+        # Check if fapolicyd is actually running
+        if ! systemctl is-active --quiet fapolicyd 2>/dev/null && [ ! -e /run/fapolicyd/fapolicyd.fifo ]; then
+            log "  fapolicyd is not running, skipping trust configuration"
+            return 0
+        fi
+    
+        local tools_in_script=()
+        for tool in oc kubectl openshift-install oc-mirror; do
+            if [ -f "${SCRIPT_DIR}/${tool}" ] && [ -x "${SCRIPT_DIR}/${tool}" ]; then
+                tools_in_script+=("${SCRIPT_DIR}/${tool}")
+            fi
+        done
+    
+        if [ ${#tools_in_script[@]} -eq 0 ]; then
+            log "  No CLI tools found in script directory to trust"
+            return 0
+        fi
+    
+        if confirm_sudo "Add script directory CLI tools to fapolicyd trust" "Allows tools in ${SCRIPT_DIR} to execute"; then
+            log "  Adding script directory tools to fapolicyd trust..."
+            # Use sudo to add each tool
+            for tool in "${tools_in_script[@]}"; do
+                if sudo fapolicyd-cli --file add "${tool}" 2>&1 | grep -q -E "added|already"; then
+                    log "  ✓ Added: ${tool}"
+                else
+                    log "  Warning: Could not add ${tool}"
+                fi
+            done
+    
+            # Update fapolicyd database
+            if sudo fapolicyd-cli --update 2>&1; then
+                log "  ✓ fapolicyd database updated"
+            else
+                log "  Warning: Could not update database"
+            fi
+        fi
+    
+        return 0
+    }
+    
     create_cli_symlinks() {
-        log "Creating symbolic links to CLI tools in script directory..."
+        log "Copying CLI tools to script directory for container access..."
     
         local created_links=false
     
-        # Create symlinks for each installed tool
+        # Copy tools to SCRIPT_DIR instead of symlinking (symlinks don't work in containers)
         for tool in oc kubectl openshift-install oc-mirror; do
-            if command -v "${tool}" &>/dev/null; then
-                local tool_path=$(which "${tool}")
-                local link_path="${SCRIPT_DIR}/${tool}"
+            local tool_path=""
+            local dest_path="${SCRIPT_DIR}/${tool}"
     
-                # Remove existing symlink or file if it exists
-                if [ -L "${link_path}" ] || [ -f "${link_path}" ]; then
-                    rm -f "${link_path}"
-                fi
+            # Remove existing file or symlink if it exists
+            if [ -f "${dest_path}" ] || [ -L "${dest_path}" ]; then
+                rm -f "${dest_path}"
+            fi
     
-                # Create symlink
-                if ln -s "${tool_path}" "${link_path}" 2>/dev/null; then
-                    log "  Created symlink: ${tool} -> ${tool_path}"
+            # Check if tool exists in CLI_INSTALL_DIR (if it was installed)
+            if [ -f "${CLI_INSTALL_DIR}/${tool}" ] && [ -x "${CLI_INSTALL_DIR}/${tool}" ]; then
+                tool_path="${CLI_INSTALL_DIR}/${tool}"
+            # Otherwise check if it's in PATH
+            elif command -v "${tool}" &>/dev/null; then
+                tool_path=$(which "${tool}" 2>/dev/null || true)
+            fi
+    
+            # Copy the tool if we found it (instead of symlinking)
+            if [ -n "${tool_path}" ]; then
+                if cp "${tool_path}" "${dest_path}" 2>/dev/null && chmod +x "${dest_path}"; then
+                    log "  Copied: ${tool} -> ${dest_path}"
                     created_links=true
                 else
-                    log "  WARNING: Could not create symlink for ${tool}"
+                    log "  WARNING: Could not copy ${tool}"
                 fi
             fi
         done
     
-        if [ "${created_links}" = false ]; then
-            log "  No CLI tools found to link"
+        # If no tools were found in PATH or CLI_INSTALL_DIR, check if they exist in cli-tools bundle
+        # and extract them directly to SCRIPT_DIR for use
+        if [ "${created_links}" = false ] && [ -d "${CLI_TOOLS_DIR}" ]; then
+            log "  No installed CLI tools found - extracting from bundle to ${SCRIPT_DIR}"
+    
+            # Try to create temp directory - use SCRIPT_DIR if mktemp fails (DISA STIG mode)
+            local temp_dir
+            if ! temp_dir=$(mktemp -d 2>/dev/null); then
+                temp_dir="${SCRIPT_DIR}/.tmp-extract-$$"
+                mkdir -p "${temp_dir}"
+                log "  Using ${temp_dir} for extraction (mktemp unavailable)"
+            fi
+    
+            # Extract oc and kubectl
+            if [ -f "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" ]; then
+                tar -xzf "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" -C "$temp_dir" 2>/dev/null || true
+                if [ -f "$temp_dir/oc" ]; then
+                    cp "$temp_dir/oc" "${SCRIPT_DIR}/oc"
+                    chmod +x "${SCRIPT_DIR}/oc"
+                    log "  Extracted oc to ${SCRIPT_DIR}"
+                    created_links=true
+                fi
+                if [ -f "$temp_dir/kubectl" ]; then
+                    cp "$temp_dir/kubectl" "${SCRIPT_DIR}/kubectl"
+                    chmod +x "${SCRIPT_DIR}/kubectl"
+                    log "  Extracted kubectl to ${SCRIPT_DIR}"
+                    created_links=true
+                fi
+                rm -f "$temp_dir/oc" "$temp_dir/kubectl"
+            fi
+    
+            # Extract openshift-install
+            if [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
+                tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir" 2>/dev/null || true
+                if [ -f "$temp_dir/openshift-install" ]; then
+                    cp "$temp_dir/openshift-install" "${SCRIPT_DIR}/openshift-install"
+                    chmod +x "${SCRIPT_DIR}/openshift-install"
+                    log "  Extracted openshift-install to ${SCRIPT_DIR}"
+                    created_links=true
+                fi
+                rm -f "$temp_dir/openshift-install"
+            fi
+    
+            # Extract oc-mirror
+            if [ -f "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" ]; then
+                # Try different extraction methods
+                if tar -xzf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                    : # Success with gzip
+                elif tar -xf "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                    : # Success without gzip
+                elif file "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" 2>/dev/null | grep -q "executable"; then
+                    # It's actually just the binary, not a tar at all
+                    cp "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" "$temp_dir/oc-mirror"
+                fi
+    
+                if [ -f "$temp_dir/oc-mirror" ]; then
+                    cp "$temp_dir/oc-mirror" "${SCRIPT_DIR}/oc-mirror"
+                    chmod +x "${SCRIPT_DIR}/oc-mirror"
+                    log "  Extracted oc-mirror to ${SCRIPT_DIR}"
+                    created_links=true
+                fi
+                rm -f "$temp_dir/oc-mirror"
+            fi
+    
+            rm -rf "$temp_dir"
         fi
+    
+        if [ "${created_links}" = false ]; then
+            log "  No CLI tools found in PATH, install directory, or bundle"
+        fi
+    
+        # Configure fapolicyd trust for script directory tools in STIG mode
+        configure_fapolicyd_trust_for_script_dir
+    }
+    
+    update_container_config() {
+        # Regenerate container-specific config with container paths for IDMS/ITMS/CA
+        if [ ! -f "${DATA_DIR}/mirror-registry-config.json" ]; then
+            log "No mirror registry config found, skipping container config update"
+            return 0
+        fi
+    
+        log "Updating container-specific config with latest paths..."
+    
+        # Start with a copy of the host config
+        cp "${DATA_DIR}/mirror-registry-config.json" "${DATA_DIR}/mirror-registry-config-container.json"
+    
+        # Update CA cert path to container path if CA exists
+        if [ -f "${DATA_DIR}/mirror-registry-ca.pem" ]; then
+            sed -i.bak "s|\"caCertPath\": *\"[^\"]*\"|\"caCertPath\": \"/data/data/mirror-registry-ca.pem\"|g" \
+                "${DATA_DIR}/mirror-registry-config-container.json"
+            rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+        fi
+    
+        # Add or update IDMS path if file exists
+        if [ -f "${DATA_DIR}/imageDigestMirrorSet.yaml" ]; then
+            if grep -q '"idmsPath"' "${DATA_DIR}/mirror-registry-config-container.json"; then
+                sed -i.bak "s|\"idmsPath\": *\"[^\"]*\"|\"idmsPath\": \"/data/data/imageDigestMirrorSet.yaml\"|g" \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            else
+                sed -i.bak 's|}$|,\n  "idmsPath": "/data/data/imageDigestMirrorSet.yaml"\n}|' \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            fi
+            rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+            log "  Added IDMS path to container config"
+        fi
+    
+        # Add or update ITMS path if file exists
+        if [ -f "${DATA_DIR}/imageTagMirrorSet.yaml" ]; then
+            if grep -q '"itmsPath"' "${DATA_DIR}/mirror-registry-config-container.json"; then
+                sed -i.bak "s|\"itmsPath\": *\"[^\"]*\"|\"itmsPath\": \"/data/data/imageTagMirrorSet.yaml\"|g" \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            else
+                sed -i.bak 's|}$|,\n  "itmsPath": "/data/data/imageTagMirrorSet.yaml"\n}|' \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            fi
+            rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+            log "  Added ITMS path to container config"
+        fi
+    
+        chmod 644 "${DATA_DIR}/mirror-registry-config-container.json"
+        log "✓ Container config updated"
     }
     
     check_images_exist() {
@@ -393,9 +1034,73 @@ data:
         if [ -f "${config_dir}/mirror-registry-config.json" ]; then
             config_file="${config_dir}/mirror-registry-config.json"
             log "Found existing registry configuration in user config: ${config_file}"
+    
+            # Copy to DATA_DIR if not present there (backend needs it)
+            if [ ! -f "${DATA_DIR}/mirror-registry-config.json" ]; then
+                mkdir -p "${DATA_DIR}"
+                cp "${config_file}" "${DATA_DIR}/mirror-registry-config.json"
+                chmod 644 "${DATA_DIR}/mirror-registry-config.json"  # Readable by container
+                log "Copied registry config to collection folder for backend access"
+            fi
+    
+            # Also copy CA certificate if it exists
+            if [ -f "${config_dir}/mirror-registry-ca.pem" ] && [ ! -f "${DATA_DIR}/mirror-registry-ca.pem" ]; then
+                cp "${config_dir}/mirror-registry-ca.pem" "${DATA_DIR}/mirror-registry-ca.pem"
+                chmod 644 "${DATA_DIR}/mirror-registry-ca.pem"  # Readable by container
+                log "Copied CA certificate to collection folder for backend access"
+            fi
+    
+            # Create container-specific config with container paths
+            # Container mounts ${SCRIPT_DIR} as /data, so ${DATA_DIR} becomes /data/data
+            cp "${DATA_DIR}/mirror-registry-config.json" "${DATA_DIR}/mirror-registry-config-container.json"
+    
+            # Update CA cert path to container path if CA exists
+            if [ -f "${DATA_DIR}/mirror-registry-ca.pem" ]; then
+                sed -i.bak "s|\"caCertPath\": *\"[^\"]*\"|\"caCertPath\": \"/data/data/mirror-registry-ca.pem\"|g" \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+                rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+            fi
+    
+            # Add IDMS path if file exists
+            if [ -f "${DATA_DIR}/imageDigestMirrorSet.yaml" ]; then
+                # Check if idmsPath already exists in the JSON
+                if grep -q '"idmsPath"' "${DATA_DIR}/mirror-registry-config-container.json"; then
+                    # Update existing idmsPath
+                    sed -i.bak "s|\"idmsPath\": *\"[^\"]*\"|\"idmsPath\": \"/data/data/imageDigestMirrorSet.yaml\"|g" \
+                        "${DATA_DIR}/mirror-registry-config-container.json"
+                else
+                    # Add idmsPath before the closing brace
+                    sed -i.bak 's|}$|,\n  "idmsPath": "/data/data/imageDigestMirrorSet.yaml"\n}|' \
+                        "${DATA_DIR}/mirror-registry-config-container.json"
+                fi
+                rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+                log "Added IDMS path to container config"
+            fi
+    
+            # Add ITMS path if file exists
+            if [ -f "${DATA_DIR}/imageTagMirrorSet.yaml" ]; then
+                # Check if itmsPath already exists in the JSON
+                if grep -q '"itmsPath"' "${DATA_DIR}/mirror-registry-config-container.json"; then
+                    # Update existing itmsPath
+                    sed -i.bak "s|\"itmsPath\": *\"[^\"]*\"|\"itmsPath\": \"/data/data/imageTagMirrorSet.yaml\"|g" \
+                        "${DATA_DIR}/mirror-registry-config-container.json"
+                else
+                    # Add itmsPath before the closing brace
+                    sed -i.bak 's|}$|,\n  "itmsPath": "/data/data/imageTagMirrorSet.yaml"\n}|' \
+                        "${DATA_DIR}/mirror-registry-config-container.json"
+                fi
+                rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+                log "Added ITMS path to container config"
+            fi
+    
+            chmod 644 "${DATA_DIR}/mirror-registry-config-container.json"
+            log "Created container-specific config with container paths"
         elif [ -f "${DATA_DIR}/mirror-registry-config.json" ]; then
             config_file="${DATA_DIR}/mirror-registry-config.json"
             log "Found existing registry configuration in collection folder: ${config_file}"
+    
+            # Ensure it's readable by container
+            chmod 644 "${DATA_DIR}/mirror-registry-config.json" 2>/dev/null || true
         else
             return 1
         fi
@@ -422,14 +1127,22 @@ data:
     
     check_mirror_registry() {
         # Check if mirror-registry is already running
+    
+        # Check system-level service
         if command -v systemctl &>/dev/null && systemctl is-active --quiet quay-pod.service 2>/dev/null; then
-            log "Mirror-registry is already running (systemd)"
+            log "Mirror-registry is already running (system service: quay-pod)"
+            return 0
+        fi
+    
+        # Check user-level service (more common with newer mirror-registry)
+        if command -v systemctl &>/dev/null && systemctl --user is-active --quiet quay-app.service 2>/dev/null; then
+            log "Mirror-registry is already running (user service: quay-app)"
             return 0
         fi
     
         # Check if podman containers exist
-        if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^quay$'; then
-            log "Mirror-registry container exists"
+        if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^(quay|quay-app|quay-postgres|quay-redis)$'; then
+            log "Mirror-registry containers exist"
             return 0
         fi
     
@@ -467,6 +1180,53 @@ data:
     
                 read -p "Data storage path [/opt/quay]: " input_path
                 MIRROR_REGISTRY_DATA_PATH="${input_path:-/opt/quay}"
+    
+                # Validate and create data path if needed
+                if [ ! -d "${MIRROR_REGISTRY_DATA_PATH}" ]; then
+                    log "Data path does not exist: ${MIRROR_REGISTRY_DATA_PATH}"
+                    read -p "Create directory? [Y/n]: " create_dir
+                    if [ "${create_dir}" != "n" ] && [ "${create_dir}" != "N" ]; then
+                        # Check if we need sudo
+                        local parent_dir=$(dirname "${MIRROR_REGISTRY_DATA_PATH}")
+                        if [ ! -w "${parent_dir}" ]; then
+                            log "Creating ${MIRROR_REGISTRY_DATA_PATH} (requires sudo)..."
+                            if ! sudo mkdir -p "${MIRROR_REGISTRY_DATA_PATH}"; then
+                                error "Failed to create directory"
+                                exit 1
+                            fi
+                            # Set ownership to current user so mirror-registry can write to it
+                            log "Setting ownership to $(id -un):$(id -gn)..."
+                            sudo chown "$(id -un):$(id -gn)" "${MIRROR_REGISTRY_DATA_PATH}"
+                            sudo chmod 755 "${MIRROR_REGISTRY_DATA_PATH}"
+                        else
+                            # No sudo needed
+                            if ! mkdir -p "${MIRROR_REGISTRY_DATA_PATH}"; then
+                                error "Failed to create directory"
+                                exit 1
+                            fi
+                            chmod 755 "${MIRROR_REGISTRY_DATA_PATH}"
+                        fi
+                        log "✓ Created ${MIRROR_REGISTRY_DATA_PATH}"
+                    else
+                        error "Data path must exist before proceeding"
+                        exit 1
+                    fi
+                else
+                    # Directory exists, check if writable
+                    if [ ! -w "${MIRROR_REGISTRY_DATA_PATH}" ]; then
+                        error "Data path exists but is not writable: ${MIRROR_REGISTRY_DATA_PATH}"
+                        log "Current ownership: $(ls -ld "${MIRROR_REGISTRY_DATA_PATH}")"
+                        read -p "Fix permissions with sudo? [Y/n]: " fix_perms
+                        if [ "${fix_perms}" != "n" ] && [ "${fix_perms}" != "N" ]; then
+                            sudo chown "$(id -un):$(id -gn)" "${MIRROR_REGISTRY_DATA_PATH}"
+                            sudo chmod 755 "${MIRROR_REGISTRY_DATA_PATH}"
+                            log "✓ Fixed permissions on ${MIRROR_REGISTRY_DATA_PATH}"
+                        else
+                            error "Cannot proceed without write access to data path"
+                            exit 1
+                        fi
+                    fi
+                fi
     
                 read -s -p "Initial admin password (leave empty to auto-generate): " input_password
                 echo ""
@@ -576,20 +1336,23 @@ data:
         log ""
     
         # Extract mirror-registry installer
-        local temp_dir=$(mktemp -d)
+        # Use a persistent directory instead of temp to preserve for uninstall
+        local install_dir="${DATA_DIR}/mirror-registry-install"
+        mkdir -p "${install_dir}"
+        log "Extracting mirror-registry to ${install_dir}..."
     
         # Try different extraction methods
-        if tar -xzf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+        if tar -xzf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$install_dir" 2>/dev/null; then
             log "Extracted mirror-registry (gzipped tar)"
-        elif tar -xf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+        elif tar -xf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$install_dir" 2>/dev/null; then
             log "Extracted mirror-registry (uncompressed tar)"
         elif file "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" 2>/dev/null | grep -q "executable"; then
             # It's the binary itself
-            cp "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" "$temp_dir/mirror-registry"
+            cp "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" "$install_dir/mirror-registry"
             log "mirror-registry.tar.gz was the binary itself"
         else
             error "Failed to extract mirror-registry.tar.gz"
-            rm -rf "$temp_dir"
+            rm -rf "$install_dir"
             return 1
         fi
     
@@ -626,27 +1389,71 @@ data:
             log "  SSL: Self-signed (auto-generated)"
         fi
     
-        cd "$temp_dir"
+        cd "$install_dir"
     
         # Make mirror-registry executable if it exists
         if [ -f "./mirror-registry" ]; then
             chmod +x ./mirror-registry
+    
+            # Set SELinux context if SELinux is enabled (DISA STIG mode)
+            if command -v chcon &>/dev/null && [ -f "./mirror-registry" ]; then
+                log "Setting SELinux context for mirror-registry..."
+                if [ "${STIG_DETECTED}" = true ]; then
+                    sudo chcon -t bin_t ./mirror-registry 2>/dev/null || \
+                        log "Warning: Could not set SELinux context (may need sudo or SELinux is disabled)"
+                else
+                    chcon -t bin_t ./mirror-registry 2>/dev/null || \
+                        log "Warning: Could not set SELinux context (may need sudo or SELinux is disabled)"
+                fi
+            fi
+    
+            # In STIG mode, add mirror-registry to fapolicyd trust (in install dir)
+            if [ "${STIG_DETECTED}" = true ]; then
+                local full_path="$(cd "$(dirname "./mirror-registry")" && pwd)/$(basename "./mirror-registry")"
+                if command -v fapolicyd-cli &>/dev/null; then
+                    if confirm_sudo "Add mirror-registry to fapolicyd trust" "Allows ${full_path} to execute"; then
+                        run_sudo fapolicyd-cli --file add "${full_path}" 2>/dev/null || log "Warning: Could not add to fapolicyd trust"
+                        run_sudo fapolicyd-cli --update 2>/dev/null || log "Warning: Could not update fapolicyd database"
+                        log "✓ Added mirror-registry to fapolicyd trust"
+                    fi
+                fi
+            fi
+    
+            MIRROR_REGISTRY_CMD="./mirror-registry"
+        else
+            error "mirror-registry binary not found after extraction"
+            cd -
+            rm -rf "$install_dir"
+            return 1
         fi
     
-        if ! ./mirror-registry install \
+        # In STIG mode, temporarily set umask for mirror-registry installation
+        local old_umask=""
+        if [ "${STIG_DETECTED}" = true ]; then
+            old_umask=$(umask)
+            umask 0022
+        fi
+    
+        if ! ${MIRROR_REGISTRY_CMD} install \
             --quayHostname "${MIRROR_REGISTRY_HOSTNAME}" \
             --quayRoot "${MIRROR_REGISTRY_DATA_PATH}" \
             --initPassword "${MIRROR_REGISTRY_INIT_PASSWORD}" \
             --sslCert "${ssl_cert_arg}" \
             --sslKey "${ssl_key_arg}"; then
             error "Mirror-registry installation failed"
+            [ -n "${old_umask}" ] && umask "${old_umask}"
             cd -
-            rm -rf "$temp_dir"
+            # Don't remove install_dir on failure - may need it for debugging
+            log "Mirror-registry files preserved at: ${install_dir}"
             return 1
         fi
     
+        # Restore umask if changed
+        [ -n "${old_umask}" ] && umask "${old_umask}"
+    
         cd -
-        rm -rf "$temp_dir"
+        # Keep the install_dir - don't remove it! We need it for uninstall
+        log "Mirror-registry installation files preserved at: ${install_dir}"
     
         log ""
         log "✓ Mirror-registry installed successfully"
@@ -692,10 +1499,16 @@ data:
       "tlsVerify": false,
       "installedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
       "dataPath": "${MIRROR_REGISTRY_DATA_PATH}",
+      "installDir": "${install_dir}",
       "type": "quay"
     }
     EOF
-            chmod 600 "${target_dir}/mirror-registry-config.json"
+            # DATA_DIR needs 644 for container access, config_dir can be 600 for security
+            if [ "${target_dir}" = "${DATA_DIR}" ]; then
+                chmod 644 "${target_dir}/mirror-registry-config.json"
+            else
+                chmod 600 "${target_dir}/mirror-registry-config.json"
+            fi
         done
     
         # Copy CA certificate if it exists (mirror-registry generates it)
@@ -739,9 +1552,16 @@ data:
       "sslType": "${ssl_type}",
       "installedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
       "dataPath": "${MIRROR_REGISTRY_DATA_PATH}",
+      "installDir": "${install_dir}",
       "type": "quay"
     }
     EOF
+                # DATA_DIR needs 644 for container access, config_dir can be 600 for security
+                if [ "${target_dir}" = "${DATA_DIR}" ]; then
+                    chmod 644 "${target_dir}/mirror-registry-config.json"
+                else
+                    chmod 600 "${target_dir}/mirror-registry-config.json"
+                fi
             done
         fi
     
@@ -879,6 +1699,9 @@ data:
     start_containers() {
         log "Starting Airgap Architect containers..."
     
+        # Prepare STIG environment if needed
+        prepare_stig_environment
+    
         # Install CLI tools first
         install_cli_tools
     
@@ -913,16 +1736,27 @@ data:
     
         mkdir -p "${DATA_DIR}"
     
-        # Ensure all directories have proper permissions for container to write (recursive)
-        find "${SCRIPT_DIR}" -type d -exec chmod 777 {} \;
+        # Ensure directories we own have proper permissions for container to write
+        # Only change directories owned by current user, ignore errors for others
+        log "Setting directory permissions for container access..."
+        find "${SCRIPT_DIR}" -type d -user "$(id -u)" -exec chmod 777 {} \; 2>/dev/null || true
     
         # Set SELinux context so container can write to script directory
         if command -v chcon &>/dev/null; then
             log "Setting SELinux context on ${SCRIPT_DIR} for container access..."
-            chcon -Rt container_file_t "${SCRIPT_DIR}" || log "Warning: chcon failed (SELinux may not be enabled)"
+            chcon -Rt container_file_t "${SCRIPT_DIR}" 2>/dev/null || log "Warning: chcon failed (SELinux may not be enabled)"
         fi
     
         log "Mounting script directory as backend /data: ${SCRIPT_DIR}"
+    
+        # Ensure imageset-config.yaml is readable by container
+        if [ -f "${SCRIPT_DIR}/imageset-config.yaml" ]; then
+            chmod 644 "${SCRIPT_DIR}/imageset-config.yaml"
+            log "Set imageset-config.yaml permissions for container access"
+        fi
+    
+        # Regenerate container-specific config with latest IDMS/ITMS paths
+        update_container_config
     
         log "Starting backend container..."
         podman run -d \
@@ -931,6 +1765,10 @@ data:
             --user "$(id -u):$(id -g)" \
             -e PORT=4000 \
             -e DATA_DIR=/data \
+            -e MIRROR_REGISTRY_CONFIG=/data/data/mirror-registry-config-container.json \
+            -e IMAGESET_CONFIG=/data/imageset-config.yaml \
+            -e IDMS_PATH=/data/data/imageDigestMirrorSet.yaml \
+            -e ITMS_PATH=/data/data/imageTagMirrorSet.yaml \
             -e MOCK_MODE="${MOCK_MODE:-false}" \
             -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
             -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
@@ -961,6 +1799,9 @@ data:
         log ""
         log "To view logs: $0 logs"
         log "To stop:      $0 stop"
+    
+        # Cleanup STIG environment
+        cleanup_stig_environment
     }
     
     stop_containers() {
@@ -1162,16 +2003,66 @@ data:
         if oc-mirror --v2 --from "file://${archives_dir}" --config "${imageset_config}" ${oc_mirror_args} "docker://${registry_url}"; then
             log "✓ Successfully mirrored images to ${registry_url}"
     
+            # Find and copy IDMS/ITMS files from oc-mirror output
+            # oc-mirror v2 creates files in archives/working-dir/cluster-resources/
+            log "Searching for IDMS/ITMS files..."
+    
+            # Search in multiple possible locations
+            local search_paths=(
+                "${archives_dir}/working-dir/cluster-resources"
+                "${work_dir}/cluster-resources"
+                "${work_dir}"
+            )
+    
+            local idms_file=""
+            local itms_file=""
+    
+            for search_path in "${search_paths[@]}"; do
+                if [ -d "${search_path}" ]; then
+                    log "Checking ${search_path}"
+    
+                    # Look for IDMS file
+                    if [ -z "${idms_file}" ]; then
+                        idms_file=$(find "${search_path}" -maxdepth 2 -type f \( -name "*idms*.yaml" -o -name "*imageDigestMirrorSet*.yaml" \) 2>/dev/null | head -1)
+                    fi
+    
+                    # Look for ITMS file
+                    if [ -z "${itms_file}" ]; then
+                        itms_file=$(find "${search_path}" -maxdepth 2 -type f \( -name "*itms*.yaml" -o -name "*imageTagMirrorSet*.yaml" \) 2>/dev/null | head -1)
+                    fi
+                fi
+            done
+    
+            # Copy IDMS file if found
+            if [ -n "${idms_file}" ] && [ -f "${idms_file}" ]; then
+                log "Found IDMS file: ${idms_file}"
+                cp "${idms_file}" "${DATA_DIR}/imageDigestMirrorSet.yaml"
+                chmod 644 "${DATA_DIR}/imageDigestMirrorSet.yaml"
+                log "✓ Copied IDMS file to ${DATA_DIR}/imageDigestMirrorSet.yaml"
+            else
+                log "⚠ No IDMS file found"
+            fi
+    
+            # Copy ITMS file if found
+            if [ -n "${itms_file}" ] && [ -f "${itms_file}" ]; then
+                log "Found ITMS file: ${itms_file}"
+                cp "${itms_file}" "${DATA_DIR}/imageTagMirrorSet.yaml"
+                chmod 644 "${DATA_DIR}/imageTagMirrorSet.yaml"
+                log "✓ Copied ITMS file to ${DATA_DIR}/imageTagMirrorSet.yaml"
+            else
+                log "⚠ No ITMS file found"
+            fi
+    
             # Check for IDMS/ITMS files and display instructions
-            if [ -f "${SCRIPT_DIR}/idms-oc-mirror.yaml" ] || [ -f "${SCRIPT_DIR}/itms-oc-mirror.yaml" ]; then
+            if [ -f "${DATA_DIR}/imageDigestMirrorSet.yaml" ] || [ -f "${DATA_DIR}/imageTagMirrorSet.yaml" ]; then
                 log ""
                 log "Mirror complete! To configure your cluster to use the mirrored content:"
                 log ""
-                if [ -f "${SCRIPT_DIR}/idms-oc-mirror.yaml" ]; then
-                    log "  kubectl apply -f ${SCRIPT_DIR}/idms-oc-mirror.yaml"
+                if [ -f "${DATA_DIR}/imageDigestMirrorSet.yaml" ]; then
+                    log "  kubectl apply -f ${DATA_DIR}/imageDigestMirrorSet.yaml"
                 fi
-                if [ -f "${SCRIPT_DIR}/itms-oc-mirror.yaml" ]; then
-                    log "  kubectl apply -f ${SCRIPT_DIR}/itms-oc-mirror.yaml"
+                if [ -f "${DATA_DIR}/imageTagMirrorSet.yaml" ]; then
+                    log "  kubectl apply -f ${DATA_DIR}/imageTagMirrorSet.yaml"
                 fi
                 log ""
             fi
@@ -1195,6 +2086,199 @@ data:
         log "Cleanup complete (data preserved in ${SCRIPT_DIR})"
     }
     
+    uninstall_mirror_registry() {
+        log ""
+        log "=== Uninstalling Mirror-Registry ==="
+        log ""
+    
+        # Check if mirror-registry is installed
+        if ! check_mirror_registry; then
+            log "Mirror-registry is not installed or not running"
+            return 0
+        fi
+    
+        # Load existing configuration to find the mirror-registry binary
+        local config_file=""
+        local config_dir="${HOME}/.config/airgap-architect"
+    
+        if [ -f "${config_dir}/mirror-registry-config.json" ]; then
+            config_file="${config_dir}/mirror-registry-config.json"
+        elif [ -f "${DATA_DIR}/mirror-registry-config.json" ]; then
+            config_file="${DATA_DIR}/mirror-registry-config.json"
+        fi
+    
+        local data_path=""
+        local saved_install_dir=""
+        if [ -n "${config_file}" ]; then
+            data_path=$(grep -o '"dataPath": *"[^"]*"' "${config_file}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+            saved_install_dir=$(grep -o '"installDir": *"[^"]*"' "${config_file}" | sed 's/.*: *"\([^"]*\)".*/\1/')
+            log "Found existing mirror-registry at: ${data_path}"
+            [ -n "${saved_install_dir}" ] && log "Installation directory: ${saved_install_dir}"
+        fi
+    
+        # Confirm uninstall
+        log ""
+        log "WARNING: This will remove the mirror-registry installation and all data."
+        log "Data path: ${data_path:-unknown}"
+        echo ""
+        read -p "Are you sure you want to uninstall mirror-registry? [y/N]: " confirm_uninstall
+    
+        if [ "${confirm_uninstall}" != "y" ] && [ "${confirm_uninstall}" != "Y" ]; then
+            log "Uninstall cancelled"
+            return 0
+        fi
+    
+        # Expand tilde in data_path if present
+        if [ -n "${data_path}" ]; then
+            # Expand ~ to actual home directory
+            data_path="${data_path/#\~/$HOME}"
+        fi
+    
+        # Try to find mirror-registry binary in common locations
+        local mirror_registry_bin=""
+        local temp_dir=""  # Declare here so it's in scope for cleanup
+    
+        # Prefer the saved install directory from config (has all supporting files)
+        if [ -n "${saved_install_dir}" ] && [ -f "${saved_install_dir}/mirror-registry" ]; then
+            mirror_registry_bin="${saved_install_dir}/mirror-registry"
+            log "Using mirror-registry from saved install directory: ${saved_install_dir}"
+        # Check in data path's parent (where mirror-registry installer usually stays)
+        elif [ -n "${data_path}" ] && [ -f "$(dirname "${data_path}")/mirror-registry" ]; then
+            mirror_registry_bin="$(dirname "${data_path}")/mirror-registry"
+        # Check in CLI install directory (but this won't have execution-environment.tar)
+        elif [ -f "${CLI_INSTALL_DIR}/mirror-registry" ]; then
+            log "WARNING: Found mirror-registry in ${CLI_INSTALL_DIR} but it may lack supporting files"
+            mirror_registry_bin="${CLI_INSTALL_DIR}/mirror-registry"
+        # Check in user's home
+        elif [ -f "${HOME}/mirror-registry" ]; then
+            mirror_registry_bin="${HOME}/mirror-registry"
+        # Check if mirror-registry is in PATH
+        elif command -v mirror-registry &>/dev/null; then
+            log "WARNING: Found mirror-registry in PATH but it may lack supporting files"
+            mirror_registry_bin=$(which mirror-registry)
+        # Look for it in common bundle extraction locations
+        elif [ -d "${CLI_TOOLS_DIR}" ] && [ -f "${CLI_TOOLS_DIR}/mirror-registry" ]; then
+            mirror_registry_bin="${CLI_TOOLS_DIR}/mirror-registry"
+        fi
+    
+        if [ -z "${mirror_registry_bin}" ]; then
+            log "mirror-registry binary not found in common locations"
+            log "Attempting to extract from bundle..."
+    
+            if [ ! -f "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" ]; then
+                error "Cannot find mirror-registry binary or bundle"
+                error "You may need to manually remove mirror-registry:"
+                error "  1. Stop user services: systemctl --user stop quay-app.service"
+                error "  2. Remove podman containers: podman rm -f quay-app quay-postgres quay-redis"
+                error "  3. Remove data directory: rm -rf ${data_path:-~/quay-install}"
+                return 1
+            fi
+    
+            # Extract mirror-registry to temp location
+            temp_dir="${SCRIPT_DIR}/.tmp-uninstall-$$"
+            mkdir -p "${temp_dir}"
+    
+            if tar -xzf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                : # Success
+            elif tar -xf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                : # Success
+            elif file "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" 2>/dev/null | grep -q "executable"; then
+                cp "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" "$temp_dir/mirror-registry"
+            else
+                error "Failed to extract mirror-registry"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+    
+            if [ -f "$temp_dir/mirror-registry" ]; then
+                chmod +x "$temp_dir/mirror-registry"
+                mirror_registry_bin="$temp_dir/mirror-registry"
+                log "Extracted mirror-registry for uninstall"
+            else
+                error "Could not extract mirror-registry binary"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        fi
+    
+        log "Using mirror-registry binary: ${mirror_registry_bin}"
+    
+        # Build uninstall command arguments
+        local uninstall_args=""
+        if [ -n "${data_path}" ]; then
+            uninstall_args="--quayRoot ${data_path}"
+        fi
+    
+        log "Running mirror-registry uninstall..."
+        log "This will:"
+        log "  - Stop all Quay containers"
+        log "  - Remove systemd service"
+        log "  - Delete data directory: ${data_path:-/opt/quay}"
+        log ""
+    
+        # In STIG mode, we may need sudo for some operations
+        if [ "${STIG_DETECTED}" = true ]; then
+            request_sudo_access || return 1
+        fi
+    
+        # Run uninstall - must be run from the directory containing all mirror-registry files
+        local uninstall_result=0
+        local original_dir=$(pwd)
+    
+        # If we extracted to temp_dir, cd there to run the command
+        if [ -n "${temp_dir}" ] && [ -d "${temp_dir}" ]; then
+            cd "${temp_dir}"
+        elif [ -n "${mirror_registry_bin}" ]; then
+            # If using an existing binary, cd to its directory
+            cd "$(dirname "${mirror_registry_bin}")"
+        fi
+    
+        # Run the uninstall command
+        if ./mirror-registry uninstall ${uninstall_args} -v; then
+            cd "${original_dir}"
+            log "✓ Mirror-registry uninstalled successfully"
+    
+            # Clean up configuration files
+            log "Removing configuration files..."
+            rm -f "${DATA_DIR}/mirror-registry-config.json" 2>/dev/null || true
+            rm -f "${DATA_DIR}/mirror-registry-credentials.txt" 2>/dev/null || true
+            rm -f "${DATA_DIR}/mirror-registry-ca.pem" 2>/dev/null || true
+            rm -f "${DATA_DIR}/mirror-registry-external.txt" 2>/dev/null || true
+    
+            rm -f "${config_dir}/mirror-registry-config.json" 2>/dev/null || true
+            rm -f "${config_dir}/mirror-registry-credentials.txt" 2>/dev/null || true
+            rm -f "${config_dir}/mirror-registry-ca.pem" 2>/dev/null || true
+            rm -f "${config_dir}/mirror-registry-external.txt" 2>/dev/null || true
+    
+            log "✓ Configuration files removed"
+    
+            # Remove temporary extraction directory if we created one
+            if [ -n "${temp_dir}" ] && [ -d "${temp_dir}" ]; then
+                rm -rf "${temp_dir}"
+            fi
+    
+            log ""
+            log "Mirror-registry has been completely uninstalled."
+            log "To reinstall, run: $0 start"
+    
+        else
+            cd "${original_dir}"
+            error "Mirror-registry uninstall failed"
+    
+            # Clean up temp dir on failure
+            if [ -n "${temp_dir}" ] && [ -d "${temp_dir}" ]; then
+                rm -rf "${temp_dir}"
+            fi
+    
+            return 1
+        fi
+    
+        # Clean up STIG environment if needed
+        if [ "${STIG_DETECTED}" = true ]; then
+            stop_sudo_keepalive
+        fi
+    }
+    
     # Parse arguments
     COMMAND=""
     while [[ $# -gt 0 ]]; do
@@ -1211,7 +2295,7 @@ data:
                 usage
                 exit 0
                 ;;
-            start|stop|restart|status|logs|mirror|clean)
+            start|stop|restart|status|logs|mirror|clean|uninstall-mirror-registry)
                 COMMAND="$1"
                 shift
                 break
@@ -1250,6 +2334,9 @@ data:
             ;;
         clean)
             clean_up
+            ;;
+        uninstall-mirror-registry)
+            uninstall_mirror_registry
             ;;
         *)
             error "Unknown command: ${COMMAND}"
