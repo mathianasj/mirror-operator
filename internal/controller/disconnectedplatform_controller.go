@@ -598,18 +598,15 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 
 										appDomain := "rhtpa." + domain
 
-										// Ensure all OIDC clients exist (frontend, cli, sbom-uploader)
+										// Ensure OIDC clients exist (frontend, cli)
 										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "frontend", appDomain, adminToken, httpClient, true); err != nil {
 											log.FromContext(ctx).Error(err, "Failed to ensure frontend OIDC client")
 										}
 										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "cli", appDomain, adminToken, httpClient, false); err != nil {
 											log.FromContext(ctx).Error(err, "Failed to ensure CLI OIDC client")
 										}
-										if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "sbom-uploader", appDomain, adminToken, httpClient, false); err != nil {
-											log.FromContext(ctx).Error(err, "Failed to ensure SBOM uploader OIDC client")
-										}
 
-										// Assign scope to frontend, CLI, and sbom-uploader clients
+										// Assign scope to frontend and CLI clients
 										if err := r.assignScopeToTrustifyClients(ctx, keycloakHost, "trustify", adminToken, httpClient); err != nil {
 											log.FromContext(ctx).Error(err, "Failed to assign scope to clients")
 										}
@@ -1254,11 +1251,6 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyRealmAndOIDC(ctx context.
 		return fmt.Errorf("failed to create CLI OIDC client: %w", err)
 	}
 
-	// Create SBOM uploader confidential OIDC client for CollectionPipeline SBOM uploads
-	if err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, realmName, "sbom-uploader", appDomain, adminToken, httpClient, false); err != nil {
-		return fmt.Errorf("failed to create SBOM uploader OIDC client: %w", err)
-	}
-
 	return nil
 }
 
@@ -1577,16 +1569,13 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 		}
 	}
 
-	// Store client secret if this is a confidential client (CLI or SBOM uploader)
+	// Store client secret for the CLI confidential client
 	if !isPublic && clientSecret != "" {
 		var secretName string
 		switch clientID {
 		case "cli":
 			secretName = "rhtpa-oidc-cli-secret"
-		case "sbom-uploader":
-			secretName = "sbom-uploader-secret"
 		default:
-			// Don't store secrets for other clients
 			return nil
 		}
 
@@ -1622,9 +1611,7 @@ func (r *DisconnectedPlatformReconciler) ensureTrustifyOIDCClient(ctx context.Co
 func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx context.Context, keycloakHost, realmName, adminToken string, httpClient *http.Client) error {
 	logger := log.FromContext(ctx)
 
-	// Assign read:document scope to frontend and CLI clients
-	// Assign both read:document and create:document to sbom-uploader for pipeline uploads
-	for _, clientID := range []string{"frontend", "cli", "sbom-uploader"} {
+	for _, clientID := range []string{"frontend", "cli"} {
 		// Get client UUID
 		clientsURL := fmt.Sprintf("https://%s/admin/realms/%s/clients?clientId=%s", keycloakHost, realmName, clientID)
 		req, _ := http.NewRequest("GET", clientsURL, nil)
@@ -1657,8 +1644,8 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 			logger.Info("Assigned read:document scope to client", "clientId", clientID)
 		}
 
-		// Additionally assign create:document scope to sbom-uploader for SBOM uploads
-		if clientID == "sbom-uploader" {
+		// Assign create:document scope to cli for SBOM uploads
+		if clientID == "cli" {
 			if err := r.assignScopeToClient(ctx, keycloakHost, realmName, clientUUID, "create:document", adminToken, httpClient); err != nil {
 				logger.Error(err, "failed to assign create scope", "clientId", clientID)
 			} else {
@@ -1666,8 +1653,8 @@ func (r *DisconnectedPlatformReconciler) assignScopeToTrustifyClients(ctx contex
 			}
 		}
 
-		// For CLI and sbom-uploader clients, assign trustify-manager role to their service accounts for create permissions
-		if clientID == "cli" || clientID == "sbom-uploader" {
+		// Assign trustify-manager role to CLI service account for create permissions
+		if clientID == "cli" {
 			if err := r.assignRoleToServiceAccountByClient(ctx, keycloakHost, realmName, clientUUID, "trustify-manager", adminToken, httpClient); err != nil {
 				logger.Error(err, "failed to assign trustify-manager role to service account", "clientId", clientID, "clientUUID", clientUUID)
 			} else {
@@ -8880,24 +8867,41 @@ jq -r '.relationships | map(select(.relationshipType == "CONTAINS")) | length | 
 set -e
 echo "=== Uploading SBOMs to TPA ==="
 
-# Get TPA OIDC token
-TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
-  -d "client_id=$(params.tpa-oidc-client-id)" \
-  -d "client_secret=$(cat /workspace/tpa-oidc-secret/clientSecret)" \
-  -d "grant_type=client_credentials" | jq -r '.access_token')
+CLIENT_SECRET=$(cat /workspace/tpa-oidc-secret/clientSecret)
+
+refresh_token() {
+  TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
+    -d "client_id=$(params.tpa-oidc-client-id)" \
+    -d "client_secret=$CLIENT_SECRET" \
+    -d "grant_type=client_credentials" | jq -r '.access_token')
+  TOKEN_TIME=$(date +%s)
+}
+
+refresh_token
 
 # Get collection name from working PVC
 COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+
+upload_sbom() {
+  local sbom_file="$1"
+  # Refresh token if older than 4 minutes (tokens expire at 5 min)
+  local now=$(date +%s)
+  if [ $((now - TOKEN_TIME)) -ge 240 ]; then
+    echo "Refreshing OIDC token..."
+    refresh_token
+  fi
+  curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+    -H "Authorization: Bearer $TPA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$sbom_file" \
+    "https://$(params.tpa-host)/api/v2/sbom"
+}
 
 # Upload image SBOMs first
 UPLOAD_COUNT=0
 find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" | while read sbom; do
   echo "Uploading image SBOM: $(basename $sbom)"
-  RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
-    -H "Authorization: Bearer $TPA_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d @"$sbom" \
-    "https://$(params.tpa-host)/api/v2/sbom")
+  RESPONSE=$(upload_sbom "$sbom")
 
   HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
 
@@ -8914,11 +8918,7 @@ BUNDLE_SBOM_ID=""
 for bundle_sbom in /workspace/output/sboms/bundle-*.spdx.json; do
   if [ -f "$bundle_sbom" ]; then
     echo "Uploading bundle SBOM: $(basename $bundle_sbom)"
-    RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
-      -H "Authorization: Bearer $TPA_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d @"$bundle_sbom" \
-      "https://$(params.tpa-host)/api/v2/sbom")
+    RESPONSE=$(upload_sbom "$bundle_sbom")
 
     HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
     RESPONSE_BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
@@ -9378,6 +9378,65 @@ fi
 								},
 							},
 						},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+
+		// Task 14: cleanup-working-storage (remove artifacts, keep caches for child runs)
+		{
+			"name":     "cleanup-working-storage",
+			"runAfter": []string{"upload-to-s3"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "cleanup",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -e
+echo "=== Cleaning up working storage after S3 upload ==="
+echo "=== Disk usage BEFORE cleanup ==="
+df -h /workspace/output
+du -sh /workspace/output/* 2>/dev/null || true
+
+cd /workspace/output
+
+# Remove bundle artifacts
+rm -f *.tar *.tar.gz *.sig *.bundle
+rm -rf archives/
+
+# Remove SBOMs (but keep sbom-cache for incremental runs)
+rm -rf sboms/
+
+# Remove exported architect images and import script
+rm -f airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz
+rm -f import-airgap-architect.sh
+
+# Remove CLI tools
+rm -rf cli-tools/
+
+# Remove temp files and container storage
+rm -rf tmp/
+rm -rf containers/
+rm -f storage.conf
+
+# Remove copied config files
+rm -f imageset-config.yaml
+rm -f idms-oc-mirror.yaml itms-oc-mirror.yaml
+
+echo ""
+echo "=== Disk usage AFTER cleanup ==="
+df -h /workspace/output
+du -sh /workspace/output/* 2>/dev/null || true
+echo ""
+echo "=== Preserved directories ==="
+ls -la /workspace/output/
+echo "=== Cleanup complete ==="
+`},
 					},
 				},
 			},
