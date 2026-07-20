@@ -4,6 +4,7 @@ resources:
 - mirror_v1_disconnectedplatform_airgapped.yaml
 - mirror_v1_collectionpipeline.yaml
 - mirror_v1_collectionpipeline_incremental.yaml
+- mirror_v1_collectionpipeline_parent.yaml
 - mirror_v1_mirrorimport.yaml
 - mirror_v1_mirrorrelease_pvc.yaml
 - mirror_v1_clusterbootstrap.yaml

@@ -2,6 +2,7 @@ package v1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -60,6 +61,13 @@ type CollectionPipelineSpec struct {
 	// Timeout for the collection pipeline. Defaults to 12 hours if not specified.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
+	// ParentPipeline is the name of a parent CollectionPipeline to inherit cache from.
+	// When set, this pipeline will reuse the parent's working PVC for incremental collection.
+	// +optional
+	ParentPipeline string `json:"parentPipeline,omitempty"`
+	// StorageSize is the size of the working PVC for collection storage. Defaults to 100Gi.
+	// +optional
+	StorageSize *resource.Quantity `json:"storageSize,omitempty"`
 }
 
 type CollectionPhase string
@@ -85,6 +93,14 @@ type CollectionPipelineStatus struct {
 	ArchitectFrontendImageURL string             `json:"architectFrontendImageUrl,omitempty"`
 	ArchitectBackendImageURL  string             `json:"architectBackendImageUrl,omitempty"`
 	ArchitectImportScriptURL  string             `json:"architectImportScriptUrl,omitempty"`
+	// WorkingPVCName is the name of the PVC used for working storage during collection.
+	// This is the PVC that contains oc-mirror's cache.
+	// +optional
+	WorkingPVCName string `json:"workingPvcName,omitempty"`
+	// ParentPipelineVersion is the version of the parent pipeline at the time this pipeline started.
+	// Populated from parent's status.version when this pipeline begins.
+	// +optional
+	ParentPipelineVersion string `json:"parentPipelineVersion,omitempty"`
 }
 
 // +kubebuilder:object:root=true

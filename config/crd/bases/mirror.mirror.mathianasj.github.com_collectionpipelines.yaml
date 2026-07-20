@@ -45,6 +45,11 @@ spec:
                 type: string
               incremental:
                 type: boolean
+              parentPipeline:
+                description: |-
+                  ParentPipeline is the name of a parent CollectionPipeline to inherit cache from.
+                  When set, this pipeline will reuse the parent's working PVC for incremental collection.
+                type: string
               signing:
                 properties:
                   keySecretRef:
@@ -157,6 +162,14 @@ spec:
                         type: object
                     type: object
                 type: object
+              storageSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: StorageSize is the size of the working PVC for collection
+                  storage. Defaults to 100Gi.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
               timeout:
                 description: Timeout for the collection pipeline. Defaults to 12 hours
                   if not specified.
@@ -237,6 +250,11 @@ spec:
                 type: array
               configMapRef:
                 type: string
+              parentPipelineVersion:
+                description: |-
+                  ParentPipelineVersion is the version of the parent pipeline at the time this pipeline started.
+                  Populated from parent's status.version when this pipeline begins.
+                type: string
               phase:
                 type: string
               pipelineRunRef:
@@ -249,6 +267,11 @@ spec:
                 format: date-time
                 type: string
               version:
+                type: string
+              workingPvcName:
+                description: |-
+                  WorkingPVCName is the name of the PVC used for working storage during collection.
+                  This is the PVC that contains oc-mirror's cache.
                 type: string
             type: object
         type: object

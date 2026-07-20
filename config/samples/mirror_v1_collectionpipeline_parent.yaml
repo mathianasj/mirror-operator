@@ -1,0 +1,47 @@
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: CollectionPipeline
+metadata:
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: collection-v4-17-update
+spec:
+  # References parent pipeline to reuse its working PVC and oc-mirror cache
+  # This enables delta collections that only download new/changed content
+  parentPipeline: collection-v4-17
+
+  # Updated imageSetConfig with additional operators or newer versions
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v1alpha2
+    storageConfig:
+      local:
+        path: /workspace/output
+    mirror:
+      platform:
+        channels:
+          - name: stable-4.17
+            type: ocp
+            minVersion: 4.17.5  # Updated from parent's baseline
+            maxVersion: 4.17.10
+      operators:
+        - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17
+          packages:
+            - name: advanced-cluster-management
+            - name: openshift-gitops-operator  # New operator added
+      additionalImages:
+        - name: registry.redhat.io/openshift4/ose-cli:v4.17
+
+  triggerType: manual
+  timeout: 12h
+
+  signing:
+    keySecretRef:
+      name: cosign-signing-key
+    passwordSecretRef:
+      name: cosign-signing-key
+
+  storage:
+    output:
+      pvc: mirror-bundles
+      filename: release-v4.17-update.tar

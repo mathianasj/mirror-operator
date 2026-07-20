@@ -105,6 +105,35 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
+	// Expand PVC if storageSize increased, regardless of pipeline state
+	if pipeline.Spec.StorageSize != nil {
+		pvcName := pipeline.Status.WorkingPVCName
+		if pvcName == "" {
+			if pipeline.Spec.ParentPipeline != "" {
+				pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.ParentPipeline)
+			} else if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+				pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+			} else {
+				pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+			}
+		}
+		if pvcName != "" {
+			existingPVC := &corev1.PersistentVolumeClaim{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: pvcName}, existingPVC); err == nil {
+				desiredSize := *pipeline.Spec.StorageSize
+				currentSize := existingPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+				if desiredSize.Cmp(currentSize) > 0 {
+					logger.Info("Expanding working PVC", "pvc", pvcName, "from", currentSize.String(), "to", desiredSize.String())
+					existingPVC.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
+					if err := r.Update(ctx, existingPVC); err != nil {
+						logger.Error(err, "failed to expand PVC", "pvc", pvcName)
+						return ctrl.Result{}, err
+					}
+				}
+			}
+		}
+	}
+
 	if pipeline.Status.PipelineRunRef != "" {
 		// Check if signing config has changed since PipelineRun was created
 		// If it has and the run hasn't started yet, recreate it
@@ -156,6 +185,45 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 			}
 		}
 		return r.trackPipelineRun(ctx, pipeline, req)
+	}
+
+	// Validate parent pipeline if specified
+	if pipeline.Spec.ParentPipeline != "" {
+		parentPipeline := &mirrorv1.CollectionPipeline{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pipeline.Spec.ParentPipeline, Namespace: pipeline.Namespace}, parentPipeline); err != nil {
+			if apierrors.IsNotFound(err) {
+				pipeline.Status.Phase = "Failed"
+				now := metav1.Now()
+				pipeline.Status.CompletionTime = &now
+				pipeline.Status.Conditions = []metav1.Condition{
+					{
+						Type:               "ParentPipelineValid",
+						Status:             metav1.ConditionFalse,
+						Reason:             "ParentNotFound",
+						Message:            fmt.Sprintf("parent pipeline %s not found", pipeline.Spec.ParentPipeline),
+						LastTransitionTime: now,
+					},
+				}
+				return ctrl.Result{}, r.Status().Update(ctx, pipeline)
+			}
+			logger.Error(err, "failed to get parent pipeline")
+			return ctrl.Result{}, err
+		}
+
+		// Validate parent is completed
+		if parentPipeline.Status.Phase != string(mirrorv1.CollectionPhaseComplete) {
+			logger.Info("Waiting for parent pipeline to complete", "parent", pipeline.Spec.ParentPipeline, "parentPhase", parentPipeline.Status.Phase)
+			// Requeue after a delay to check again
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// Capture parent version in status if not already set
+		if pipeline.Status.ParentPipelineVersion == "" {
+			pipeline.Status.ParentPipelineVersion = parentPipeline.Status.Version
+			if err := r.Status().Update(ctx, pipeline); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
@@ -441,18 +509,39 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 }
 
 func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) error {
+	logger := log.FromContext(ctx)
 	// Always create working PVC - it's needed for temporary storage during collection
 	// Even when using S3 for final storage, we need working space
 
 	// Determine working PVC name with 1:1 mapping to pipeline
-	// For incremental collections, reuse the base version's PVC
+	// Priority order: parent pipeline > incremental base version > own PVC
 	var workingPVCName string
-	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+	if pipeline.Spec.ParentPipeline != "" {
+		// Reuse parent pipeline's working PVC
+		parentPipeline := &mirrorv1.CollectionPipeline{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pipeline.Spec.ParentPipeline, Namespace: pipeline.Namespace}, parentPipeline); err != nil {
+			return fmt.Errorf("failed to get parent pipeline for PVC lookup: %w", err)
+		}
+		if parentPipeline.Status.WorkingPVCName != "" {
+			workingPVCName = parentPipeline.Status.WorkingPVCName
+		} else {
+			// Fallback: derive from parent's name if status not yet populated
+			workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.ParentPipeline)
+		}
+	} else if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
 		// Use the base version's PVC name for incremental builds
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
 	} else {
 		// Each CollectionPipeline gets its own PVC (1:1 mapping)
 		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+	}
+
+	// Track the working PVC name in status
+	if pipeline.Status.WorkingPVCName != workingPVCName {
+		pipeline.Status.WorkingPVCName = workingPVCName
+		if err := r.Status().Update(ctx, pipeline); err != nil {
+			return err
+		}
 	}
 
 	// Ensure working PVC exists
@@ -462,9 +551,12 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		// Create new working PVC - only for non-incremental collections
+		// Create new working PVC - only for non-incremental, non-parent-referencing collections
 		if pipeline.Spec.Incremental {
 			return fmt.Errorf("incremental collection requires base working PVC %s to exist", workingPVCName)
+		}
+		if pipeline.Spec.ParentPipeline != "" {
+			return fmt.Errorf("parent pipeline collection requires parent working PVC %s to exist", workingPVCName)
 		}
 
 		workingPVC := &corev1.PersistentVolumeClaim{
@@ -486,13 +578,24 @@ func (r *CollectionPipelineReconciler) ensurePVC(ctx context.Context, pipeline *
 				},
 				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("100Gi"),
+						corev1.ResourceStorage: getStorageSize(pipeline),
 					},
 				},
 			},
 		}
 		if err := r.Create(ctx, workingPVC); err != nil {
 			return err
+		}
+	} else {
+		// PVC exists — expand if requested size is larger
+		desiredSize := getStorageSize(pipeline)
+		currentSize := existingWorking.Spec.Resources.Requests[corev1.ResourceStorage]
+		if desiredSize.Cmp(currentSize) > 0 {
+			logger.Info("Expanding working PVC", "pvc", workingPVCName, "from", currentSize.String(), "to", desiredSize.String())
+			existingWorking.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
+			if err := r.Update(ctx, existingWorking); err != nil {
+				return fmt.Errorf("failed to expand PVC %s: %w", workingPVCName, err)
+			}
 		}
 	}
 
@@ -518,12 +621,25 @@ func collectionPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, cm *corev1.ConfigMap) (*pipelinev1.PipelineRun, error) {
 	logger := log.FromContext(ctx)
 
-	// Determine working PVC name
-	var workingPVCName string
-	if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
-		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
-	} else {
-		workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+	// Use the working PVC name from status (set by ensurePVC)
+	workingPVCName := pipeline.Status.WorkingPVCName
+	if workingPVCName == "" {
+		// Fallback: determine working PVC name using same logic as ensurePVC
+		if pipeline.Spec.ParentPipeline != "" {
+			parentPipeline := &mirrorv1.CollectionPipeline{}
+			if err := r.Get(ctx, types.NamespacedName{Name: pipeline.Spec.ParentPipeline, Namespace: pipeline.Namespace}, parentPipeline); err != nil {
+				return nil, fmt.Errorf("failed to get parent pipeline for PVC lookup: %w", err)
+			}
+			if parentPipeline.Status.WorkingPVCName != "" {
+				workingPVCName = parentPipeline.Status.WorkingPVCName
+			} else {
+				workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.ParentPipeline)
+			}
+		} else if pipeline.Spec.Incremental && pipeline.Spec.BaseVersion != "" {
+			workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Spec.BaseVersion)
+		} else {
+			workingPVCName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+		}
 	}
 
 	// Get runtime config from DisconnectedPlatform
@@ -928,7 +1044,6 @@ func (r *CollectionPipelineReconciler) getTPAAndKeycloakHosts(ctx context.Contex
 		return tpaHostname, "", ""
 	}
 
-	// TPA CLI client ID is "cli"
 	oidcClientID := "cli"
 
 	return tpaHostname, oidcIssuer, oidcClientID
@@ -1093,6 +1208,13 @@ func rewriteImageReference(originalRef, intermediateRegistry string) string {
 	// For specific images, use flat structure in intermediate registry
 	// This matches oc-mirror's default behavior of flattening paths
 	return intermediateRegistry + "/" + imageName
+}
+
+func getStorageSize(pipeline *mirrorv1.CollectionPipeline) resource.Quantity {
+	if pipeline.Spec.StorageSize != nil {
+		return *pipeline.Spec.StorageSize
+	}
+	return resource.MustParse("100Gi")
 }
 
 // getParentDisconnectedPlatform finds the DisconnectedPlatform that owns this CollectionPipeline
