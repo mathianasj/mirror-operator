@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -92,7 +93,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 			cm, err := r.ensureConfigMap(ctx, pipeline, "mirror-config-test-pipeline")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cm).NotTo(BeNil())
-			Expect(cm.Data["imageset-config.yaml"]).To(Equal(pipeline.Spec.ImageSetConfig))
+			Expect(cm.Data["imageset-config.yaml"]).To(ContainSubstring("ImageSetConfiguration"))
 		})
 
 		It("returns existing ConfigMap without creating a duplicate", func() {
@@ -141,7 +142,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 			}
 		})
 
-		It("uses file:// destination with --v2 flag and three tasks", func() {
+		It("creates a PipelineRun referencing the template with correct params", func() {
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
 				Spec: mirrorv1.CollectionPipelineSpec{
@@ -157,14 +158,16 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 
 			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pr.Spec.PipelineSpec.Tasks).To(HaveLen(3))
-			Expect(pr.Spec.PipelineSpec.Tasks[0].Name).To(Equal("oc-mirror"))
-			Expect(pr.Spec.PipelineSpec.Tasks[1].Name).To(Equal("syft-sbom"))
-			Expect(pr.Spec.PipelineSpec.Tasks[2].Name).To(Equal("cosign-sign"))
-			step := pr.Spec.PipelineSpec.Tasks[0].TaskSpec.Steps[0]
-			Expect(step.Args).To(ContainElement("file:///workspace/output"))
-			Expect(step.Args).To(ContainElement("--v2"))
-			Expect(step.Image).To(Equal("custom-oc-mirror:latest"))
+			Expect(pr.Spec.PipelineRef).NotTo(BeNil())
+			Expect(pr.Spec.PipelineRef.Name).To(Equal("collection-pipeline-template"))
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["config-map-name"]).To(Equal(cm.Name))
+			Expect(paramMap["mirror-image"]).To(Equal("custom-oc-mirror:latest"))
+			Expect(paramMap["working-pvc-name"]).To(Equal("collection-storage-test-pipeline"))
 		})
 
 		It("adds cosign-key workspace when signing config is set", func() {
@@ -191,13 +194,9 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 					SecretName: "cosign-key-secret",
 				},
 			}))
-			cosignTask := pr.Spec.PipelineSpec.Tasks[2]
-			Expect(cosignTask.Workspaces).To(ContainElement(pipelinev1.WorkspacePipelineTaskBinding{
-				Name: "cosign-key", Workspace: "cosign-key",
-			}))
 		})
 
-		It("sets COSIGN_PASSWORD when password secret is configured", func() {
+		It("adds cosign-key workspace when key secret ref is set with password", func() {
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
 				Spec: mirrorv1.CollectionPipelineSpec{
@@ -208,6 +207,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 						},
 					},
 					Signing: &mirrorv1.CosignSigningConfig{
+						KeySecretRef:      &corev1.LocalObjectReference{Name: "cosign-key-secret"},
 						PasswordSecretRef: &corev1.LocalObjectReference{Name: "cosign-pass-secret"},
 					},
 				},
@@ -215,52 +215,45 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 
 			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
 			Expect(err).NotTo(HaveOccurred())
-			cosignStep := pr.Spec.PipelineSpec.Tasks[2].TaskSpec.Steps[0]
-			Expect(cosignStep.Env).To(ContainElement(corev1.EnvVar{
-				Name: "COSIGN_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: "cosign-pass-secret"},
-						Key:                  "password",
-					},
+			Expect(pr.Spec.PipelineRef).NotTo(BeNil())
+			Expect(pr.Spec.Workspaces).To(ContainElement(pipelinev1.WorkspaceBinding{
+				Name: "cosign-key",
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "cosign-key-secret",
 				},
 			}))
 		})
 
-		It("injects S3 env vars when S3 output is configured", func() {
-			s3Secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "s3-secret", Namespace: "default"},
-				Data: map[string][]byte{
-					"accessKeyId":     []byte("key"),
-					"secretAccessKey": []byte("secret"),
+		It("sets S3 params when OBC ConfigMap exists", func() {
+			obcConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data: map[string]string{
+					"BUCKET_NAME":   "my-bucket",
+					"BUCKET_HOST":   "https://s3.example.com",
+					"BUCKET_REGION": "us-east-1",
 				},
 			}
-			r.Client = fake.NewClientBuilder().WithScheme(testScheme).WithObjects(s3Secret).Build()
+			r.Client = fake.NewClientBuilder().WithScheme(testScheme).WithObjects(obcConfigMap).Build()
 
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
 				Spec: mirrorv1.CollectionPipelineSpec{
 					ImageSetConfig: "kind: ImageSetConfiguration",
-					Storage: mirrorv1.ArtifactOutput{
-						Output: &mirrorv1.BundleOutput{
-							S3: &mirrorv1.S3Config{
-								Bucket:    "my-bucket",
-								Region:    "us-east-1",
-								Endpoint:  "https://s3.example.com",
-								SecretRef: corev1.LocalObjectReference{Name: "s3-secret"},
-							},
-						},
-					},
 				},
 			}
 
 			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
 			Expect(err).NotTo(HaveOccurred())
-			step := pr.Spec.PipelineSpec.Tasks[0].TaskSpec.Steps[0]
-			Expect(step.Args).To(ContainElement("file:///workspace/output"))
-			Expect(step.Args).To(ContainElement("--v2"))
-			Expect(step.Env).To(ContainElement(corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: "https://s3.example.com"}))
-			Expect(step.Env).To(ContainElement(corev1.EnvVar{Name: "AWS_DEFAULT_REGION", Value: "us-east-1"}))
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["has-s3"]).To(Equal("true"))
+			Expect(paramMap["s3-bucket"]).To(Equal("my-bucket"))
+			Expect(paramMap["s3-region"]).To(Equal("us-east-1"))
+			Expect(paramMap["s3-endpoint"]).To(Equal("https://s3.example.com"))
+			Expect(paramMap["s3-secret-name"]).To(Equal("collection-artifacts"))
 		})
 
 		It("uses default image when MirrorImage is empty", func() {
@@ -274,8 +267,12 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 
 			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
 			Expect(err).NotTo(HaveOccurred())
-			step := pr.Spec.PipelineSpec.Tasks[0].TaskSpec.Steps[0]
-			Expect(step.Image).To(Equal(defaultMirrorImage))
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["mirror-image"]).To(Equal(defaultMirrorImage))
 		})
 	})
 
@@ -399,6 +396,20 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 					},
 				},
 			}
+			basePVC := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "collection-storage-v2025.01.01.001-manual",
+					Namespace: "default",
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("100Gi"),
+						},
+					},
+				},
+			}
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-pipeline",
@@ -422,7 +433,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 						&mirrorv1.DisconnectedPlatform{},
 						&mirrorv1.CollectionPipeline{},
 					).
-					WithObjects(platform, pipeline).
+					WithObjects(platform, pipeline, basePVC).
 					Build(),
 				Scheme: testScheme,
 			}
@@ -439,6 +450,20 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 		})
 
 		It("proceeds when incremental but no platform exists", func() {
+			basePVC := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "collection-storage-v2025.01.01.001-manual",
+					Namespace: "default",
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("100Gi"),
+						},
+					},
+				},
+			}
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-pipeline",
@@ -459,7 +484,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 				Client: fake.NewClientBuilder().
 					WithScheme(testScheme).
 					WithStatusSubresource(&mirrorv1.CollectionPipeline{}).
-					WithObjects(pipeline).
+					WithObjects(pipeline, basePVC).
 					Build(),
 				Scheme: testScheme,
 			}

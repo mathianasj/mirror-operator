@@ -6,6 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -273,6 +274,11 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 	Describe("architect reconciliation", func() {
 		It("creates frontend and backend deployments when architect is enabled", func() {
 			replicas := int32(1)
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
 			platform := &mirrorv1.DisconnectedPlatform{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-platform",
@@ -291,7 +297,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Client: fake.NewClientBuilder().
 					WithScheme(testScheme).
 					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
-					WithObjects(platform).
+					WithObjects(platform, pullSecret).
 					Build(),
 				Scheme:                 testScheme,
 				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
@@ -317,6 +323,11 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		})
 
 		It("creates route when route config is provided", func() {
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
 			platform := &mirrorv1.DisconnectedPlatform{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-platform",
@@ -340,7 +351,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Client: fake.NewClientBuilder().
 					WithScheme(testScheme).
 					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
-					WithObjects(platform).
+					WithObjects(platform, pullSecret).
 					Build(),
 				Scheme:                 testScheme,
 				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
@@ -400,8 +411,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		})
 
 		It("deletes all architect resources when disabled after being enabled", func() {
-			backendDepName := "mirror-operator-test-platform-airgap-architect-backend"
-			frontendDepName := "mirror-operator-test-platform-airgap-architect-frontend"
+			backendDepName := "mo-test-platform-airgap-architect-backend"
+			frontendDepName := "mo-test-platform-airgap-architect-frontend"
 			backendSvcName := backendDepName
 			frontendSvcName := frontendDepName
 
@@ -476,7 +487,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 
 		It("deletes architect resources on finalizer cleanup", func() {
 			now := metav1.Now()
-			backendDepName := "mirror-operator-test-platform-airgap-architect-backend"
+			backendDepName := "mo-test-platform-airgap-architect-backend"
 
 			backendDep := &unstructured.Unstructured{}
 			backendDep.SetGroupVersionKind(deploymentGVK)
