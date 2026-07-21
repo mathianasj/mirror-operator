@@ -717,12 +717,22 @@ spec:
                 description: Status of managed components
                 items:
                   properties:
+                    apiGroup:
+                      description: API group of the resource (e.g. apps, operators.coreos.com)
+                      type: string
+                    kind:
+                      description: Kubernetes resource kind (e.g. Deployment, Service,
+                        Subscription)
+                      type: string
                     lastCheck:
                       description: Last health check timestamp
                       format: date-time
                       type: string
                     name:
                       description: Component name
+                      type: string
+                    namespace:
+                      description: Namespace of the managed resource
                       type: string
                     status:
                       description: Component health status

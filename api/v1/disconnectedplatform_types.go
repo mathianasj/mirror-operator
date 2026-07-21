@@ -474,6 +474,15 @@ type ComponentStatus struct {
 	Name string `json:"name"`
 	// Component health status
 	Status string `json:"status"`
+	// Kubernetes resource kind (e.g. Deployment, Service, Subscription)
+	// +optional
+	Kind string `json:"kind,omitempty"`
+	// API group of the resource (e.g. apps, operators.coreos.com)
+	// +optional
+	APIGroup string `json:"apiGroup,omitempty"`
+	// Namespace of the managed resource
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 	// Component URL (if externally accessible)
 	// +optional
 	URL string `json:"url,omitempty"`

@@ -196,6 +196,12 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			r.setErrorCondition(platform, "ManagedKeycloakFailed", err.Error())
 			return ctrl.Result{}, r.Status().Update(ctx, platform)
 		}
+		platform.Status.Components = append(platform.Status.Components,
+			mirrorv1.ComponentStatus{Name: "keycloak", Status: "Running",
+				Kind: "Keycloak", APIGroup: "k8s.keycloak.org", Namespace: architectNamespace},
+			mirrorv1.ComponentStatus{Name: "keycloak-postgresql", Status: "Running",
+				Kind: "StatefulSet", APIGroup: "apps", Namespace: architectNamespace},
+		)
 		// Check if Keycloak instance is actually ready
 		if err := r.checkKeycloakHealth(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "Keycloak instance not healthy")
@@ -207,6 +213,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	if signingImages {
 		if err := r.reconcileRHTASConfig(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile RHTAS config")
+		} else {
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{Name: "securesign", Status: "Running",
+					Kind: "Securesign", APIGroup: "rhtas.redhat.com", Namespace: architectNamespace},
+			)
 		}
 		if err := r.extractRHTASRootKeys(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to extract RHTAS root keys")
@@ -232,6 +243,13 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	if platform.Spec.Connected != nil && platform.Spec.Connected.RHTPA != nil {
 		if err := r.reconcileRHTPAConfig(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile RHTPA config")
+		} else {
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{Name: "trusted-profile-analyzer", Status: "Running",
+					Kind: "TrustedProfileAnalyzer", APIGroup: "rhtpa.io", Namespace: architectNamespace},
+				mirrorv1.ComponentStatus{Name: "rhtpa-postgresql", Status: "Running",
+					Kind: "StatefulSet", APIGroup: "apps", Namespace: architectNamespace},
+			)
 		}
 	}
 
@@ -239,6 +257,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	if platform.Spec.Mode == mirrorv1.PlatformModeConnected && platform.Spec.Connected != nil {
 		if err := r.reconcileQuayConfig(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile Quay config")
+		} else if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{Name: "quay-registry", Status: "Running",
+					Kind: "QuayRegistry", APIGroup: "quay.redhat.com", Namespace: architectNamespace},
+			)
 		}
 		// Ensure Quay credentials are in pull-secret for managed Quay
 		if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
@@ -249,6 +272,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		// Reconcile ObjectBucketClaim for artifacts storage
 		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile artifacts bucket")
+		} else {
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{Name: "collection-artifacts", Status: "Running",
+					Kind: "ObjectBucketClaim", APIGroup: "objectbucket.io", Namespace: architectNamespace},
+			)
 		}
 		// Sync S3 config from ConfigMap to Secret for backend
 		if err := r.syncS3ConfigToSecret(ctx, platform); err != nil {
@@ -257,6 +285,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile collection pipeline template")
+		} else {
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{Name: "collection-pipeline-template", Status: "Running",
+					Kind: "Pipeline", APIGroup: "tekton.dev", Namespace: architectNamespace},
+			)
 		}
 	}
 
@@ -306,6 +339,7 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 
 	platform.Status.Components = append(platform.Status.Components, mirrorv1.ComponentStatus{
 		Name: "disconnected-platform", Status: "Running",
+		Kind: "DisconnectedPlatform", APIGroup: "mirror.mirror.mathianasj.github.com",
 	})
 
 	// Set Ready condition to true if no errors
@@ -428,16 +462,16 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 		}
 		if cfg != nil && cfg.Disabled {
 			components = append(components, mirrorv1.ComponentStatus{
-				Name:   op.name,
-				Status: "Disabled",
+				Name: op.name, Status: "Disabled",
+				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			})
 			continue
 		}
 
 		if err := r.ensureNamespace(ctx, op.ns); err != nil {
 			components = append(components, mirrorv1.ComponentStatus{
-				Name:   op.name,
-				Status: "Error",
+				Name: op.name, Status: "Error",
+				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			})
 			platform.Status.Components = components
 			return fmt.Errorf("namespace for %s: %w", op.name, err)
@@ -445,8 +479,8 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 
 		if err := r.ensureOperatorGroup(ctx, op); err != nil {
 			components = append(components, mirrorv1.ComponentStatus{
-				Name:   op.name,
-				Status: "Error",
+				Name: op.name, Status: "Error",
+				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			})
 			platform.Status.Components = components
 			return fmt.Errorf("operatorgroup for %s: %w", op.name, err)
@@ -454,8 +488,8 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 
 		if err := r.ensureSubscription(ctx, op, cfg); err != nil {
 			components = append(components, mirrorv1.ComponentStatus{
-				Name:   op.name,
-				Status: "Error",
+				Name: op.name, Status: "Error",
+				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			})
 			platform.Status.Components = components
 			return fmt.Errorf("subscription for %s: %w", op.name, err)
@@ -466,8 +500,8 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 			compStatus = "Installing"
 		}
 		components = append(components, mirrorv1.ComponentStatus{
-			Name:   op.name,
-			Status: compStatus,
+			Name: op.name, Status: compStatus,
+			Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 		})
 
 		// Enable console plugins for operators that provide them
@@ -5019,7 +5053,8 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 			return err
 		}
 		platform.Status.Components = append(platform.Status.Components,
-			mirrorv1.ComponentStatus{Name: "airgap-architect-frontend", Status: "Running"},
+			mirrorv1.ComponentStatus{Name: "airgap-architect-frontend", Status: "Running",
+				Kind: "Deployment", APIGroup: "apps", Namespace: architectNamespace},
 		)
 	} else if cfg.ConsolePlugin != nil && cfg.ConsolePlugin.Enabled && cfg.FrontendImage == "" {
 		// Only delete frontend if console plugin is enabled AND frontendImage is not explicitly set
@@ -5050,7 +5085,8 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 			logger.Error(err, "failed to enable console plugin in operator")
 		}
 		platform.Status.Components = append(platform.Status.Components,
-			mirrorv1.ComponentStatus{Name: "airgap-architect-console-plugin", Status: "Running"},
+			mirrorv1.ComponentStatus{Name: "airgap-architect-console-plugin", Status: "Running",
+				Kind: "Deployment", APIGroup: "apps", Namespace: architectNamespace},
 		)
 		logger.Info("Console plugin enabled - UI accessible via OpenShift Console: Administrator → Airgap Architect")
 	} else {
@@ -5061,7 +5097,8 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 	}
 
 	platform.Status.Components = append(platform.Status.Components,
-		mirrorv1.ComponentStatus{Name: "airgap-architect-backend", Status: "Running"},
+		mirrorv1.ComponentStatus{Name: "airgap-architect-backend", Status: "Running",
+			Kind: "Deployment", APIGroup: "apps", Namespace: architectNamespace},
 	)
 	return nil
 }
