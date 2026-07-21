@@ -3460,6 +3460,40 @@ func (r *DisconnectedPlatformReconciler) updateKeycloakClientSecret(ctx context.
 	return nil
 }
 
+// resolveQuayS3Credentials returns S3 credentials from explicit CR spec values if provided,
+// otherwise provisions an OBC and reads the auto-generated credentials.
+func (r *DisconnectedPlatformReconciler) resolveQuayS3Credentials(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, storage *mirrorv1.QuayStorageConfig) (*resolvedS3Credentials, error) {
+	hasExplicit := storage.S3AccessKey != "" || storage.S3SecretKey != "" || storage.S3Bucket != "" || storage.S3Endpoint != ""
+	if hasExplicit {
+		endpoint := storage.S3Endpoint
+		hostname := endpoint
+		port := 443
+		isSecure := true
+		if strings.Contains(endpoint, ":") {
+			parts := strings.Split(endpoint, ":")
+			hostname = parts[0]
+			if len(parts) == 2 {
+				if p, err := strconv.Atoi(parts[1]); err == nil {
+					port = p
+					if port != 443 {
+						isSecure = false
+					}
+				}
+			}
+		}
+		return &resolvedS3Credentials{
+			Hostname:  hostname,
+			Port:      port,
+			IsSecure:  isSecure,
+			Bucket:    storage.S3Bucket,
+			AccessKey: storage.S3AccessKey,
+			SecretKey: storage.S3SecretKey,
+		}, nil
+	}
+
+	return r.reconcileQuayOBC(ctx, platform)
+}
+
 // reconcileQuayConfig creates and manages a Quay registry for intermediate image storage
 func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
@@ -3481,7 +3515,6 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 
 	// Deploy managed Quay instance
 	if quayConfig.Managed != nil && quayConfig.Managed.Enabled {
-		// Check if QuayRegistry CRD exists
 		quayRegistry := &unstructured.Unstructured{}
 		quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   "quay.redhat.com",
@@ -3491,10 +3524,25 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		quayRegistry.SetName("mirror-operator-quay")
 		quayRegistry.SetNamespace(architectNamespace)
 
+		useS3Storage := quayConfig.Managed.Storage != nil && quayConfig.Managed.Storage.Type == "s3"
+
 		// Check if QuayRegistry already exists
 		err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry)
 		if err == nil {
-			// QuayRegistry exists, get its hostname and update mirrorRegistry
+			// QuayRegistry exists — ensure config bundle secret has valid S3 creds
+			if useS3Storage {
+				creds, err := r.resolveQuayS3Credentials(ctx, platform, quayConfig.Managed.Storage)
+				if err != nil {
+					return fmt.Errorf("failed to resolve Quay S3 credentials: %w", err)
+				}
+				if creds != nil {
+					if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds); err != nil {
+						logger.Error(err, "failed to update Quay S3 config secret")
+					}
+				}
+			}
+
+			// Get hostname and update mirrorRegistry
 			hostname, err := r.getQuayHostname(ctx, quayRegistry)
 			if err != nil {
 				logger.Error(err, "failed to get Quay hostname")
@@ -3505,7 +3553,6 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				newRegistry := hostname + "/mirror"
 				logger.Info("Updated mirrorRegistry from managed Quay", "registry", newRegistry)
 
-				// Refetch to get latest version before updating
 				latest := &mirrorv1.DisconnectedPlatform{}
 				if err := r.Get(ctx, client.ObjectKeyFromObject(platform), latest); err != nil {
 					return fmt.Errorf("failed to refetch platform for mirrorRegistry update: %w", err)
@@ -3516,7 +3563,6 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 					return fmt.Errorf("failed to update mirrorRegistry: %w", err)
 				}
 
-				// Update our local copy too
 				platform.Spec.Connected.MirrorRegistry = newRegistry
 			}
 
@@ -3536,17 +3582,19 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		// Create new QuayRegistry
 		logger.Info("Creating managed Quay registry")
 
-		orgName := quayConfig.Managed.OrganizationName
-		if orgName == "" {
-			orgName = "mirror"
+		// If S3 storage, resolve credentials before creating QuayRegistry
+		var creds *resolvedS3Credentials
+		if useS3Storage {
+			creds, err = r.resolveQuayS3Credentials(ctx, platform, quayConfig.Managed.Storage)
+			if err != nil {
+				return fmt.Errorf("failed to resolve Quay S3 credentials: %w", err)
+			}
+			if creds == nil {
+				logger.Info("Waiting for Quay S3 OBC credentials to become ready")
+				return nil
+			}
 		}
 
-		// Determine if using S3 storage
-		useS3Storage := quayConfig.Managed.Storage != nil && quayConfig.Managed.Storage.Type == "s3"
-
-		// Build QuayRegistry spec
-		// For filesystem storage: use managed objectstorage (requires ObjectBucketClaim CRD)
-		// For S3 storage: use unmanaged objectstorage with config bundle secret
 		objectStorageManaged := !useS3Storage
 
 		components := []interface{}{
@@ -3592,82 +3640,51 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			return fmt.Errorf("failed to set QuayRegistry components: %w", err)
 		}
 
-		// If using S3 storage, set the configBundleSecret reference
 		if useS3Storage {
-			// Set the configBundleSecret reference
 			if err := unstructured.SetNestedField(quayRegistry.Object, quayRegistry.GetName()+"-config-bundle", "spec", "configBundleSecret"); err != nil {
 				return fmt.Errorf("failed to set configBundleSecret: %w", err)
 			}
 		}
 
-		// Create QuayRegistry first
 		if err := r.Create(ctx, quayRegistry); err != nil {
 			return fmt.Errorf("failed to create QuayRegistry: %w", err)
 		}
 
 		logger.Info("Created managed Quay registry", "name", quayRegistry.GetName(), "s3Storage", useS3Storage)
 
-		// If using S3 storage, create config bundle secret with S3 credentials after QuayRegistry is created
 		if useS3Storage {
-			if err := r.createQuayS3ConfigSecret(ctx, quayRegistry, quayConfig.Managed.Storage); err != nil {
+			if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds); err != nil {
 				logger.Error(err, "failed to create Quay S3 config secret, will retry on next reconciliation")
-				// Don't return error - let it retry on next reconciliation when QuayRegistry has UID
 			}
 		}
 
-		// Configure Clair if requested
 		if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
 			if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
 				logger.Error(err, "failed to configure Clair VEX, will retry on next reconciliation")
 			}
 		}
 
-		// Wait for Quay to be ready and get hostname
-		// Note: This will be updated in subsequent reconciliations
 		return nil
 	}
 
 	return nil
 }
 
-// createQuayS3ConfigSecret creates a config bundle secret for Quay with S3 storage configuration
-func (r *DisconnectedPlatformReconciler) createQuayS3ConfigSecret(ctx context.Context, quayRegistry *unstructured.Unstructured, storage *mirrorv1.QuayStorageConfig) error {
+// createOrUpdateQuayS3ConfigSecret creates or updates the config bundle secret for Quay with resolved S3 credentials.
+func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx context.Context, quayRegistry *unstructured.Unstructured, creds *resolvedS3Credentials) error {
 	logger := log.FromContext(ctx)
 
-	// Parse endpoint to extract hostname and port
-	endpoint := storage.S3Endpoint
-	hostname := endpoint
-	port := 443
-	isSecure := true
-
-	// Check if endpoint includes port (e.g., "minio.svc:9000")
-	if strings.Contains(endpoint, ":") {
-		parts := strings.Split(endpoint, ":")
-		hostname = parts[0]
-		if len(parts) == 2 {
-			// Parse port
-			if p, err := strconv.Atoi(parts[1]); err == nil {
-				port = p
-				// If port is not 443, assume not using TLS
-				if port != 443 {
-					isSecure = false
-				}
-			}
-		}
-	}
-
-	// Quay config.yaml structure for S3 storage
 	quayConfig := map[string]interface{}{
 		"DISTRIBUTED_STORAGE_CONFIG": map[string]interface{}{
 			"default": []interface{}{
 				"RadosGWStorage",
 				map[string]interface{}{
-					"hostname":     hostname,
-					"is_secure":    isSecure,
-					"port":         port,
-					"bucket_name":  storage.S3Bucket,
-					"access_key":   storage.S3AccessKey,
-					"secret_key":   storage.S3SecretKey,
+					"hostname":     creds.Hostname,
+					"is_secure":    creds.IsSecure,
+					"port":         creds.Port,
+					"bucket_name":  creds.Bucket,
+					"access_key":   creds.AccessKey,
+					"secret_key":   creds.SecretKey,
 					"storage_path": "/datastorage/registry",
 				},
 			},
@@ -3678,16 +3695,27 @@ func (r *DisconnectedPlatformReconciler) createQuayS3ConfigSecret(ctx context.Co
 		},
 	}
 
-	// Convert to YAML
 	configYAML, err := yaml.Marshal(quayConfig)
 	if err != nil {
 		return fmt.Errorf("failed to marshal Quay config: %w", err)
 	}
 
-	// Create secret
+	secretName := quayRegistry.GetName() + "-config-bundle"
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: quayRegistry.GetNamespace()}, existing); err == nil {
+		existing.Data = map[string][]byte{"config.yaml": configYAML}
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("failed to update Quay config bundle secret: %w", err)
+		}
+		logger.Info("Updated Quay S3 config bundle secret", "secret", secretName)
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      quayRegistry.GetName() + "-config-bundle",
+			Name:      secretName,
 			Namespace: quayRegistry.GetNamespace(),
 		},
 		Data: map[string][]byte{
@@ -3696,7 +3724,6 @@ func (r *DisconnectedPlatformReconciler) createQuayS3ConfigSecret(ctx context.Co
 		Type: corev1.SecretTypeOpaque,
 	}
 
-	// Set owner reference if QuayRegistry has UID (already created)
 	if quayRegistry.GetUID() != "" {
 		secret.SetOwnerReferences([]metav1.OwnerReference{
 			{
@@ -3710,15 +3737,89 @@ func (r *DisconnectedPlatformReconciler) createQuayS3ConfigSecret(ctx context.Co
 	}
 
 	if err := r.Create(ctx, secret); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
+		return err
+	}
+	logger.Info("Created Quay S3 config bundle secret", "secret", secretName)
+	return nil
+}
+
+// resolvedS3Credentials holds S3 storage credentials resolved from either the CR spec or an OBC.
+type resolvedS3Credentials struct {
+	Hostname  string
+	Port      int
+	IsSecure  bool
+	Bucket    string
+	AccessKey string
+	SecretKey string
+}
+
+// reconcileQuayOBC ensures an ObjectBucketClaim exists for Quay S3 storage and returns
+// the resolved credentials. Returns nil credentials if the OBC is not yet ready.
+func (r *DisconnectedPlatformReconciler) reconcileQuayOBC(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (*resolvedS3Credentials, error) {
+	logger := log.FromContext(ctx)
+
+	obcName := "quay-storage"
+	obc := &unstructured.Unstructured{}
+	obc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "objectbucket.io",
+		Version: "v1alpha1",
+		Kind:    "ObjectBucketClaim",
+	})
+	obc.SetName(obcName)
+	obc.SetNamespace(architectNamespace)
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(obc.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(obc), existing); apierrors.IsNotFound(err) {
+		obc.Object["spec"] = map[string]interface{}{
+			"generateBucketName": obcName,
+			"storageClassName":   "openshift-storage.noobaa.io",
 		}
-		logger.Info("Config bundle secret already exists", "secret", secret.Name)
-	} else {
-		logger.Info("Created Quay S3 config bundle secret", "secret", secret.Name)
+		if err := ctrl.SetControllerReference(platform, obc, r.Scheme); err != nil {
+			return nil, fmt.Errorf("failed to set owner reference on Quay OBC: %w", err)
+		}
+		if err := r.Create(ctx, obc); err != nil {
+			return nil, fmt.Errorf("failed to create Quay storage OBC: %w", err)
+		}
+		logger.Info("Created Quay storage ObjectBucketClaim")
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get Quay storage OBC: %w", err)
 	}
 
-	return nil
+	obcConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcConfigMap); err != nil {
+		logger.Info("Quay storage OBC ConfigMap not ready yet")
+		return nil, nil
+	}
+
+	obcSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: obcName, Namespace: architectNamespace}, obcSecret); err != nil {
+		logger.Info("Quay storage OBC Secret not ready yet")
+		return nil, nil
+	}
+
+	hostname := obcConfigMap.Data["BUCKET_HOST"]
+	portStr := obcConfigMap.Data["BUCKET_PORT"]
+	port := 443
+	isSecure := true
+	if portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil {
+			port = p
+			if port != 443 {
+				isSecure = false
+			}
+		}
+	}
+
+	return &resolvedS3Credentials{
+		Hostname:  hostname,
+		Port:      port,
+		IsSecure:  isSecure,
+		Bucket:    obcConfigMap.Data["BUCKET_NAME"],
+		AccessKey: string(obcSecret.Data["AWS_ACCESS_KEY_ID"]),
+		SecretKey: string(obcSecret.Data["AWS_SECRET_ACCESS_KEY"]),
+	}, nil
 }
 
 // configureClairVEX configures Clair to use only Red Hat VEX data for vulnerability scanning
@@ -5051,9 +5152,12 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 		}
 	}
 
+	// Console plugin is enabled by default (when ConsolePlugin is nil or Enabled is not explicitly false)
+	consolePluginEnabled := cfg.ConsolePlugin == nil || cfg.ConsolePlugin.Enabled
+
 	// Frontend resources (after routes to get hostnames)
-	// Deploy if frontendImage is explicitly set, or if console plugin is not enabled (default mode)
-	deployFrontend := frontendImage != "" && (cfg.ConsolePlugin == nil || !cfg.ConsolePlugin.Enabled || cfg.FrontendImage != "")
+	// Deploy if frontendImage is explicitly set, or if console plugin is not enabled
+	deployFrontend := frontendImage != "" && (!consolePluginEnabled || cfg.FrontendImage != "")
 
 	if deployFrontend {
 		frontendName := architectResourceName(platform, "airgap-architect-frontend")
@@ -5068,7 +5172,7 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 			mirrorv1.ComponentStatus{Name: "airgap-architect-frontend", Status: "Running",
 				Kind: "Deployment", APIGroup: "apps", Namespace: architectNamespace},
 		)
-	} else if cfg.ConsolePlugin != nil && cfg.ConsolePlugin.Enabled && cfg.FrontendImage == "" {
+	} else if consolePluginEnabled && cfg.FrontendImage == "" {
 		// Only delete frontend if console plugin is enabled AND frontendImage is not explicitly set
 		// This allows hybrid mode (both frontend and plugin) when frontendImage is specified
 		if err := r.deleteArchitectFrontendResources(ctx, platform); err != nil {
@@ -5076,11 +5180,17 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 		}
 	}
 
-	// Console Plugin resources (if enabled)
-	if cfg.ConsolePlugin != nil && cfg.ConsolePlugin.Enabled {
-		consolePluginImage := cfg.ConsolePlugin.Image
+	// Console Plugin resources (enabled by default)
+	if consolePluginEnabled {
+		consolePluginImage := ""
+		if cfg.ConsolePlugin != nil {
+			consolePluginImage = cfg.ConsolePlugin.Image
+		}
 		if consolePluginImage == "" {
 			consolePluginImage = r.ArchitectConsolePluginImage
+		}
+		if consolePluginImage == "" {
+			consolePluginImage = "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
 		}
 		pluginName := "airgap-architect-plugin"
 		pluginLabels := architectComponentLabels("console-plugin")
@@ -9755,5 +9865,6 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 			"kind":       "Route",
 		}}).
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
+		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
 		Complete(r)
 }

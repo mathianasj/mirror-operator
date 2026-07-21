@@ -82,7 +82,7 @@ func main() {
 		"airgap-architect frontend UI container image")
 	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mirror-operator/airgap-architect-backend:latest",
 		"airgap-architect backend API container image")
-	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image", "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest",
+	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest",
 		"airgap-architect OpenShift console plugin container image")
 	opts := zap.Options{
 		Development: true,

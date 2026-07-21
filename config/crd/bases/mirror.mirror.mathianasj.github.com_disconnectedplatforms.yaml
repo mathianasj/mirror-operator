@@ -197,8 +197,8 @@ spec:
                     description: Storage configuration for collection artifacts
                     properties:
                       size:
-                        default: 500Gi
-                        description: Storage size for collection artifacts (e.g. '500Gi')
+                        default: 200Gi
+                        description: Storage size for collection artifacts (e.g. '200Gi')
                         type: string
                       storageClass:
                         description: Kubernetes StorageClass to use for artifact PVCs
@@ -421,6 +421,7 @@ spec:
                             - name
                             type: object
                           enabled:
+                            default: true
                             description: Enable managed Quay deployment
                             type: boolean
                           organizationName:

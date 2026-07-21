@@ -63,7 +63,7 @@ spec:
     rhtpa:
       storage:
         type: local
-        size: 20Gi
+        size: 200Gi
 
     # Quay intermediate registry configuration
     # Operator manages database automatically

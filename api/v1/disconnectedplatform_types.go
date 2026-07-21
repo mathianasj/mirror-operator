@@ -26,8 +26,8 @@ type ArtifactStorageConfig struct {
 	// Kubernetes StorageClass to use for artifact PVCs
 	// +optional
 	StorageClass string `json:"storageClass,omitempty"`
-	// Storage size for collection artifacts (e.g. '500Gi')
-	// +kubebuilder:default="500Gi"
+	// Storage size for collection artifacts (e.g. '200Gi')
+	// +kubebuilder:default="200Gi"
 	Size string `json:"size"`
 }
 
@@ -200,6 +200,7 @@ type QuayInstallerConfig struct {
 type ManagedQuayConfig struct {
 	// Enable managed Quay deployment
 	// +optional
+	// +kubebuilder:default=true
 	Enabled bool `json:"enabled,omitempty"`
 	// Quay organization name for mirrored content
 	// +kubebuilder:default="mirror"

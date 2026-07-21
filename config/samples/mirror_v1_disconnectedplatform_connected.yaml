@@ -11,7 +11,7 @@ spec:
     collectionSchedule: "0 2 * * 0"
     mirrorRegistry: "quay.example.com/mirror"
     artifactStorage:
-      size: 2Ti
+      size: 200Gi
     triggerTypes:
       - scheduled
       - manual
@@ -27,7 +27,7 @@ spec:
     rhtpa:
       storage:
         type: local
-        size: 20Gi
+        size: 200Gi
       database:
         host: postgres.example.com
         name: rhtpa

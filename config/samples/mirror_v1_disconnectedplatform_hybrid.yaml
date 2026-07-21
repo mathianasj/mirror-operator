@@ -46,7 +46,7 @@ spec:
     rhtpa:
       storage:
         type: local
-        size: 20Gi
+        size: 200Gi
       database:
         host: postgres.example.com
         name: rhtpa
