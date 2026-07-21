@@ -74,6 +74,7 @@ rules:
 - apiGroups:
   - config.openshift.io
   resources:
+  - infrastructures
   - ingresses
   verbs:
   - get
@@ -184,6 +185,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - oauth.openshift.io
   resources:
   - oauthclients
@@ -280,6 +289,15 @@ rules:
   - rhtas.redhat.com
   resources:
   - securesigns/status
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rhtas.redhat.com
+  resources:
   - tufs
   verbs:
   - get
