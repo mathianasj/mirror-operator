@@ -108,10 +108,6 @@ spec:
                         type: object
                         x-kubernetes-map-type: atomic
                     type: object
-                required:
-                - bootstrapEnabled
-                - managementCluster
-                - mirrorRegistry
                 type: object
               architect:
                 description: Airgap Architect web UI configuration
@@ -130,8 +126,6 @@ spec:
                       image:
                         description: Container image for the console plugin
                         type: string
-                    required:
-                    - enabled
                     type: object
                   enabled:
                     description: Deploy the Airgap Architect web UI
@@ -192,12 +186,8 @@ spec:
                             - passthrough
                             - reencrypt
                             type: string
-                        required:
-                        - termination
                         type: object
                     type: object
-                required:
-                - enabled
                 type: object
               connected:
                 description: Connected mode configuration for content collection and
@@ -489,8 +479,6 @@ spec:
                                 type: string
                             type: object
                             x-kubernetes-map-type: atomic
-                        required:
-                        - enabled
                         type: object
                     type: object
                   rhtas:
@@ -583,8 +571,6 @@ spec:
                                     type: string
                                 type: object
                                 x-kubernetes-map-type: atomic
-                            required:
-                            - enabled
                             type: object
                           type:
                             description: OIDC identity claim type
@@ -719,8 +705,6 @@ spec:
                   repositoryURL:
                     description: Git repository URL for storing platform configuration
                     type: string
-                required:
-                - enabled
                 type: object
               mode:
                 allOf:

@@ -130,7 +130,8 @@ type RHTASOIDCConfig struct {
 
 type ManagedKeycloakConfig struct {
 	// Enable managed Keycloak deployment
-	Enabled bool `json:"enabled"`
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 	// Keycloak realm name
 	// +optional
 	Realm string `json:"realm,omitempty"`
@@ -198,7 +199,8 @@ type QuayInstallerConfig struct {
 
 type ManagedQuayConfig struct {
 	// Enable managed Quay deployment
-	Enabled bool `json:"enabled"`
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 	// Quay organization name for mirrored content
 	// +kubebuilder:default="mirror"
 	// +optional
@@ -333,11 +335,14 @@ type MirrorRegistryConfig struct {
 
 type AirgappedConfig struct {
 	// Whether this cluster serves as the management hub
-	ManagementCluster bool `json:"managementCluster"`
+	// +optional
+	ManagementCluster bool `json:"managementCluster,omitempty"`
 	// Target mirror registry URL for imported content
-	MirrorRegistry string `json:"mirrorRegistry"`
+	// +optional
+	MirrorRegistry string `json:"mirrorRegistry,omitempty"`
 	// Enable cluster bootstrapping from mirrored content
-	BootstrapEnabled bool `json:"bootstrapEnabled"`
+	// +optional
+	BootstrapEnabled bool `json:"bootstrapEnabled,omitempty"`
 	// Filesystem path for physical media import (e.g. /mnt/physical-media)
 	// +optional
 	ImportPath string `json:"importPath,omitempty"`
@@ -362,7 +367,8 @@ type TLSConfig struct {
 	// Route TLS termination type
 	// +kubebuilder:validation:Enum=edge;passthrough;reencrypt
 	// +kubebuilder:default="edge"
-	Termination string `json:"termination"`
+	// +optional
+	Termination string `json:"termination,omitempty"`
 }
 
 type RouteConfig struct {
@@ -376,7 +382,8 @@ type RouteConfig struct {
 
 type AirgapArchitectConfig struct {
 	// Deploy the Airgap Architect web UI
-	Enabled bool `json:"enabled"`
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 	// Container image for the Architect frontend
 	// +optional
 	FrontendImage string `json:"frontendImage,omitempty"`
@@ -404,7 +411,8 @@ type AirgapArchitectConfig struct {
 
 type ConsolePluginConfig struct {
 	// Enable the OpenShift console plugin for integrated management UI
-	Enabled bool `json:"enabled"`
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 	// Container image for the console plugin
 	// +optional
 	Image string `json:"image,omitempty"`
@@ -412,7 +420,8 @@ type ConsolePluginConfig struct {
 
 type GitOpsConfig struct {
 	// Enable GitOps integration for declarative management
-	Enabled bool `json:"enabled"`
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
 	// Git repository URL for storing platform configuration
 	// +optional
 	RepositoryURL string `json:"repositoryURL,omitempty"`
