@@ -19,6 +19,8 @@ spec:
   - name: v1
     schema:
       openAPIV3Schema:
+        description: DisconnectedPlatform is the top-level orchestrator for managing
+          disconnected OpenShift environments
         properties:
           apiVersion:
             description: |-
@@ -38,32 +40,42 @@ spec:
           metadata:
             type: object
           spec:
+            description: DisconnectedPlatformSpec defines the desired state of DisconnectedPlatform
             properties:
               airgapped:
+                description: Airgapped mode configuration for importing and serving
+                  mirrored content
                 properties:
                   bootstrapEnabled:
+                    description: Enable cluster bootstrapping from mirrored content
                     type: boolean
                   importPath:
+                    description: Filesystem path for physical media import (e.g. /mnt/physical-media)
                     type: string
                   managementCluster:
+                    description: Whether this cluster serves as the management hub
                     type: boolean
                   mirrorRegistry:
+                    description: Target mirror registry URL for imported content
                     type: string
                   mirrorRegistryConfig:
+                    description: Mirror registry deployment configuration (for operator-managed
+                      registry)
                     properties:
                       dataPath:
-                        description: 'DataPath is the storage path for Quay data (default:
-                          /opt/quay)'
+                        default: /opt/quay
+                        description: Storage path for Quay data
                         type: string
                       port:
-                        description: 'Port is the Quay service port (default: 8443)'
+                        default: 8443
+                        description: Quay service port
                         format: int32
+                        minimum: 1
                         type: integer
                     type: object
                   registryCredentials:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: Reference to a Secret containing registry pull/push
+                      credentials
                     properties:
                       name:
                         default: ""
@@ -77,11 +89,12 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   rhtas:
+                    description: Red Hat Trusted Artifact Signer configuration for
+                      airgapped signature verification
                     properties:
                       trustedRootKeys:
-                        description: |-
-                          LocalObjectReference contains enough information to let you locate the
-                          referenced object inside the same namespace.
+                        description: Reference to a Secret containing trusted root
+                          keys for airgapped signature verification
                         properties:
                           name:
                             default: ""
@@ -101,26 +114,34 @@ spec:
                 - mirrorRegistry
                 type: object
               architect:
+                description: Airgap Architect web UI configuration
                 properties:
                   backendImage:
+                    description: Container image for the Architect backend API
                     type: string
                   consolePlugin:
+                    description: OpenShift console plugin configuration for integrated
+                      UI
                     properties:
                       enabled:
+                        description: Enable the OpenShift console plugin for integrated
+                          management UI
                         type: boolean
                       image:
+                        description: Container image for the console plugin
                         type: string
                     required:
                     - enabled
                     type: object
                   enabled:
+                    description: Deploy the Airgap Architect web UI
                     type: boolean
                   frontendImage:
+                    description: Container image for the Architect frontend
                     type: string
                   githubTokenSecret:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: Reference to a Secret containing a GitHub token for
+                      release lookups
                     properties:
                       name:
                         default: ""
@@ -134,9 +155,8 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   pullSecret:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: Reference to a Secret containing pull credentials
+                      for Architect images
                     properties:
                       name:
                         default: ""
@@ -150,15 +170,27 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   replicas:
+                    default: 1
+                    description: Number of replicas for the Architect deployment
                     format: int32
+                    minimum: 1
                     type: integer
                   route:
+                    description: OpenShift Route configuration for external access
                     properties:
                       host:
+                        description: Custom hostname for the OpenShift Route
                         type: string
                       tls:
+                        description: TLS configuration for the Route
                         properties:
                           termination:
+                            default: edge
+                            description: Route TLS termination type
+                            enum:
+                            - edge
+                            - passthrough
+                            - reencrypt
                             type: string
                         required:
                         - termination
@@ -168,172 +200,283 @@ spec:
                 - enabled
                 type: object
               connected:
+                description: Connected mode configuration for content collection and
+                  mirroring
                 properties:
                   artifactStorage:
+                    description: Storage configuration for collection artifacts
                     properties:
                       size:
+                        default: 500Gi
+                        description: Storage size for collection artifacts (e.g. '500Gi')
                         type: string
                       storageClass:
+                        description: Kubernetes StorageClass to use for artifact PVCs
                         type: string
                     required:
                     - size
                     type: object
                   collectionSchedule:
+                    description: Cron schedule for automated content collection (e.g.
+                      '0 2 * * 0' for weekly Sunday 2am). Required only when triggerTypes
+                      includes 'scheduled'.
                     type: string
                   mirrorRegistry:
+                    description: Target mirror registry URL (auto-configured when
+                      managed Quay is enabled)
                     type: string
                   operators:
+                    description: OLM operator subscriptions managed by this platform
                     properties:
                       keycloak:
+                        description: Red Hat Build of Keycloak operator subscription
                         properties:
                           approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
                             type: string
                           catalogSource:
+                            description: OLM catalog source name
                             type: string
                           catalogSourceNamespace:
+                            description: OLM catalog source namespace
                             type: string
                           channel:
+                            description: OLM subscription channel
                             type: string
                           disabled:
+                            description: Set to true to skip installation of this
+                              operator
                             type: boolean
                           startingCSV:
+                            description: Starting CSV version for the subscription
                             type: string
                         type: object
                       openshiftPipelines:
+                        description: OpenShift Pipelines operator subscription (provides
+                          Tekton)
                         properties:
                           approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
                             type: string
                           catalogSource:
+                            description: OLM catalog source name
                             type: string
                           catalogSourceNamespace:
+                            description: OLM catalog source namespace
                             type: string
                           channel:
+                            description: OLM subscription channel
                             type: string
                           disabled:
+                            description: Set to true to skip installation of this
+                              operator
                             type: boolean
                           startingCSV:
+                            description: Starting CSV version for the subscription
                             type: string
                         type: object
                       quayOperator:
+                        description: Quay operator subscription for managed registry
                         properties:
                           approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
                             type: string
                           catalogSource:
+                            description: OLM catalog source name
                             type: string
                           catalogSourceNamespace:
+                            description: OLM catalog source namespace
                             type: string
                           channel:
+                            description: OLM subscription channel
                             type: string
                           disabled:
+                            description: Set to true to skip installation of this
+                              operator
                             type: boolean
                           startingCSV:
+                            description: Starting CSV version for the subscription
                             type: string
                         type: object
                       rhtas:
+                        description: Red Hat Trusted Artifact Signer operator subscription
                         properties:
                           approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
                             type: string
                           catalogSource:
+                            description: OLM catalog source name
                             type: string
                           catalogSourceNamespace:
+                            description: OLM catalog source namespace
                             type: string
                           channel:
+                            description: OLM subscription channel
                             type: string
                           disabled:
+                            description: Set to true to skip installation of this
+                              operator
                             type: boolean
                           startingCSV:
+                            description: Starting CSV version for the subscription
                             type: string
                         type: object
                       rhtpa:
+                        description: Red Hat Trusted Profile Analyzer operator subscription
                         properties:
                           approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
                             type: string
                           catalogSource:
+                            description: OLM catalog source name
                             type: string
                           catalogSourceNamespace:
+                            description: OLM catalog source namespace
                             type: string
                           channel:
+                            description: OLM subscription channel
                             type: string
                           disabled:
+                            description: Set to true to skip installation of this
+                              operator
                             type: boolean
                           startingCSV:
+                            description: Starting CSV version for the subscription
                             type: string
                         type: object
                     type: object
                   quay:
+                    description: Quay registry configuration for intermediate image
+                      storage
                     properties:
                       externalURL:
-                        description: External Quay configuration if not using managed
-                          instance
+                        description: External Quay URL if not using a managed instance
                         type: string
                       managed:
-                        description: Managed Quay instance for intermediate registry
+                        description: Deploy and manage a Quay registry instance
                         properties:
                           adminPassword:
+                            description: Quay admin password
                             type: string
                           adminUser:
+                            description: Quay admin username
                             type: string
                           certIssuer:
+                            description: cert-manager issuer reference for automatic
+                              TLS certificate provisioning
                             properties:
                               kind:
+                                default: ClusterIssuer
+                                description: Kind of the cert-manager issuer resource
+                                enum:
+                                - ClusterIssuer
+                                - Issuer
                                 type: string
                               name:
+                                description: Name of the cert-manager Issuer or ClusterIssuer
                                 type: string
                             required:
                             - name
                             type: object
                           clair:
+                            description: Clair vulnerability scanner configuration
                             properties:
                               useRedHatVEXOnly:
-                                description: UseRedHatVEXOnly configures Clair to
-                                  use only Red Hat VEX data for vulnerability scanning
+                                description: Configure Clair to use only Red Hat VEX
+                                  data for vulnerability scanning
                                 type: boolean
                             type: object
                           database:
+                            description: External database configuration for Quay
                             properties:
                               host:
+                                description: Database hostname
                                 type: string
                               name:
+                                description: Database name
                                 type: string
                               password:
+                                description: Database password
                                 type: string
                               port:
+                                description: Database port
                                 format: int32
+                                minimum: 1
                                 type: integer
                               username:
+                                description: Database username
                                 type: string
                             required:
                             - host
                             - name
                             type: object
                           enabled:
+                            description: Enable managed Quay deployment
                             type: boolean
                           organizationName:
+                            default: mirror
+                            description: Quay organization name for mirrored content
                             type: string
                           storage:
+                            description: Storage configuration for Quay registry
                             properties:
                               s3AccessKey:
+                                description: S3 access key (auto-provisioned via ODF
+                                  BucketClaim if not set)
                                 type: string
                               s3Bucket:
-                                description: S3-specific config
+                                description: S3 bucket name (auto-provisioned via
+                                  ODF BucketClaim if not set)
                                 type: string
                               s3Endpoint:
+                                description: S3 endpoint URL (auto-provisioned via
+                                  ODF BucketClaim if not set)
                                 type: string
                               s3SecretKey:
+                                description: S3 secret key (auto-provisioned via ODF
+                                  BucketClaim if not set)
                                 type: string
                               size:
+                                description: Storage size (for filesystem type)
                                 type: string
                               storageClass:
+                                description: Kubernetes StorageClass (for filesystem
+                                  type)
                                 type: string
                               type:
+                                default: s3
+                                description: 'Storage backend: filesystem (PVC) or
+                                  s3 (ODF BucketClaim)'
+                                enum:
+                                - filesystem
+                                - s3
                                 type: string
                             required:
                             - type
                             type: object
                           tlsSecret:
-                            description: |-
-                              LocalObjectReference contains enough information to let you locate the
-                              referenced object inside the same namespace.
+                            description: Reference to a pre-existing TLS secret for
+                              Quay
                             properties:
                               name:
                                 default: ""
@@ -351,55 +494,83 @@ spec:
                         type: object
                     type: object
                   rhtas:
+                    description: Red Hat Trusted Artifact Signer configuration for
+                      supply chain security
                     properties:
                       database:
+                        description: External database configuration for RHTAS
                         properties:
                           host:
+                            description: Database hostname
                             type: string
                           name:
+                            description: Database name
                             type: string
                           password:
+                            description: Database password
                             type: string
                           port:
+                            description: Database port
                             format: int32
+                            minimum: 1
                             type: integer
                           username:
+                            description: Database username
                             type: string
                         required:
                         - host
                         - name
                         type: object
                       oidc:
+                        description: OIDC configuration for Trusted Artifact Signer
+                          authentication
                         properties:
                           clientId:
+                            description: OIDC client ID
                             type: string
                           clientSecret:
+                            description: OIDC client secret
                             type: string
                           issuer:
+                            description: OIDC issuer URL
                             type: string
                           managed:
+                            description: Managed Keycloak instance for OIDC (auto-provisions
+                              Keycloak)
                             properties:
                               adminPassword:
+                                description: Keycloak admin password
                                 type: string
                               adminUser:
+                                description: Keycloak admin username
                                 type: string
                               certIssuer:
+                                description: cert-manager issuer reference for automatic
+                                  TLS certificate provisioning
                                 properties:
                                   kind:
+                                    default: ClusterIssuer
+                                    description: Kind of the cert-manager issuer resource
+                                    enum:
+                                    - ClusterIssuer
+                                    - Issuer
                                     type: string
                                   name:
+                                    description: Name of the cert-manager Issuer or
+                                      ClusterIssuer
                                     type: string
                                 required:
                                 - name
                                 type: object
                               enabled:
+                                description: Enable managed Keycloak deployment
                                 type: boolean
                               realm:
+                                description: Keycloak realm name
                                 type: string
                               tlsSecret:
-                                description: |-
-                                  LocalObjectReference contains enough information to let you locate the
-                                  referenced object inside the same namespace.
+                                description: Reference to a pre-existing TLS secret
+                                  for Keycloak
                                 properties:
                                   name:
                                     default: ""
@@ -416,12 +587,12 @@ spec:
                             - enabled
                             type: object
                           type:
+                            description: OIDC identity claim type
                             type: string
                         type: object
                       trustedRootKeys:
-                        description: |-
-                          LocalObjectReference contains enough information to let you locate the
-                          referenced object inside the same namespace.
+                        description: Reference to a Secret containing trusted root
+                          keys for signature verification
                         properties:
                           name:
                             default: ""
@@ -436,16 +607,23 @@ spec:
                         x-kubernetes-map-type: atomic
                     type: object
                   rhtpa:
+                    description: Red Hat Trusted Profile Analyzer configuration for
+                      SBOM analysis
                     properties:
                       database:
+                        description: External database configuration for RHTPA
                         properties:
                           host:
+                            description: Database hostname
                             type: string
                           name:
+                            description: Database name
                             type: string
                           password:
+                            description: Database password
                             type: string
                           username:
+                            description: Database username
                             type: string
                         required:
                         - host
@@ -454,48 +632,72 @@ spec:
                         - username
                         type: object
                       oidc:
+                        description: OIDC configuration for RHTPA authentication
                         properties:
                           clientId:
+                            description: OIDC client ID
                             type: string
                           clientSecret:
+                            description: OIDC client secret
                             type: string
                           issuer:
+                            description: OIDC issuer URL for RHTPA authentication
                             type: string
                         type: object
                       storage:
+                        description: Storage configuration for Trusted Profile Analyzer
                         properties:
                           accessKey:
+                            description: S3 access key (auto-provisioned via ODF BucketClaim
+                              if not set)
                             type: string
                           bucket:
+                            description: S3 bucket name (auto-provisioned via ODF
+                              BucketClaim if not set)
                             type: string
                           region:
+                            description: S3 region
                             type: string
                           secretKey:
+                            description: S3 secret key (auto-provisioned via ODF BucketClaim
+                              if not set)
                             type: string
                           size:
+                            description: Storage size (for local type)
                             type: string
                           type:
+                            default: s3
+                            description: 'Storage backend: local (PVC) or s3 (ODF
+                              BucketClaim)'
+                            enum:
+                            - local
+                            - s3
                             type: string
                         required:
                         - type
                         type: object
                     type: object
                   triggerTypes:
+                    description: 'Collection trigger types: scheduled (cron), manual
+                      (on-demand), event (webhook)'
                     items:
+                      enum:
+                      - scheduled
+                      - manual
+                      - event
                       type: string
                     type: array
                 required:
                 - artifactStorage
-                - collectionSchedule
                 type: object
               gitOps:
+                description: GitOps integration configuration
                 properties:
                   branch:
+                    description: Git branch to use
                     type: string
                   credentials:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: Reference to a Secret containing git credentials
                     properties:
                       name:
                         default: ""
@@ -509,15 +711,27 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   enabled:
+                    description: Enable GitOps integration for declarative management
                     type: boolean
                   path:
+                    description: Path within the repository for platform configuration
                     type: string
                   repositoryURL:
+                    description: Git repository URL for storing platform configuration
                     type: string
                 required:
                 - enabled
                 type: object
               mode:
+                allOf:
+                - enum:
+                  - connected
+                  - airgapped
+                - enum:
+                  - connected
+                  - airgapped
+                description: 'Platform operating mode: connected (internet access)
+                  or airgapped (disconnected)'
                 type: string
             required:
             - mode
@@ -525,16 +739,21 @@ spec:
           status:
             properties:
               collectionHistory:
+                description: History of past collections
                 items:
                   properties:
                     size:
+                      description: Total size of collected artifacts
                       type: string
                     status:
+                      description: Collection status
                       type: string
                     timestamp:
+                      description: Timestamp of the collection
                       format: date-time
                       type: string
                     version:
+                      description: Collection version identifier
                       type: string
                   required:
                   - size
@@ -544,16 +763,21 @@ spec:
                   type: object
                 type: array
               components:
+                description: Status of managed components
                 items:
                   properties:
                     lastCheck:
+                      description: Last health check timestamp
                       format: date-time
                       type: string
                     name:
+                      description: Component name
                       type: string
                     status:
+                      description: Component health status
                       type: string
                     url:
+                      description: Component URL (if externally accessible)
                       type: string
                   required:
                   - name
@@ -561,6 +785,7 @@ spec:
                   type: object
                 type: array
               conditions:
+                description: Standard Kubernetes conditions
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -617,14 +842,18 @@ spec:
                   type: object
                 type: array
               importHistory:
+                description: History of past imports
                 items:
                   properties:
                     status:
+                      description: Import status
                       type: string
                     timestamp:
+                      description: Timestamp of the import
                       format: date-time
                       type: string
                     version:
+                      description: Import version identifier
                       type: string
                   required:
                   - status
@@ -633,15 +862,20 @@ spec:
                   type: object
                 type: array
               lastCollection:
+                description: Most recent collection information
                 properties:
                   size:
+                    description: Total size of collected artifacts
                     type: string
                   status:
+                    description: Collection status
                     type: string
                   timestamp:
+                    description: Timestamp of the collection
                     format: date-time
                     type: string
                   version:
+                    description: Collection version identifier
                     type: string
                 required:
                 - size
@@ -650,13 +884,17 @@ spec:
                 - version
                 type: object
               lastImport:
+                description: Most recent import information
                 properties:
                   status:
+                    description: Import status
                     type: string
                   timestamp:
+                    description: Timestamp of the import
                     format: date-time
                     type: string
                   version:
+                    description: Import version identifier
                     type: string
                 required:
                 - status
@@ -664,19 +902,26 @@ spec:
                 - version
                 type: object
               phase:
+                description: Current phase of the platform lifecycle
                 type: string
               rhtasRootKeys:
+                description: RHTAS root key information for signature verification
                 properties:
                   configMap:
+                    description: ConfigMap containing the root keys
                     type: string
                   fulcioRootHash:
+                    description: Hash of the Fulcio root certificate
                     type: string
                   lastUpdated:
+                    description: Timestamp of last root key update
                     format: date-time
                     type: string
                   rekorKeyHash:
+                    description: Hash of the Rekor signing key
                     type: string
                   tufRepositoryUrl:
+                    description: TUF repository URL for root key distribution
                     type: string
                 required:
                 - configMap

@@ -175,6 +175,10 @@ spec:
                   if not specified.
                 type: string
               triggerType:
+                enum:
+                - scheduled
+                - manual
+                - event
                 type: string
             required:
             - imageSetConfig
