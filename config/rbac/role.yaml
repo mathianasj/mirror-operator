@@ -17,6 +17,7 @@ rules:
   - apps
   resources:
   - deployments
+  - statefulsets
   verbs:
   - create
   - delete
@@ -71,6 +72,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - config.openshift.io
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - console.openshift.io
   resources:
   - consoleplugins
@@ -86,6 +95,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - persistentvolumeclaims
   - serviceaccounts
   - services
   verbs:
@@ -99,13 +109,11 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - persistentvolumeclaims
+  - namespaces
   verbs:
   - create
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - ""
@@ -176,6 +184,30 @@ rules:
   - update
   - watch
 - apiGroups:
+  - oauth.openshift.io
+  resources:
+  - oauthclients
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - objectbucket.io
+  resources:
+  - objectbucketclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - operator.openshift.io
   resources:
   - consoles
@@ -208,6 +240,18 @@ rules:
   - list
   - watch
 - apiGroups:
+  - quay.redhat.com
+  resources:
+  - quayregistries
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - rolebindings
@@ -231,6 +275,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - rhtas.redhat.com
+  resources:
+  - securesigns/status
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - rhtpa.io
@@ -260,6 +312,7 @@ rules:
   - tekton.dev
   resources:
   - pipelineruns
+  - pipelines
   verbs:
   - create
   - delete
