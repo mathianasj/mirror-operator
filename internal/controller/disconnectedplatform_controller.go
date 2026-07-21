@@ -122,6 +122,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=clusterserviceversions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rhtpa.io,resources=trustedprofileanalyzers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rhtas.redhat.com,resources=tufs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=k8s.keycloak.org,resources=keycloaks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8s.keycloak.org,resources=keycloakrealmimports,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
@@ -5406,6 +5407,9 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 			},
 			"initialDelaySeconds": int64(5),
 			"periodSeconds":       int64(10),
+			"failureThreshold":    int64(3),
+			"successThreshold":    int64(1),
+			"timeoutSeconds":      int64(1),
 		},
 		"livenessProbe": map[string]interface{}{
 			"tcpSocket": map[string]interface{}{
@@ -5413,6 +5417,9 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 			},
 			"initialDelaySeconds": int64(15),
 			"periodSeconds":       int64(20),
+			"failureThreshold":    int64(3),
+			"successThreshold":    int64(1),
+			"timeoutSeconds":      int64(1),
 		},
 	}
 }
@@ -5485,6 +5492,9 @@ func consolePluginContainer(name, image string, labels map[string]string) map[st
 			},
 			"initialDelaySeconds": int64(5),
 			"periodSeconds":       int64(10),
+			"failureThreshold":    int64(3),
+			"successThreshold":    int64(1),
+			"timeoutSeconds":      int64(1),
 		},
 		"readinessProbe": map[string]interface{}{
 			"httpGet": map[string]interface{}{
@@ -5494,6 +5504,9 @@ func consolePluginContainer(name, image string, labels map[string]string) map[st
 			},
 			"initialDelaySeconds": int64(5),
 			"periodSeconds":       int64(10),
+			"failureThreshold":    int64(3),
+			"successThreshold":    int64(1),
+			"timeoutSeconds":      int64(1),
 		},
 	}
 }

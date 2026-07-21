@@ -8,6 +8,16 @@
       <stop offset="0%" stop-color="#ee4444"/>
       <stop offset="100%" stop-color="#bb2233"/>
     </linearGradient>
+    <linearGradient id="flame1" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#ff4400"/>
+      <stop offset="40%" stop-color="#ff8800"/>
+      <stop offset="100%" stop-color="#ffcc00"/>
+    </linearGradient>
+    <linearGradient id="flame2" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#ee3300"/>
+      <stop offset="50%" stop-color="#ff6600"/>
+      <stop offset="100%" stop-color="#ffaa00"/>
+    </linearGradient>
   </defs>
 
   <!-- Background -->
@@ -51,7 +61,7 @@
     <circle cx="32" cy="27.5" r="1.8" fill="#44ee88"/>
 
     <!-- Shield overlay -->
-    <path d="M22,0 L32,-2 L32,6 Q32,12 22,14 Q12,12 12,6 L12,-2 Z" fill="#228855" opacity="0.85" transform="translate(0,0)"/>
+    <path d="M22,0 L32,-2 L32,6 Q32,12 22,14 Q12,12 12,6 L12,-2 Z" fill="#228855" opacity="0.85"/>
     <path d="M22,2 L29,0 L29,5 Q29,10 22,12 Q15,10 15,5 L15,0 Z" fill="#1a1a3a" opacity="0.6"/>
     <!-- Lock icon inside shield -->
     <rect x="19" y="5" width="6" height="5" rx="1" fill="#44ee88" opacity="0.9"/>
@@ -70,8 +80,20 @@
   <path d="M96,52 Q100,44 102,38" fill="none" stroke="#44ee88" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
   <polygon points="99,36 102,32 105,37" fill="#44ee88" opacity="0.7"/>
 
-  <!-- === THE SNEAKER - centered hero === -->
+  <!-- === HOT ROD FLAMES shooting behind/below the sole === -->
   <g transform="translate(10, 44)">
+    <!-- Large outer flames (behind the shoe, from heel trailing back) -->
+    <path d="M4,58 Q-4,52 -8,56 Q-4,48 -12,50 Q-6,42 -14,44 Q-6,36 -2,42 Q2,36 6,42 Q8,48 4,54 Z" fill="url(#flame1)" opacity="0.9"/>
+    <!-- Medium flame tongues -->
+    <path d="M8,56 Q2,50 -2,54 Q2,46 -4,48 Q0,40 6,44 Q10,48 8,54 Z" fill="url(#flame2)" opacity="0.85"/>
+    <!-- Small inner hot flames (white/yellow core) -->
+    <path d="M6,56 Q2,52 0,54 Q2,48 -2,50 Q2,44 6,48 Q8,52 6,54 Z" fill="#ffee66" opacity="0.7"/>
+
+    <!-- Flames licking along bottom of sole toward toe -->
+    <path d="M14,62 Q10,56 6,60 Q10,54 4,56 Q8,50 14,54 Q18,58 14,62 Z" fill="url(#flame1)" opacity="0.75"/>
+    <path d="M28,62 Q24,58 22,60 Q24,54 20,56 Q22,52 28,56 Q30,58 28,62 Z" fill="url(#flame2)" opacity="0.6"/>
+    <path d="M42,62 Q40,58 38,60 Q40,56 36,58 Q38,54 42,56 Q44,58 42,62 Z" fill="url(#flame1)" opacity="0.45"/>
+
     <!-- Sole bottom - thick rubber -->
     <path d="M12,62 L4,62 Q0,62 0,58 L0,56 Q0,54 4,54 L100,54 Q108,54 108,56 L108,58 Q108,62 104,62 Z" fill="#f0f0f0"/>
     <!-- Sole tread -->
@@ -87,6 +109,9 @@
 
     <!-- Midsole -->
     <path d="M12,54 L4,54 Q0,54 0,50 L2,48 Q4,46 8,46 L96,44 Q104,44 106,46 L108,50 Q108,54 104,54 Z" fill="#dddddd"/>
+
+    <!-- Hot rod flame stripe on midsole -->
+    <path d="M4,52 Q12,48 20,52 Q28,48 36,52 Q44,48 52,52 Q60,48 68,52 Q76,48 84,52 Q92,48 100,52 Q104,50 106,52" fill="none" stroke="#ff6600" stroke-width="1.5" opacity="0.5"/>
 
     <!-- Shoe upper - main body -->
     <path d="M8,46 L6,30 Q4,10 14,4 L20,2 Q24,0 30,0 L42,2 Q48,4 50,8 L54,16 Q56,20 60,22 L80,30 Q96,36 102,40 Q106,42 106,44 L96,44 Q90,44 8,46 Z" fill="url(#upper)"/>
@@ -129,8 +154,7 @@
     <circle cx="8" cy="6" r="1.5" fill="#44ee88"/>
   </g>
 
-  <!-- Motion lines -->
-  <line x1="8" y1="74" x2="2" y2="74" stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.35"/>
-  <line x1="10" y1="82" x2="4" y2="82" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" opacity="0.25"/>
-  <line x1="6" y1="90" x2="2" y2="90" stroke="#ffffff" stroke-width="1" stroke-linecap="round" opacity="0.15"/>
+  <!-- Heat shimmer / smoke wisps above flames -->
+  <path d="M4,80 Q2,76 4,72" fill="none" stroke="#ff8800" stroke-width="0.8" stroke-linecap="round" opacity="0.3"/>
+  <path d="M8,82 Q6,78 8,74" fill="none" stroke="#ff6600" stroke-width="0.6" stroke-linecap="round" opacity="0.2"/>
 </svg>

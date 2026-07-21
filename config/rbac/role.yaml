@@ -280,6 +280,7 @@ rules:
   - rhtas.redhat.com
   resources:
   - securesigns/status
+  - tufs
   verbs:
   - get
   - list
