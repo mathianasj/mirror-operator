@@ -106,7 +106,8 @@ jobs:
           make bundle-build BUNDLE_IMG=${{ steps.vars.outputs.bundle_img }}
           make bundle-push BUNDLE_IMG=${{ steps.vars.outputs.bundle_img }}
 
-      - name: Build and push catalog image
+      - name: Build and push catalog image (FBC)
         run: |
-          make catalog-build CATALOG_IMG=${{ steps.vars.outputs.catalog_img }} BUNDLE_IMGS=${{ steps.vars.outputs.bundle_img }}
+          make catalog-build CATALOG_IMG=${{ steps.vars.outputs.catalog_img }} BUNDLE_IMGS=${{ steps.vars.outputs.bundle_img }} VERSION=${{ steps.vars.outputs.version }}
           make catalog-push CATALOG_IMG=${{ steps.vars.outputs.catalog_img }}
+          make catalog-clean

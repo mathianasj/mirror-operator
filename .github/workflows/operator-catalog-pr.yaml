@@ -1,0 +1,134 @@
+name: Submit to OpenShift OperatorHub
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Operator version (e.g., 0.0.1 without v prefix)'
+        required: true
+
+env:
+  OPERATOR_NAME: mirror-operator
+
+jobs:
+  submit-to-openshift-catalog:
+    name: Create PR to OpenShift OperatorHub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mirror-operator
+        uses: actions/checkout@v4
+        with:
+          path: mirror-operator
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=${{ github.event.inputs.version }}
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION_TAG=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install operator-sdk
+        run: |
+          OS=$(go env GOOS)
+          ARCH=$(go env GOARCH)
+          curl -sSLo operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/v1.39.2/operator-sdk_${OS}_${ARCH}
+          chmod +x operator-sdk
+          sudo mv operator-sdk /usr/local/bin/
+
+      - name: Generate bundle
+        run: |
+          cd mirror-operator
+          make bundle IMG=quay.io/mathianasj/mirror-operator:${{ steps.version.outputs.VERSION_TAG }} VERSION=${{ steps.version.outputs.VERSION }}
+
+      - name: Checkout community-operators-prod
+        uses: actions/checkout@v4
+        with:
+          repository: redhat-openshift-ecosystem/community-operators-prod
+          path: community-operators-prod
+          token: ${{ secrets.OPERATOR_CATALOG_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create operator directory structure
+        run: |
+          cd community-operators-prod
+          mkdir -p operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}
+
+          # Copy bundle manifests
+          cp -r ../mirror-operator/bundle/manifests operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}/
+
+          # Copy metadata (annotations.yaml only — ci.yaml goes to operator root)
+          mkdir -p operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}/metadata
+          cp ../mirror-operator/bundle/metadata/annotations.yaml operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}/metadata/
+
+          # Copy tests
+          if [ -d ../mirror-operator/bundle/tests ]; then
+            cp -r ../mirror-operator/bundle/tests operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}/
+          fi
+
+          # Copy release-config.yaml for auto-approved upgrades
+          cp ../mirror-operator/community-operators/release-config.yaml operators/${{ env.OPERATOR_NAME }}/${{ steps.version.outputs.VERSION }}/release-config.yaml
+
+          # Copy ci.yaml to operator root (FBC config + auto-approval)
+          cp ../mirror-operator/community-operators/ci.yaml operators/${{ env.OPERATOR_NAME }}/ci.yaml
+
+          # Copy catalog-templates for FBC
+          cp -r ../mirror-operator/catalog-templates operators/${{ env.OPERATOR_NAME }}/
+
+          # Download the FBC Makefile from operator-pipelines
+          curl -sSLo operators/${{ env.OPERATOR_NAME }}/Makefile \
+            https://raw.githubusercontent.com/redhat-openshift-ecosystem/operator-pipelines/main/fbc/Makefile
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: community-operators-prod
+          token: ${{ secrets.OPERATOR_CATALOG_TOKEN }}
+          push-to-fork: ${{ github.repository_owner }}/community-operators-prod
+          branch: add-${{ env.OPERATOR_NAME }}-${{ steps.version.outputs.VERSION }}
+          commit-message: "operator ${{ env.OPERATOR_NAME }} (${{ steps.version.outputs.VERSION }})"
+          signoff: true
+          title: "operator ${{ env.OPERATOR_NAME }} (${{ steps.version.outputs.VERSION }})"
+          body: |
+            ### New Operator Submission
+
+            **Operator Name:** ${{ env.OPERATOR_NAME }}
+            **Version:** ${{ steps.version.outputs.VERSION }}
+
+            #### Description
+            Mirror Operator manages the disconnected OpenShift lifecycle. It provides CRDs for content collection (CollectionPipeline), bundle import (MirrorImport), cluster bootstrapping (ClusterBootstrap), and top-level orchestration (DisconnectedPlatform).
+
+            #### Features
+            - Automated oc-mirror v2 content collection via Tekton pipelines
+            - Airgapped registry import with ICSP/CatalogSource management
+            - Supply chain security via Cosign signing and Tekton Chains attestations
+            - Cluster bootstrapping from mirrored content
+
+            #### Links
+            - Repository: https://github.com/${{ github.repository }}
+            - Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.VERSION_TAG }}
+            - Container Image: quay.io/mathianasj/mirror-operator:${{ steps.version.outputs.VERSION_TAG }}
+
+            #### Checklist
+            - [x] Bundle validated with operator-sdk
+            - [x] Container images publicly accessible
+            - [x] Multi-architecture support (amd64, arm64)
+            - [x] Tests passing
+            - [x] Tested on OpenShift
+
+            ---
+            *This PR was automatically created by GitHub Actions*

@@ -302,7 +302,7 @@ ifeq (,$(shell which opm 2>/dev/null))
 	set -e ;\
 	mkdir -p $(dir $(OPM)) ;\
 	OS=$(shell go env GOOS) && ARCH=$(shell go env GOARCH) && \
-	curl -sSLo $(OPM) https://github.com/operator-framework/operator-registry/releases/download/v1.23.0/$${OS}-$${ARCH}-opm ;\
+	curl -sSLo $(OPM) https://github.com/operator-framework/operator-registry/releases/download/v1.71.0/$${OS}-$${ARCH}-opm ;\
 	chmod +x $(OPM) ;\
 	}
 else
@@ -310,26 +310,36 @@ OPM = $(shell which opm)
 endif
 endif
 
-# A comma-separated list of bundle images (e.g. make catalog-build BUNDLE_IMGS=example.com/operator-bundle:v0.1.0,example.com/operator-bundle:v0.2.0).
-# These images MUST exist in a registry and be pull-able.
+# The bundle image(s) to render into the FBC catalog.
 BUNDLE_IMGS ?= $(BUNDLE_IMG)
 
-# The image tag given to the resulting catalog image (e.g. make catalog-build CATALOG_IMG=example.com/operator-catalog:v0.2.0).
+# The image tag given to the resulting catalog image.
 CATALOG_IMG ?= $(IMAGE_TAG_BASE)-catalog:v$(VERSION)
 
-# Set CATALOG_BASE_IMG to an existing catalog image tag to add $BUNDLE_IMGS to that image.
-ifneq ($(origin CATALOG_BASE_IMG), undefined)
-FROM_INDEX_OPT := --from-index $(CATALOG_BASE_IMG)
-endif
+# Directory for the File-Based Catalog content.
+CATALOG_DIR ?= catalog/mirror-operator
 
-# Build a catalog image by adding bundle images to an empty catalog using the operator package manager tool, 'opm'.
-# This recipe invokes 'opm' in 'semver' bundle add mode. For more information on add modes, see:
-# https://github.com/operator-framework/community-operators/blob/7f1438c/docs/packaging-operator.md#updating-your-existing-operator
+.PHONY: fbc-render
+fbc-render: opm ## Render bundle image(s) into a File-Based Catalog.
+	mkdir -p $(CATALOG_DIR)
+	@echo '{"schema":"olm.package","name":"mirror-operator","defaultChannel":"alpha"}' > $(CATALOG_DIR)/catalog.json
+	@echo '{"schema":"olm.channel","name":"alpha","package":"mirror-operator","entries":[{"name":"mirror-operator.v$(VERSION)"}]}' >> $(CATALOG_DIR)/catalog.json
+	$(OPM) render $(BUNDLE_IMGS) -o json >> $(CATALOG_DIR)/catalog.json
+
+.PHONY: fbc-validate
+fbc-validate: opm ## Validate the File-Based Catalog.
+	$(OPM) validate catalog/
+
 .PHONY: catalog-build
-catalog-build: opm ## Build a catalog image.
-	$(OPM) index add --container-tool docker --mode semver --tag $(CATALOG_IMG) --bundles $(BUNDLE_IMGS) $(FROM_INDEX_OPT)
+catalog-build: fbc-render fbc-validate ## Build a catalog image from the FBC.
+	$(OPM) generate dockerfile catalog/ --binary-image=quay.io/operator-framework/opm:v1.71.0
+	$(CONTAINER_TOOL) build -t $(CATALOG_IMG) -f catalog.Dockerfile .
+	rm -f catalog.Dockerfile
 
-# Push the catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+.PHONY: catalog-clean
+catalog-clean: ## Clean generated catalog files.
+	rm -rf catalog/ catalog.Dockerfile

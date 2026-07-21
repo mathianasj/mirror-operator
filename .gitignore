@@ -32,3 +32,4 @@ dist/
 
 # Generated OLM artifacts
 bundle.Dockerfile
+.DS_Store
