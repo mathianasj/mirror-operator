@@ -287,8 +287,9 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Spec: mirrorv1.DisconnectedPlatformSpec{
 					Mode: mirrorv1.PlatformModeAirgapped,
 					Architect: &mirrorv1.AirgapArchitectConfig{
-						Enabled:  true,
-						Replicas: replicas,
+						Enabled:       true,
+						Replicas:      replicas,
+						FrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
 					},
 				},
 			}
@@ -336,7 +337,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Spec: mirrorv1.DisconnectedPlatformSpec{
 					Mode: mirrorv1.PlatformModeAirgapped,
 					Architect: &mirrorv1.AirgapArchitectConfig{
-						Enabled: true,
+						Enabled:       true,
+						FrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
 						Route: &mirrorv1.RouteConfig{
 							Host: "architect.apps.example.com",
 							TLS: &mirrorv1.TLSConfig{
