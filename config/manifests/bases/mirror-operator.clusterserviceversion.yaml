@@ -66,6 +66,6 @@ spec:
   maturity: alpha
   minKubeVersion: 1.30.0
   provider:
-    name: Mathianasj
+    name: Joshua Mathianas
     url: https://github.com/mathianasj
   version: 0.0.0

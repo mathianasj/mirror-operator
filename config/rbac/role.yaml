@@ -159,13 +159,22 @@ rules:
   - mirror.mirror.mathianasj.github.com
   resources:
   - clusterbootstraps/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - mirror.mirror.mathianasj.github.com
+  resources:
   - collectionpipelines/status
   - disconnectedplatforms/status
   - mirrorimports/status
   verbs:
   - get
+  - list
   - patch
   - update
+  - watch
 - apiGroups:
   - operator.openshift.io
   resources:
