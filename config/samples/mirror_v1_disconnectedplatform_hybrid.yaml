@@ -7,6 +7,10 @@ spec:
   mode: connected
   connected:
     collectionSchedule: "0 2 * * 0"  # Weekly at 2 AM on Sunday
+    # cert-manager issuer for TLS certificates (used by managed Keycloak, Quay, etc.)
+    certIssuer:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
     artifactStorage:
       size: "500Gi"
       storageClass: "gp3-csi"
@@ -34,10 +38,6 @@ spec:
         managed:
           enabled: true
           realm: "trusted-artifact-signer"
-          # Use existing ClusterIssuer (e.g., Let's Encrypt)
-          certIssuer:
-            name: letsencrypt-prod
-            kind: ClusterIssuer
         type: "email"
       database:
         host: "postgres.example.com"

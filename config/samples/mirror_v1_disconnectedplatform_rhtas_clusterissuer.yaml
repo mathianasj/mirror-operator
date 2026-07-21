@@ -10,6 +10,10 @@ spec:
   connected:
     collectionSchedule: "0 2 * * 0"
     mirrorRegistry: "quay.example.com/mirror"
+    # cert-manager issuer for TLS certificates (used by managed Keycloak, Quay, etc.)
+    certIssuer:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
     artifactStorage:
       size: 2Ti
     triggerTypes:
@@ -25,10 +29,6 @@ spec:
         managed:
           enabled: true
           realm: "trusted-artifact-signer"
-          # Use existing ClusterIssuer (e.g., Let's Encrypt)
-          certIssuer:
-            name: letsencrypt-prod
-            kind: ClusterIssuer
         type: "email"
       database:
         host: "postgres.example.com"

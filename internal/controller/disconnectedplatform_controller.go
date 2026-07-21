@@ -127,7 +127,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=cert-manager.io,resources=clusterissuers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
@@ -3993,17 +3993,15 @@ func (r *DisconnectedPlatformReconciler) deleteRHTASConfig(ctx context.Context) 
 }
 
 func (r *DisconnectedPlatformReconciler) ensureKeycloakTLS(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, hostname, secretName string) error {
-	cfg := platform.Spec.Connected.RHTAS
-
-	// Require certIssuer to be explicitly specified
-	if cfg.OIDC.Managed.CertIssuer == nil {
-		return fmt.Errorf("certIssuer must be specified when not using custom tlsSecret")
+	// Require certIssuer to be explicitly specified at the connected level
+	if platform.Spec.Connected.CertIssuer == nil {
+		return fmt.Errorf("spec.connected.certIssuer must be specified when not using custom tlsSecret")
 	}
 
-	issuerName := cfg.OIDC.Managed.CertIssuer.Name
+	issuerName := platform.Spec.Connected.CertIssuer.Name
 	issuerKind := "ClusterIssuer" // Default to ClusterIssuer
-	if cfg.OIDC.Managed.CertIssuer.Kind != "" {
-		issuerKind = cfg.OIDC.Managed.CertIssuer.Kind
+	if platform.Spec.Connected.CertIssuer.Kind != "" {
+		issuerKind = platform.Spec.Connected.CertIssuer.Kind
 	}
 
 	cert := &unstructured.Unstructured{}

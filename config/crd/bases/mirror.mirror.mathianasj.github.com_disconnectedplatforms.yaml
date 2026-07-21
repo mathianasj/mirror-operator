@@ -206,6 +206,23 @@ spec:
                     required:
                     - size
                     type: object
+                  certIssuer:
+                    description: cert-manager issuer reference for automatic TLS certificate
+                      provisioning (used by managed Keycloak)
+                    properties:
+                      kind:
+                        default: ClusterIssuer
+                        description: Kind of the cert-manager issuer resource
+                        enum:
+                        - ClusterIssuer
+                        - Issuer
+                        type: string
+                      name:
+                        description: Name of the cert-manager Issuer or ClusterIssuer
+                        type: string
+                    required:
+                    - name
+                    type: object
                   collectionSchedule:
                     description: Cron schedule for automated content collection (e.g.
                       '0 2 * * 0' for weekly Sunday 2am). Required only when triggerTypes
@@ -371,23 +388,6 @@ spec:
                           adminUser:
                             description: Quay admin username
                             type: string
-                          certIssuer:
-                            description: cert-manager issuer reference for automatic
-                              TLS certificate provisioning
-                            properties:
-                              kind:
-                                default: ClusterIssuer
-                                description: Kind of the cert-manager issuer resource
-                                enum:
-                                - ClusterIssuer
-                                - Issuer
-                                type: string
-                              name:
-                                description: Name of the cert-manager Issuer or ClusterIssuer
-                                type: string
-                            required:
-                            - name
-                            type: object
                           clair:
                             description: Clair vulnerability scanner configuration
                             properties:
@@ -464,21 +464,6 @@ spec:
                             required:
                             - type
                             type: object
-                          tlsSecret:
-                            description: Reference to a pre-existing TLS secret for
-                              Quay
-                            properties:
-                              name:
-                                default: ""
-                                description: |-
-                                  Name of the referent.
-                                  This field is effectively required, but due to backwards compatibility is
-                                  allowed to be empty. Instances of this type with an empty value here are
-                                  almost certainly wrong.
-                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                                type: string
-                            type: object
-                            x-kubernetes-map-type: atomic
                         type: object
                     type: object
                   rhtas:
@@ -532,24 +517,6 @@ spec:
                               adminUser:
                                 description: Keycloak admin username
                                 type: string
-                              certIssuer:
-                                description: cert-manager issuer reference for automatic
-                                  TLS certificate provisioning
-                                properties:
-                                  kind:
-                                    default: ClusterIssuer
-                                    description: Kind of the cert-manager issuer resource
-                                    enum:
-                                    - ClusterIssuer
-                                    - Issuer
-                                    type: string
-                                  name:
-                                    description: Name of the cert-manager Issuer or
-                                      ClusterIssuer
-                                    type: string
-                                required:
-                                - name
-                                type: object
                               enabled:
                                 description: Enable managed Keycloak deployment
                                 type: boolean

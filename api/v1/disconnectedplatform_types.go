@@ -55,6 +55,9 @@ type ConnectedConfig struct {
 	// Quay registry configuration for intermediate image storage
 	// +optional
 	Quay *QuayInstallerConfig `json:"quay,omitempty"`
+	// cert-manager issuer reference for automatic TLS certificate provisioning (used by managed Keycloak)
+	// +optional
+	CertIssuer *CertIssuerReference `json:"certIssuer,omitempty"`
 }
 
 type OLMSubscriptionConfig struct {
@@ -144,9 +147,6 @@ type ManagedKeycloakConfig struct {
 	// Reference to a pre-existing TLS secret for Keycloak
 	// +optional
 	TLSSecret *corev1.LocalObjectReference `json:"tlsSecret,omitempty"`
-	// cert-manager issuer reference for automatic TLS certificate provisioning
-	// +optional
-	CertIssuer *CertIssuerReference `json:"certIssuer,omitempty"`
 }
 
 type CertIssuerReference struct {
@@ -217,12 +217,6 @@ type ManagedQuayConfig struct {
 	// Quay admin password
 	// +optional
 	AdminPassword string `json:"adminPassword,omitempty"`
-	// Reference to a pre-existing TLS secret for Quay
-	// +optional
-	TLSSecret *corev1.LocalObjectReference `json:"tlsSecret,omitempty"`
-	// cert-manager issuer reference for automatic TLS certificate provisioning
-	// +optional
-	CertIssuer *CertIssuerReference `json:"certIssuer,omitempty"`
 	// Clair vulnerability scanner configuration
 	// +optional
 	Clair *ClairConfig `json:"clair,omitempty"`

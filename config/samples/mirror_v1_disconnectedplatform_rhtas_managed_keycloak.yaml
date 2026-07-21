@@ -9,6 +9,10 @@ spec:
   mode: connected
   connected:
     collectionSchedule: "0 2 * * 0"
+    # cert-manager issuer for TLS certificates (used by managed Keycloak, Quay, etc.)
+    certIssuer:
+      name: letsencrypt-production-ec2     # Name of your ClusterIssuer or Issuer
+      kind: ClusterIssuer                  # or "Issuer" for namespace-scoped
     mirrorRegistry: "quay.example.com/mirror"
     artifactStorage:
       size: 2Ti
@@ -26,10 +30,6 @@ spec:
         managed:
           enabled: true
           realm: "trusted-artifact-signer"  # Optional, defaults to "trusted-artifact-signer"
-          # REQUIRED (unless using tlsSecret): Specify cert-manager issuer for TLS certificates
-          certIssuer:
-            name: letsencrypt-production-ec2     # Name of your ClusterIssuer or Issuer
-            kind: ClusterIssuer                  # or "Issuer" for namespace-scoped
           # tlsSecret:  # Alternative - use custom TLS secret instead of cert-manager
           #   name: my-keycloak-tls
         type: "email"       # Optional, defaults to "email" for managed
