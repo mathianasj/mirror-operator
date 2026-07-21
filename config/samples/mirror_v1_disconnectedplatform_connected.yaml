@@ -17,12 +17,13 @@ spec:
       - manual
     operators:
       openshiftPipelines: {}
-      rhtas:
-        oidc:
-          managed:
-            enabled: true
-            realm: trusted-artifact-signer
+      rhtas: {}
       rhtpa: {}
+    rhtas:
+      oidc:
+        managed:
+          enabled: true
+          realm: trusted-artifact-signer
     rhtpa:
       storage:
         type: local
