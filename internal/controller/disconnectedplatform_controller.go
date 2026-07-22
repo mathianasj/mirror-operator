@@ -8119,13 +8119,17 @@ upload_sbom_to_tpa() {
     -H "Content-Type: application/json" \
     -d @"$sbom_file" \
     "https://$(params.tpa-host)/api/v2/sbom")
-  local http_code
+  local http_code body
   http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+  body=$(echo "$response" | grep -v "HTTP_CODE:")
   if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
     echo "    -> Uploaded to TPA"
     return 0
+  elif [ "$http_code" = "409" ]; then
+    echo "    -> Already exists in TPA (HTTP 409), skipping"
+    return 0
   else
-    echo "    -> TPA upload failed (HTTP $http_code)"
+    echo "    -> TPA upload failed (HTTP $http_code): $body"
     return 1
   fi
 }
@@ -8335,9 +8339,19 @@ export COSIGN_EXPERIMENTAL=1
 echo "=== Initializing TUF root for private Sigstore ==="
 cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
 
-# Point cosign at the CTFE public key from our private TUF root
-# Without this, cosign cannot match the SCT to our CT log's key
+# Remove trusted_root.json so cosign falls back to individual key files.
+# With trusted_root.json present, cosign matches SCT log IDs against protobuf
+# entries and ignores SIGSTORE_CT_LOG_PUBLIC_KEY_FILE. Removing it forces the
+# legacy code path that respects the env var.
+rm -f $HOME/.sigstore/root/targets/trusted_root.json
+rm -f $HOME/.sigstore/root/targets/signing_config.v0.2.json
+
 export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE=$HOME/.sigstore/root/targets/ctfe.pub
+
+echo "=== TUF targets after cleanup ==="
+ls -la $HOME/.sigstore/root/targets/
+echo "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE=$SIGSTORE_CT_LOG_PUBLIC_KEY_FILE"
+echo "==="
 
 # Sign each image in intermediate registry
 signed_count=0
@@ -8982,13 +8996,17 @@ upload_sbom_to_tpa() {
     -H "Content-Type: application/json" \
     -d @"$sbom_file" \
     "https://$(params.tpa-host)/api/v2/sbom")
-  local http_code
+  local http_code body
   http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+  body=$(echo "$response" | grep -v "HTTP_CODE:")
   if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
     echo "  -> Uploaded to TPA"
     return 0
+  elif [ "$http_code" = "409" ]; then
+    echo "  -> Already exists in TPA (HTTP 409), skipping"
+    return 0
   else
-    echo "  -> TPA upload failed (HTTP $http_code)"
+    echo "  -> TPA upload failed (HTTP $http_code): $body"
     return 1
   fi
 }
