@@ -8277,11 +8277,10 @@ if [ -f "$US_FILE" ]; then
   if curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
     "$API_SERVER/apis/updateservice.operator.openshift.io/v1" >/dev/null 2>&1; then
 
-    # Delete any existing UpdateService from a previous run
-    curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-      -X DELETE "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror" \
-      >/dev/null 2>&1 || true
-    sleep 2
+    # Use a per-run UpdateService name to avoid conflicts between concurrent runs
+    US_NAME="osus-${RUN_TAG}"
+    echo "UpdateService name: $US_NAME"
+    echo "$US_NAME" > /workspace/output/osus-name
 
     # Apply the updateService.yaml
     echo "Applying UpdateService CR to cluster..."
@@ -8291,13 +8290,14 @@ if [ -f "$US_FILE" ]; then
     US_REPLICAS=$(grep 'replicas:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
     US_REPLICAS=${US_REPLICAS:-1}
     US_JSON=$(jq -n \
+      --arg name "$US_NAME" \
       --arg graph "$US_GRAPH" \
       --arg releases "$US_RELEASES" \
       --argjson replicas "$US_REPLICAS" \
       '{
         apiVersion: "updateservice.operator.openshift.io/v1",
         kind: "UpdateService",
-        metadata: {name: "update-service-oc-mirror", namespace: "openshift-update-service"},
+        metadata: {name: $name, namespace: "openshift-update-service"},
         spec: {graphDataImage: $graph, releases: $releases, replicas: $replicas}
       }')
 
@@ -8312,7 +8312,7 @@ if [ -f "$US_FILE" ]; then
         echo "UpdateService already exists, updating..."
         curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
           -H "Content-Type: application/json" \
-          -X PUT "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror" \
+          -X PUT "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/${US_NAME}" \
           -d "$US_JSON" >/dev/null 2>&1 || true
       else
         echo "WARNING: Failed to create UpdateService (HTTP $HTTP_CODE)"
@@ -9113,7 +9113,18 @@ echo "Upstream access: BLOCKED (registries.conf + /etc/hosts)"
 TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 API_SERVER="https://kubernetes.default.svc"
 CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror"
+
+# Read per-run UpdateService name created by mirror-to-intermediate
+US_NAME=""
+if [ -f /workspace/output/osus-name ]; then
+  US_NAME=$(cat /workspace/output/osus-name)
+fi
+if [ -z "$US_NAME" ]; then
+  echo "WARNING: No OSUS name file found - UpdateService may not have been created"
+  US_NAME="osus-fallback"
+fi
+US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/${US_NAME}"
+echo "Using UpdateService: $US_NAME"
 
 echo "=== Waiting for OSUS to be ready ==="
 OSUS_READY=0
