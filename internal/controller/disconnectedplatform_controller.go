@@ -138,6 +138,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=console.openshift.io,resources=consoleplugins,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=consoles,verbs=get;list;watch;update;patch
@@ -152,6 +154,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=oauth.openshift.io,resources=oauthclients,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=updateservice.operator.openshift.io,resources=updateservices,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	platform := &mirrorv1.DisconnectedPlatform{}
@@ -284,6 +287,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
+		// Ensure pipeline SA RBAC for UpdateService management (OSUS)
+		if err := r.ensurePipelineUpdateServiceRBAC(ctx); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure pipeline RBAC for UpdateService")
+		}
+
 		// Reconcile ObjectBucketClaim for artifacts storage
 		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile artifacts bucket")
@@ -439,6 +447,14 @@ var defaultOperators = []operatorDef{
 		catalogNS: "openshift-marketplace",
 		ns:        "openshift-operators",
 	},
+	{
+		name:      "cincinnati-operator",
+		pkg:       "cincinnati-operator",
+		channel:   "v1",
+		catalog:   "redhat-operators",
+		catalogNS: "openshift-marketplace",
+		ns:        "openshift-update-service",
+	},
 }
 
 func getOperatorOverrides(platform *mirrorv1.DisconnectedPlatform) map[string]*mirrorv1.OLMSubscriptionConfig {
@@ -461,6 +477,9 @@ func getOperatorOverrides(platform *mirrorv1.DisconnectedPlatform) map[string]*m
 	}
 	if op.QuayOperator != nil {
 		overrides["quay-operator"] = op.QuayOperator
+	}
+	if op.OSUS != nil {
+		overrides["cincinnati-operator"] = op.OSUS
 	}
 	return overrides
 }
@@ -4690,6 +4709,66 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 	return r.Create(ctx, sub)
 }
 
+func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceRBAC(ctx context.Context) error {
+	clusterRole := &unstructured.Unstructured{}
+	clusterRole.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole",
+	})
+	clusterRole.SetName("mirror-operator-pipeline-osus")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(clusterRole.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(clusterRole), existing); err == nil {
+		return r.ensurePipelineUpdateServiceBinding(ctx)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	clusterRole.Object["rules"] = []interface{}{
+		map[string]interface{}{
+			"apiGroups": []interface{}{"updateservice.operator.openshift.io"},
+			"resources": []interface{}{"updateservices"},
+			"verbs":     []interface{}{"get", "list", "watch", "create", "update", "patch", "delete"},
+		},
+	}
+
+	if err := r.Create(ctx, clusterRole); err != nil {
+		return err
+	}
+	return r.ensurePipelineUpdateServiceBinding(ctx)
+}
+
+func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceBinding(ctx context.Context) error {
+	binding := &unstructured.Unstructured{}
+	binding.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding",
+	})
+	binding.SetName("mirror-operator-pipeline-osus")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(binding.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(binding), existing); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	binding.Object["roleRef"] = map[string]interface{}{
+		"apiGroup": "rbac.authorization.k8s.io",
+		"kind":     "ClusterRole",
+		"name":     "mirror-operator-pipeline-osus",
+	}
+	binding.Object["subjects"] = []interface{}{
+		map[string]interface{}{
+			"kind":      "ServiceAccount",
+			"name":      "pipeline",
+			"namespace": architectNamespace,
+		},
+	}
+
+	return r.Create(ctx, binding)
+}
+
 const (
 	architectPort = 4000
 	frontendPort  = 5173
@@ -8160,6 +8239,87 @@ if [ -f "$ITMS_FILE" ]; then
 else
   echo "WARNING: ITMS file not found at $ITMS_FILE"
 fi
+
+# Preserve updateService.yaml and deploy OSUS for enclave graph support
+US_FILE="/workspace/output/workspace-to-intermediate/working-dir/cluster-resources/updateService.yaml"
+US_BACKUP="/workspace/output/updateService.yaml"
+if [ -f "$US_FILE" ]; then
+  echo "=== Setting up OSUS for graph support ==="
+  cp "$US_FILE" "$US_BACKUP"
+  cat "$US_BACKUP"
+
+  # Tag the graph image with a run-specific tag to avoid conflicts between runs
+  RUN_TAG="run-$(date +%s)"
+  GRAPH_IMAGE=$(grep 'graphDataImage:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
+  if [ -n "$GRAPH_IMAGE" ]; then
+    # Derive the tagged reference (strip any existing tag/digest, add run tag)
+    GRAPH_REPO=$(echo "$GRAPH_IMAGE" | sed 's/@sha256:.*//; s/:.*$//')
+    TAGGED_IMAGE="${GRAPH_REPO}:${RUN_TAG}"
+    echo "Tagging graph image: $GRAPH_IMAGE -> $TAGGED_IMAGE"
+    skopeo copy --authfile=/workspace/pull-secret/.dockerconfigjson \
+      --src-tls-verify=false --dest-tls-verify=false \
+      "docker://${GRAPH_IMAGE}" "docker://${TAGGED_IMAGE}" || true
+
+    # Update the updateService.yaml with the tagged image
+    sed -i "s|graphDataImage:.*|graphDataImage: ${TAGGED_IMAGE}|" "$US_BACKUP"
+    echo "Updated updateService.yaml with tagged image: $TAGGED_IMAGE"
+  fi
+
+  # Save the run tag for mirror-from-intermediate to use for cleanup
+  echo "$RUN_TAG" > /workspace/output/osus-run-tag
+
+  # Apply UpdateService CR to the cluster via Kubernetes API
+  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+  API_SERVER="https://kubernetes.default.svc"
+  CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+  # Check if UpdateService CRD exists (OSUS operator installed)
+  if curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+    "$API_SERVER/apis/updateservice.operator.openshift.io/v1" >/dev/null 2>&1; then
+
+    # Delete any existing UpdateService from a previous run
+    curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+      -X DELETE "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror" \
+      >/dev/null 2>&1 || true
+    sleep 2
+
+    # Apply the updateService.yaml
+    echo "Applying UpdateService CR to cluster..."
+    US_JSON=$(cat "$US_BACKUP" | python3 -c "
+import sys, json, yaml
+docs = list(yaml.safe_load_all(sys.stdin))
+doc = docs[0]
+doc['metadata'] = doc.get('metadata', {})
+doc['metadata']['name'] = 'update-service-oc-mirror'
+doc['metadata']['namespace'] = 'openshift-update-service'
+json.dump(doc, sys.stdout)
+" 2>/dev/null || cat "$US_BACKUP" | yq -o json '.' 2>/dev/null)
+
+    if [ -n "$US_JSON" ]; then
+      HTTP_CODE=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -X POST "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices" \
+        -d "$US_JSON" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+      if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+        echo "✓ UpdateService CR created successfully"
+      elif [ "$HTTP_CODE" = "409" ]; then
+        echo "UpdateService already exists, updating..."
+        curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -X PUT "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror" \
+          -d "$US_JSON" >/dev/null 2>&1 || true
+      else
+        echo "WARNING: Failed to create UpdateService (HTTP $HTTP_CODE)"
+      fi
+    else
+      echo "WARNING: Failed to convert updateService.yaml to JSON"
+    fi
+  else
+    echo "WARNING: UpdateService CRD not found - OSUS operator may not be installed"
+  fi
+else
+  echo "INFO: updateService.yaml not found (graph: true may not be set in ImageSetConfig)"
+fi
 `},
 					},
 				},
@@ -8327,8 +8487,12 @@ while IFS='=' read -r source dest; do
     CACHE_FILE="$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
     if [ -f "$CACHE_FILE" ]; then
       cp "$CACHE_FILE" "$OUTPUT_FILE"
-      pkg_count=$(jq '.packages | length // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
-      echo "  [$current/$image_count] Cached: $dest_no_proto ($pkg_count packages)"
+      # Re-apply post-processing to fix any stale localhost:55000 references
+      fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
+      fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
+      postprocess_sbom "$OUTPUT_FILE" "$fixed_source" "$fixed_dest"
+      pkg_count=$(jq '.packages | length // 0' "$OUTPUT_FILE" 2>/dev/null || echo 0)
+      echo "  [$current/$image_count] Cached: $fixed_dest ($pkg_count packages)"
       cached=$((cached + 1))
       if upload_sbom_to_tpa "$OUTPUT_FILE"; then
         uploaded_tpa=$((uploaded_tpa + 1))
@@ -8351,8 +8515,10 @@ while IFS='=' read -r source dest; do
   echo "  [$current/$image_count] Scanning: $dest_no_proto"
   if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" 2>/dev/null; then
     scanned=$((scanned + 1))
-    # Post-process: set upstream source name and add intermediate destination annotation
-    postprocess_sbom "$OUTPUT_FILE" "$source" "$dest_no_proto"
+    # Post-process: replace localhost:55000 with intermediate registry and set upstream source
+    fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
+    fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
+    postprocess_sbom "$OUTPUT_FILE" "$fixed_source" "$fixed_dest"
     # Cache the post-processed SBOM by digest for future runs
     if [ -n "$DIGEST" ]; then
       cp "$OUTPUT_FILE" "$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
@@ -8902,6 +9068,7 @@ cat >> /etc/hosts <<HOSTS_EOF
 127.0.0.1 cdn03.quay.io
 127.0.0.1 docker.io
 127.0.0.1 registry-1.docker.io
+127.0.0.1 api.openshift.com
 HOSTS_EOF
 
 echo "=== Blocked upstream registries in /etc/hosts ==="
@@ -8933,6 +9100,33 @@ echo "=== Starting mirror from intermediate registry ==="
 echo "Source: $(params.intermediate-registry)"
 echo "Destination: file:///workspace/output"
 echo "Upstream access: BLOCKED (registries.conf + /etc/hosts)"
+
+# Discover OSUS graph URL from UpdateService CR for oc-mirror v2 enclave support
+# oc-mirror v2 removed --graph-image; uses UPDATE_URL_OVERRIDE to query
+# a local OSUS instance instead of the public Cincinnati API
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+API_SERVER="https://kubernetes.default.svc"
+CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror"
+
+echo "=== Waiting for OSUS to be ready ==="
+OSUS_READY=0
+for i in $(seq 1 60); do
+  POLICY_URI=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+    "$US_API" 2>/dev/null | jq -r '.status.policyEngineURI // empty' 2>/dev/null)
+  if [ -n "$POLICY_URI" ]; then
+    export UPDATE_URL_OVERRIDE="${POLICY_URI}/api/upgrades_info/v1/graph"
+    echo "✓ OSUS ready: UPDATE_URL_OVERRIDE=$UPDATE_URL_OVERRIDE"
+    OSUS_READY=1
+    break
+  fi
+  echo "  Waiting for OSUS policy engine... (attempt $i/60)"
+  sleep 10
+done
+
+if [ "$OSUS_READY" -eq 0 ]; then
+  echo "WARNING: OSUS not ready after 10 minutes - graph: true in ImageSetConfig may fail"
+fi
 echo ""
 
 # Run oc-mirror with verbose output and clear error handling
@@ -8941,7 +9135,6 @@ if ! oc-mirror \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --cache-dir=/workspace/output/.oc-mirror/.cache \
-  --graph-image=docker://$(params.intermediate-registry)/openshift/graph-image:latest \
   file:///workspace/output; then
 
   echo ""
@@ -8956,11 +9149,22 @@ if ! oc-mirror \
   echo "Check that the intermediate registry has been populated with:"
   echo "  oc-mirror --v2 --config=imageset.yaml docker://$(params.intermediate-registry)/mirror"
   echo ""
+
+  # Clean up UpdateService CR even on failure
+  echo "=== Cleaning up UpdateService CR ==="
+  curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+    -X DELETE "$US_API" >/dev/null 2>&1 && echo "✓ UpdateService deleted" || echo "UpdateService cleanup skipped"
+
   exit 1
 fi
 
 echo ""
 echo "=== Mirror from intermediate complete ==="
+
+# Clean up UpdateService CR after successful mirror
+echo "=== Cleaning up UpdateService CR ==="
+curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+  -X DELETE "$US_API" >/dev/null 2>&1 && echo "✓ UpdateService deleted" || echo "UpdateService cleanup skipped"
 `},
 					},
 				},

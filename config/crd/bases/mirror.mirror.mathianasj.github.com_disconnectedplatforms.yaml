@@ -290,6 +290,34 @@ spec:
                             description: Starting CSV version for the subscription
                             type: string
                         type: object
+                      osus:
+                        description: OpenShift Update Service (OSUS/Cincinnati) operator
+                          subscription
+                        properties:
+                          approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
+                            type: string
+                          catalogSource:
+                            description: OLM catalog source name
+                            type: string
+                          catalogSourceNamespace:
+                            description: OLM catalog source namespace
+                            type: string
+                          channel:
+                            description: OLM subscription channel
+                            type: string
+                          disabled:
+                            description: Set to true to skip installation of this
+                              operator
+                            type: boolean
+                          startingCSV:
+                            description: Starting CSV version for the subscription
+                            type: string
+                        type: object
                       quayOperator:
                         description: Quay operator subscription for managed registry
                         properties:

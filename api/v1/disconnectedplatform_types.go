@@ -99,6 +99,9 @@ type OperatorConfig struct {
 	// Quay operator subscription for managed registry
 	// +optional
 	QuayOperator *OLMSubscriptionConfig `json:"quayOperator,omitempty"`
+	// OpenShift Update Service (OSUS/Cincinnati) operator subscription
+	// +optional
+	OSUS *OLMSubscriptionConfig `json:"osus,omitempty"`
 }
 
 type RHTASInstallerConfig struct {

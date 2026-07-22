@@ -277,6 +277,8 @@ rules:
 - apiGroups:
   - rbac.authorization.k8s.io
   resources:
+  - clusterrolebindings
+  - clusterroles
   - rolebindings
   - roles
   verbs:
@@ -360,3 +362,15 @@ rules:
   - pipelineruns/status
   verbs:
   - get
+- apiGroups:
+  - updateservice.operator.openshift.io
+  resources:
+  - updateservices
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
