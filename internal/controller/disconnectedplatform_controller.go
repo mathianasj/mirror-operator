@@ -3938,6 +3938,23 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayOBC(ctx context.Context, p
 		}
 	}
 
+	// Use external S3 route instead of internal svc so that nodes and external
+	// consumers (e.g. OSUS pods) can reach the object store via redirect URLs.
+	if hostname == "s3.openshift-storage.svc" {
+		s3Route := &unstructured.Unstructured{}
+		s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "route.openshift.io",
+			Version: "v1",
+			Kind:    "Route",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
+			if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
+				hostname = host
+				logger.Info("Using external S3 route for Quay storage", "hostname", hostname)
+			}
+		}
+	}
+
 	return &resolvedS3Credentials{
 		Hostname:  hostname,
 		Port:      port,
