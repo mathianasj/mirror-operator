@@ -8285,15 +8285,21 @@ if [ -f "$US_FILE" ]; then
 
     # Apply the updateService.yaml
     echo "Applying UpdateService CR to cluster..."
-    US_JSON=$(cat "$US_BACKUP" | python3 -c "
-import sys, json, yaml
-docs = list(yaml.safe_load_all(sys.stdin))
-doc = docs[0]
-doc['metadata'] = doc.get('metadata', {})
-doc['metadata']['name'] = 'update-service-oc-mirror'
-doc['metadata']['namespace'] = 'openshift-update-service'
-json.dump(doc, sys.stdout)
-" 2>/dev/null || cat "$US_BACKUP" | yq -o json '.' 2>/dev/null)
+    # Build JSON from the updateService.yaml values using jq (available in oc-mirror image)
+    US_GRAPH=$(grep 'graphDataImage:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
+    US_RELEASES=$(grep 'releases:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
+    US_REPLICAS=$(grep 'replicas:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
+    US_REPLICAS=${US_REPLICAS:-1}
+    US_JSON=$(jq -n \
+      --arg graph "$US_GRAPH" \
+      --arg releases "$US_RELEASES" \
+      --argjson replicas "$US_REPLICAS" \
+      '{
+        apiVersion: "updateservice.operator.openshift.io/v1",
+        kind: "UpdateService",
+        metadata: {name: "update-service-oc-mirror", namespace: "openshift-update-service"},
+        spec: {graphDataImage: $graph, releases: $releases, replicas: $replicas}
+      }')
 
     if [ -n "$US_JSON" ]; then
       HTTP_CODE=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
