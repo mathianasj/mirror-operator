@@ -8545,7 +8545,7 @@ while IFS='=' read -r source dest; do
     DIGEST=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
   fi
 
-  SAFE_NAME=$(echo "$dest_no_proto" | tr '/:@' '_')
+  SAFE_NAME=$(echo -n "$dest_no_proto" | sha256sum | cut -d' ' -f1)
   OUTPUT_FILE="/workspace/output/sboms/${SAFE_NAME}.spdx.json"
 
   # Check cache first if we have a digest
