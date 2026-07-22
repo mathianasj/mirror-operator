@@ -8136,15 +8136,33 @@ postprocess_sbom() {
   local source_ref="$2"
   local dest_ref="$3"
   local src_no_proto="${source_ref#docker://}"
-  jq --arg src "$src_no_proto" --arg dest "$dest_ref" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-    .name = $src |
+  local src_repo="${src_no_proto%%@*}"
+  jq --arg src "$src_no_proto" --arg srcRepo "$src_repo" --arg dest "$dest_ref" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    .name = $srcRepo |
     .documentNamespace = "https://mirror-operator/sboms/\($src)" |
     .annotations = ((.annotations // []) + [{
       "annotationDate": $ts,
       "annotationType": "OTHER",
       "annotator": "Tool: mirror-operator-collection-pipeline",
       "comment": "Mirrored to: \($dest)"
-    }])
+    }]) |
+    if (.packages | length) > 0 then
+      .packages[0].name = $srcRepo |
+      .packages[0].externalRefs = ([
+        .packages[0].externalRefs[]? |
+        if .referenceType == "purl" then
+          . as $orig |
+          (.referenceLocator | ltrimstr("pkg:oci/") | index("@")) as $at |
+          if $at then
+            {referenceCategory: "PACKAGE-MANAGER", referenceType: "purl",
+             referenceLocator: ("pkg:oci/" + $srcRepo + (.referenceLocator | ltrimstr("pkg:oci/")[$at:]))},
+            {referenceCategory: "OTHER", referenceType: "purl",
+             referenceLocator: $orig.referenceLocator,
+             comment: "intermediate-registry-ref"}
+          else . end
+        else . end
+      ])
+    else . end
   ' "$sbom_file" > "${sbom_file}.tmp" && mv "${sbom_file}.tmp" "$sbom_file"
 }
 
@@ -10011,6 +10029,10 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		Owns(&unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "route.openshift.io/v1",
 			"kind":       "Route",
+		}}).
+		Owns(&unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "tekton.dev/v1",
+			"kind":       "Pipeline",
 		}}).
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
 		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
