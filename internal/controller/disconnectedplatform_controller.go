@@ -291,6 +291,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		if err := r.ensurePipelineUpdateServiceRBAC(ctx); err != nil {
 			log.FromContext(ctx).Error(err, "failed to ensure pipeline RBAC for UpdateService")
 		}
+		// Copy pull secret to OSUS namespace so UpdateService pods can pull graph images
+		if err := r.ensureOSUSPullSecret(ctx); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure pull secret in OSUS namespace")
+		}
 
 		// Reconcile ObjectBucketClaim for artifacts storage
 		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
@@ -4767,6 +4771,62 @@ func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceBinding(ctx 
 	}
 
 	return r.Create(ctx, binding)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {
+	osusNamespace := "openshift-update-service"
+
+	sourceSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: architectNamespace}, sourceSecret); err != nil {
+		return fmt.Errorf("failed to get pull-secret from %s: %w", architectNamespace, err)
+	}
+
+	targetSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pull-secret",
+			Namespace: osusNamespace,
+		},
+		Data: sourceSecret.Data,
+		Type: sourceSecret.Type,
+	}
+
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(targetSecret), existing); err == nil {
+		if string(existing.Data[".dockerconfigjson"]) != string(sourceSecret.Data[".dockerconfigjson"]) {
+			existing.Data = sourceSecret.Data
+			if err := r.Update(ctx, existing); err != nil {
+				return err
+			}
+		}
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, targetSecret); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+
+	// Link pull secret to default SA so UpdateService pods can pull graph images
+	sa := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "default", Namespace: osusNamespace}, sa); err != nil {
+		return fmt.Errorf("failed to get default SA in %s: %w", osusNamespace, err)
+	}
+
+	hasSecret := false
+	for _, s := range sa.ImagePullSecrets {
+		if s.Name == "pull-secret" {
+			hasSecret = true
+			break
+		}
+	}
+	if !hasSecret {
+		sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: "pull-secret"})
+		if err := r.Update(ctx, sa); err != nil {
+			return fmt.Errorf("failed to link pull-secret to default SA: %w", err)
+		}
+	}
+
+	return nil
 }
 
 const (
