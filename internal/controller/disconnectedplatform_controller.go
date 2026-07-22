@@ -8093,6 +8093,64 @@ mkdir -p $HOME/.docker
 cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
 export DOCKER_CONFIG=$HOME/.docker
 
+# === TPA Upload Setup ===
+CLIENT_SECRET=$(cat /workspace/tpa-oidc-secret/clientSecret)
+TPA_TOKEN=""
+TOKEN_TIME=0
+
+refresh_tpa_token() {
+  TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
+    -d "client_id=$(params.tpa-oidc-client-id)" \
+    -d "client_secret=$CLIENT_SECRET" \
+    -d "grant_type=client_credentials" | jq -r '.access_token')
+  TOKEN_TIME=$(date +%s)
+}
+
+upload_sbom_to_tpa() {
+  local sbom_file="$1"
+  local now=$(date +%s)
+  if [ $((now - TOKEN_TIME)) -ge 240 ]; then
+    echo "    Refreshing TPA OIDC token..."
+    refresh_tpa_token
+  fi
+  local response
+  response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+    -H "Authorization: Bearer $TPA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$sbom_file" \
+    "https://$(params.tpa-host)/api/v2/sbom")
+  local http_code
+  http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+    echo "    -> Uploaded to TPA"
+    return 0
+  else
+    echo "    -> TPA upload failed (HTTP $http_code)"
+    return 1
+  fi
+}
+
+# Post-process SBOM to set upstream source name and add intermediate destination annotation
+postprocess_sbom() {
+  local sbom_file="$1"
+  local source_ref="$2"
+  local dest_ref="$3"
+  local src_no_proto="${source_ref#docker://}"
+  jq --arg src "$src_no_proto" --arg dest "$dest_ref" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    .name = $src |
+    .documentNamespace = "https://mirror-operator/sboms/\($src)" |
+    .annotations = ((.annotations // []) + [{
+      "annotationDate": $ts,
+      "annotationType": "OTHER",
+      "annotator": "Tool: mirror-operator-collection-pipeline",
+      "comment": "Mirrored to: \($dest)"
+    }])
+  ' "$sbom_file" > "${sbom_file}.tmp" && mv "${sbom_file}.tmp" "$sbom_file"
+}
+
+refresh_tpa_token
+uploaded_tpa=0
+
 MAPPING_FILE="/workspace/output/working-dir/dry-run/mapping.txt"
 if [ ! -f "$MAPPING_FILE" ]; then
   MAPPING_FILE=$(find /workspace/output/working-dir -name "mapping.txt" -type f 2>/dev/null | head -1)
@@ -8147,8 +8205,11 @@ while IFS='=' read -r source dest; do
     if [ -f "$CACHE_FILE" ]; then
       cp "$CACHE_FILE" "$OUTPUT_FILE"
       pkg_count=$(jq '.packages | length // 0' "$CACHE_FILE" 2>/dev/null || echo 0)
-      echo "  [$current/$image_count] ✓ Cached: $dest_no_proto ($pkg_count packages)"
+      echo "  [$current/$image_count] Cached: $dest_no_proto ($pkg_count packages)"
       cached=$((cached + 1))
+      if upload_sbom_to_tpa "$OUTPUT_FILE"; then
+        uploaded_tpa=$((uploaded_tpa + 1))
+      fi
       continue
     fi
   fi
@@ -8167,9 +8228,14 @@ while IFS='=' read -r source dest; do
   echo "  [$current/$image_count] Scanning: $dest_no_proto"
   if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" 2>/dev/null; then
     scanned=$((scanned + 1))
-    # Cache the SBOM by digest for future runs
+    # Post-process: set upstream source name and add intermediate destination annotation
+    postprocess_sbom "$OUTPUT_FILE" "$source" "$dest_no_proto"
+    # Cache the post-processed SBOM by digest for future runs
     if [ -n "$DIGEST" ]; then
       cp "$OUTPUT_FILE" "$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
+    fi
+    if upload_sbom_to_tpa "$OUTPUT_FILE"; then
+      uploaded_tpa=$((uploaded_tpa + 1))
     fi
   else
     echo "    Failed to scan"
@@ -8177,7 +8243,7 @@ while IFS='=' read -r source dest; do
 done < "$MAPPING_FILE"
 
 echo "=== SBOM generation complete ==="
-echo "Total: $image_count | Cached: $cached | Scanned: $scanned"
+echo "Total: $image_count | Cached: $cached | Scanned: $scanned | Uploaded to TPA: $uploaded_tpa"
 ls -lh /workspace/output/sboms/ | head -20
 `},
 						"env": []map[string]interface{}{
@@ -8190,6 +8256,7 @@ ls -lh /workspace/output/sboms/ | head -20
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
 				{"name": "pull-secret"},
+				{"name": "tpa-oidc-secret"},
 			},
 		},
 
@@ -8250,6 +8317,10 @@ export COSIGN_EXPERIMENTAL=1
 echo "=== Initializing TUF root for private Sigstore ==="
 cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
 
+# Point cosign at the CTFE public key from our private TUF root
+# Without this, cosign cannot match the SCT to our CT log's key
+export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE=$HOME/.sigstore/root/targets/ctfe.pub
+
 # Sign each image in intermediate registry
 signed_count=0
 skipped_count=0
@@ -8295,6 +8366,11 @@ done < "$MAPPING_FILE"
 echo ""
 echo "=== Image signing complete ==="
 echo "Total: $total_images | Signed: $signed_count | Already signed: $skipped_count | Failed: $failed_count"
+
+if [ "$signed_count" -eq 0 ] && [ "$skipped_count" -eq 0 ] && [ "$total_images" -gt 0 ]; then
+  echo "ERROR: All images failed to sign"
+  exit 1
+fi
 `},
 						"env": []map[string]interface{}{
 							{"name": "COSIGN_EXPERIMENTAL", "value": "1"},
@@ -8746,6 +8822,7 @@ if ! oc-mirror \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --cache-dir=/workspace/output/.oc-mirror/.cache \
+  --graph-image=docker://$(params.intermediate-registry)/openshift/graph-image:latest \
   file:///workspace/output; then
 
   echo ""
@@ -8844,7 +8921,7 @@ echo "=== Bundle signing complete ==="
 			},
 		},
 
-		// Task 8: create-bundle-sbom (create contextual SBOM for the signed bundle)
+		// Task 8: create-bundle-sbom (scan additional artifacts and create contextual SBOM for the signed bundle)
 		{
 			"name":     "create-bundle-sbom",
 			"runAfter": []string{"sign-bundles"},
@@ -8859,161 +8936,242 @@ echo "=== Bundle signing complete ==="
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
-echo "=== Creating Bundle SBOM (Contextual SBOM Pattern) ==="
+echo "=== Creating Bundle SBOM (Full Hierarchy) ==="
 
-# Get collection name
+# === TPA Upload Setup ===
+CLIENT_SECRET=$(cat /workspace/tpa-oidc-secret/clientSecret)
+TPA_TOKEN=""
+TOKEN_TIME=0
+
+refresh_tpa_token() {
+  TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
+    -d "client_id=$(params.tpa-oidc-client-id)" \
+    -d "client_secret=$CLIENT_SECRET" \
+    -d "grant_type=client_credentials" | jq -r '.access_token')
+  TOKEN_TIME=$(date +%s)
+}
+
+upload_sbom_to_tpa() {
+  local sbom_file="$1"
+  local now=$(date +%s)
+  if [ $((now - TOKEN_TIME)) -ge 240 ]; then
+    echo "  Refreshing TPA OIDC token..."
+    refresh_tpa_token
+  fi
+  local response
+  response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+    -H "Authorization: Bearer $TPA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$sbom_file" \
+    "https://$(params.tpa-host)/api/v2/sbom")
+  local http_code
+  http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+    echo "  -> Uploaded to TPA"
+    return 0
+  else
+    echo "  -> TPA upload failed (HTTP $http_code)"
+    return 1
+  fi
+}
+
+postprocess_sbom() {
+  local sbom_file="$1"
+  local source_name="$2"
+  jq --arg src "$source_name" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    .name = $src |
+    .documentNamespace = "https://mirror-operator/sboms/\($src)"
+  ' "$sbom_file" > "${sbom_file}.tmp" && mv "${sbom_file}.tmp" "$sbom_file"
+}
+
+refresh_tpa_token
+uploaded_tpa=0
+
 COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+mkdir -p /workspace/output/sboms
 
-# Find the complete bundle (created by repackage-bundle task)
+# === Scan Architect Images ===
+echo "--- Scanning Architect Images ---"
+
+if [ -f "/workspace/output/airgap-architect-frontend.tar.gz" ]; then
+  echo "Scanning architect frontend image..."
+  if syft docker-archive:/workspace/output/airgap-architect-frontend.tar.gz \
+       -o spdx-json=/workspace/output/sboms/architect-frontend.spdx.json 2>/dev/null; then
+    postprocess_sbom "/workspace/output/sboms/architect-frontend.spdx.json" "$(params.architect-frontend-image)"
+    if upload_sbom_to_tpa "/workspace/output/sboms/architect-frontend.spdx.json"; then
+      uploaded_tpa=$((uploaded_tpa + 1))
+    fi
+  else
+    echo "  Failed to scan architect frontend"
+  fi
+else
+  echo "  Architect frontend tarball not found, skipping"
+fi
+
+if [ -f "/workspace/output/airgap-architect-backend.tar.gz" ]; then
+  echo "Scanning architect backend image..."
+  if syft docker-archive:/workspace/output/airgap-architect-backend.tar.gz \
+       -o spdx-json=/workspace/output/sboms/architect-backend.spdx.json 2>/dev/null; then
+    postprocess_sbom "/workspace/output/sboms/architect-backend.spdx.json" "$(params.architect-backend-image)"
+    if upload_sbom_to_tpa "/workspace/output/sboms/architect-backend.spdx.json"; then
+      uploaded_tpa=$((uploaded_tpa + 1))
+    fi
+  else
+    echo "  Failed to scan architect backend"
+  fi
+else
+  echo "  Architect backend tarball not found, skipping"
+fi
+
+# === Scan CLI Tools (conditional) ===
+if [ "$(params.cli-tools-enabled)" = "true" ] && [ -d "/workspace/output/cli-tools" ]; then
+  echo "--- Scanning CLI Tools ---"
+
+  scan_cli_tool() {
+    local tarball="$1"
+    local sbom_name="$2"
+    local display_name="$3"
+    if [ -f "$tarball" ]; then
+      echo "Scanning $display_name..."
+      if syft file:"$tarball" \
+           -o spdx-json="/workspace/output/sboms/${sbom_name}.spdx.json" 2>/dev/null; then
+        postprocess_sbom "/workspace/output/sboms/${sbom_name}.spdx.json" "$display_name"
+        if upload_sbom_to_tpa "/workspace/output/sboms/${sbom_name}.spdx.json"; then
+          uploaded_tpa=$((uploaded_tpa + 1))
+        fi
+      else
+        echo "  Failed to scan $display_name"
+      fi
+    else
+      echo "  $display_name tarball not found, skipping"
+    fi
+  }
+
+  scan_cli_tool "/workspace/output/cli-tools/openshift-client-linux.tar.gz" \
+    "cli-openshift-client-linux" \
+    "openshift-client-linux $(params.oc-version)"
+
+  scan_cli_tool "/workspace/output/cli-tools/openshift-install-linux.tar.gz" \
+    "cli-openshift-install-linux" \
+    "openshift-install-linux $(params.oc-version)"
+
+  scan_cli_tool "/workspace/output/cli-tools/oc-mirror.tar.gz" \
+    "cli-oc-mirror" \
+    "oc-mirror $(params.oc-version)"
+
+  scan_cli_tool "/workspace/output/cli-tools/mirror-registry.tar.gz" \
+    "cli-mirror-registry" \
+    "mirror-registry $(params.mirror-registry-version)"
+else
+  echo "--- CLI tools scanning skipped (disabled or not present) ---"
+fi
+
+echo "Uploaded $uploaded_tpa additional SBOMs to TPA"
+
+# === Build Bundle SBOM ===
+echo "--- Building Bundle SBOM ---"
+
 BUNDLE_FILE=$(find /workspace/output -maxdepth 1 -name "*-complete.tar.gz" -type f | head -1)
 if [ -z "$BUNDLE_FILE" ]; then
   echo "No complete bundle file found, skipping bundle SBOM creation"
   exit 0
 fi
 
-echo "Found complete bundle: $(basename "$BUNDLE_FILE")"
-
-# Use the complete bundle as-is (no rename)
 BUNDLE_FILENAME=$(basename "$BUNDLE_FILE")
-
-# Calculate bundle checksum
 BUNDLE_SHA256=$(sha256sum "$BUNDLE_FILE" | awk '{print $1}')
-echo "Bundle SHA256: $BUNDLE_SHA256"
-
-# Count image SBOMs
-SBOM_COUNT=$(find /workspace/output/sboms -name "*.spdx.json" -type f | wc -l)
-echo "Found $SBOM_COUNT image SBOMs to reference"
-
-# Generate unique SBOM IDs
-BUNDLE_SBOM_ID="SPDXRef-DOCUMENT"
 BUNDLE_PACKAGE_ID="SPDXRef-Package-Bundle-${COLLECTION_NAME}"
+BUNDLE_SBOM="/workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json"
 
-# Create bundle SBOM in SPDX 2.3 format
-cat > /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<'HEADER'
-{
-  "spdxVersion": "SPDX-2.3",
-  "dataLicense": "CC0-1.0",
-  "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "OCI Mirror Bundle",
-HEADER
+echo "Bundle: $BUNDLE_FILENAME (SHA256: $BUNDLE_SHA256)"
 
-# Add dynamic fields
-cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<EOF
-  "documentNamespace": "https://mirror-operator/bundles/${COLLECTION_NAME}/$(date -u +%Y%m%d%H%M%S)",
-  "creationInfo": {
-    "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-    "creators": [
-      "Tool: mirror-operator-collection-pipeline"
-    ],
-    "licenseListVersion": "3.21"
-  },
-  "packages": [
-    {
-      "SPDXID": "${BUNDLE_PACKAGE_ID}",
-      "name": "${BUNDLE_FILENAME}",
-      "versionInfo": "${COLLECTION_NAME}",
-      "downloadLocation": "s3://$(params.s3-bucket)/${COLLECTION_NAME}/${BUNDLE_FILENAME}",
-      "filesAnalyzed": false,
-      "checksums": [
-        {
-          "algorithm": "SHA256",
-          "checksumValue": "${BUNDLE_SHA256}"
-        }
-      ],
-      "externalRefs": [
-        {
-          "referenceCategory": "PACKAGE-MANAGER",
-          "referenceType": "purl",
-          "referenceLocator": "pkg:oci/mirror-bundle@${COLLECTION_NAME}?checksum=sha256:${BUNDLE_SHA256}"
-        }
-      ],
-      "primaryPackagePurpose": "CONTAINER",
-      "description": "OCI mirror bundle containing ${SBOM_COUNT} container images"
-    }
-EOF
+# Collect child packages, external refs, and relationships from all child SBOMs
+CHILD_PACKAGES="[]"
+EXT_REFS="[]"
+CONTAINS_RELS="[]"
 
-# Add each image as a package in the bundle SBOM
-# Syft puts the main container image as the first package
-find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
-  # Extract the first package (the container image itself)
-  package_info=$(jq -c '.packages[0]' "$sbom_file" 2>/dev/null)
-  if [ -n "$package_info" ] && [ "$package_info" != "{}" ] && [ "$package_info" != "null" ]; then
-    echo "," >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-    echo "$package_info" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-  fi
-done
-
-cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<PACKAGES_END
-  ],
-  "externalDocumentRefs": [
-PACKAGES_END
-
-# Add external document references for each image SBOM
-first=true
-find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
+for sbom_file in $(find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort); do
   sbom_name=$(basename "$sbom_file" .spdx.json)
+
+  pkg=$(jq -c '.packages[0] // empty' "$sbom_file" 2>/dev/null)
+  if [ -n "$pkg" ] && [ "$pkg" != "null" ]; then
+    CHILD_PACKAGES=$(echo "$CHILD_PACKAGES" | jq --argjson p "$pkg" '. + [$p]')
+  fi
+
   sbom_checksum=$(sha256sum "$sbom_file" | awk '{print $1}')
+  EXT_REFS=$(echo "$EXT_REFS" | jq \
+    --arg id "DocumentRef-${sbom_name}" \
+    --arg uri "https://mirror-operator/sboms/${sbom_name}" \
+    --arg sum "$sbom_checksum" \
+    '. + [{"externalDocumentId": $id, "spdxDocument": $uri, "checksum": {"algorithm": "SHA256", "checksumValue": $sum}}]')
 
-  if [ "$first" = false ]; then
-    echo "," >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-  fi
-  first=false
-
-  cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<DOCREF
-    {
-      "externalDocumentId": "DocumentRef-${sbom_name}",
-      "spdxDocument": "https://mirror-operator/sboms/${sbom_name}",
-      "checksum": {
-        "algorithm": "SHA256",
-        "checksumValue": "${sbom_checksum}"
-      }
-    }
-DOCREF
+  main_pkg_id=$(jq -r '.packages[0].SPDXID // "SPDXRef-Package"' "$sbom_file" 2>/dev/null || echo "SPDXRef-Package")
+  CONTAINS_RELS=$(echo "$CONTAINS_RELS" | jq \
+    --arg bundle "$BUNDLE_PACKAGE_ID" \
+    --arg child "$main_pkg_id" \
+    '. + [{"spdxElementId": $bundle, "relationshipType": "CONTAINS", "relatedSpdxElement": $child}]')
 done
 
-# Add relationships
-cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<RELS
-  ],
-  "relationships": [
-    {
-      "spdxElementId": "SPDXRef-DOCUMENT",
-      "relationshipType": "DESCRIBES",
-      "relatedSpdxElement": "${BUNDLE_PACKAGE_ID}"
-    }
-RELS
+CHILD_COUNT=$(echo "$CHILD_PACKAGES" | jq 'length')
 
-# Add CONTAINS relationships - both to packages in this SBOM and external documents for full context
-find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort | while read sbom_file; do
-  sbom_name=$(basename "$sbom_file" .spdx.json)
-  # Get the first package ID (the container image)
-  main_package_id=$(jq -r '.packages[0].SPDXID // "SPDXRef-Package"' "$sbom_file" 2>/dev/null || echo "SPDXRef-Package")
-
-  # Create CONTAINS relationship to the package we included in this SBOM
-  cat >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json <<CONTAINS
-    ,
-    {
-      "spdxElementId": "${BUNDLE_PACKAGE_ID}",
-      "relationshipType": "CONTAINS",
-      "relatedSpdxElement": "${main_package_id}"
-    }
-CONTAINS
-done
-
-# Close JSON
-echo "  ]" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-echo "}" >> /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+# Build the complete bundle SBOM in a single jq invocation
+jq -n \
+  --arg ns "https://mirror-operator/bundles/${COLLECTION_NAME}/$(date -u +%Y%m%d%H%M%S)" \
+  --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg bundleId "$BUNDLE_PACKAGE_ID" \
+  --arg bundleName "$BUNDLE_FILENAME" \
+  --arg collName "$COLLECTION_NAME" \
+  --arg s3Bucket "$(params.s3-bucket)" \
+  --arg bundleSha "$BUNDLE_SHA256" \
+  --arg childCount "$CHILD_COUNT" \
+  --argjson childPkgs "$CHILD_PACKAGES" \
+  --argjson extRefs "$EXT_REFS" \
+  --argjson containsRels "$CONTAINS_RELS" \
+  '{
+    spdxVersion: "SPDX-2.3",
+    dataLicense: "CC0-1.0",
+    SPDXID: "SPDXRef-DOCUMENT",
+    name: "OCI Mirror Bundle",
+    documentNamespace: $ns,
+    creationInfo: {
+      created: $created,
+      creators: ["Tool: mirror-operator-collection-pipeline"],
+      licenseListVersion: "3.21"
+    },
+    packages: ([{
+      SPDXID: $bundleId,
+      name: $bundleName,
+      versionInfo: $collName,
+      downloadLocation: ("s3://" + $s3Bucket + "/" + $collName + "/" + $bundleName),
+      filesAnalyzed: false,
+      checksums: [{algorithm: "SHA256", checksumValue: $bundleSha}],
+      externalRefs: [{
+        referenceCategory: "PACKAGE-MANAGER",
+        referenceType: "purl",
+        referenceLocator: ("pkg:oci/mirror-bundle@" + $collName + "?checksum=sha256:" + $bundleSha)
+      }],
+      primaryPackagePurpose: "CONTAINER",
+      description: ("OCI mirror bundle containing " + $childCount + " child components (OCI images, CLI tools, architect images)")
+    }] + $childPkgs),
+    externalDocumentRefs: $extRefs,
+    relationships: ([{
+      spdxElementId: "SPDXRef-DOCUMENT",
+      relationshipType: "DESCRIBES",
+      relatedSpdxElement: $bundleId
+    }] + $containsRels)
+  }' > "$BUNDLE_SBOM"
 
 echo "=== Bundle SBOM Created ==="
 echo "File: bundle-${COLLECTION_NAME}.spdx.json"
-jq -r '.packages[0] | "Bundle: \(.name) (\(.versionInfo))"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-jq -r '.externalDocumentRefs | length | "References: \(.) image SBOMs"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
-jq -r '.relationships | map(select(.relationshipType == "CONTAINS")) | length | "Contains: \(.) images"' /workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json
+jq -r '.packages | length | "Total packages: \(.)"' "$BUNDLE_SBOM"
+jq -r '.externalDocumentRefs | length | "External document refs: \(.)"' "$BUNDLE_SBOM"
+jq -r '.relationships | map(select(.relationshipType == "CONTAINS")) | length | "Contains relationships: \(.)"' "$BUNDLE_SBOM"
 `},
 					},
 				},
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
+				{"name": "tpa-oidc-secret"},
 			},
 		},
 
@@ -9070,21 +9228,9 @@ upload_sbom() {
     "https://$(params.tpa-host)/api/v2/sbom"
 }
 
-# Upload image SBOMs first
+# Image SBOMs were already uploaded to TPA during the syft-sbom task
+echo "Skipping image SBOM upload (already uploaded during syft-sbom task)"
 UPLOAD_COUNT=0
-find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" | while read sbom; do
-  echo "Uploading image SBOM: $(basename $sbom)"
-  RESPONSE=$(upload_sbom "$sbom")
-
-  HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-
-  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-    UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
-    echo "✓ Successfully uploaded: $(basename $sbom)"
-  else
-    echo "✗ Failed to upload $(basename $sbom) - HTTP $HTTP_CODE"
-  fi
-done
 
 # Upload bundle SBOM last and capture its ID for the result URL
 BUNDLE_SBOM_ID=""
