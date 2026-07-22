@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -805,7 +806,7 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	} else {
 		// Create managed PostgreSQL for TPA
 		var err error
-		dbHost, dbName, dbUser, dbPassword, err = r.ensureRHTPAPostgreSQL(ctx)
+		dbHost, dbName, dbUser, dbPassword, err = r.ensureRHTPAPostgreSQL(ctx, cfg.DatabaseStorageSize, cfg.DatabaseMaxStorageSize)
 		if err != nil {
 			return fmt.Errorf("failed to create managed PostgreSQL for TPA: %w", err)
 		}
@@ -1998,9 +1999,17 @@ func (r *DisconnectedPlatformReconciler) assignRoleToServiceAccount(ctx context.
 	return nil
 }
 
-func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Context) (string, string, string, string, error) {
+func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Context, storageSize, maxStorageSize string) (string, string, string, string, error) {
 	// Create PostgreSQL StatefulSet for TPA persistence
 	// Returns: host, dbname, username, password, error
+	logger := log.FromContext(ctx)
+
+	if storageSize == "" {
+		storageSize = "50Gi"
+	}
+	if maxStorageSize == "" {
+		maxStorageSize = "200Gi"
+	}
 
 	dbName := "rhtpadb"
 	dbUser := "rhtpa"
@@ -2031,6 +2040,7 @@ func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Conte
 	}
 
 	// Create PVC
+	requestedSize := resource.MustParse(storageSize)
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
@@ -2043,7 +2053,7 @@ func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Conte
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("10Gi"),
+					corev1.ResourceStorage: requestedSize,
 				},
 			},
 		},
@@ -2053,6 +2063,9 @@ func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Conte
 		if err := r.Create(ctx, pvc); err != nil {
 			return "", "", "", "", fmt.Errorf("failed to create TPA PostgreSQL PVC: %w", err)
 		}
+	} else if err == nil {
+		// Auto-expand: check if PVC usage exceeds 80% of capacity
+		r.autoExpandPVC(ctx, existingPVC, maxStorageSize, logger)
 	}
 
 	// Create PostgreSQL StatefulSet
@@ -2151,6 +2164,94 @@ func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Conte
 
 	dbHost := fmt.Sprintf("%s.%s.svc", serviceName, architectNamespace)
 	return dbHost, dbName, dbUser, dbPassword, nil
+}
+
+func (r *DisconnectedPlatformReconciler) autoExpandPVC(ctx context.Context, pvc *corev1.PersistentVolumeClaim, maxStorageSize string, logger logr.Logger) {
+	maxSize := resource.MustParse(maxStorageSize)
+	currentCapacity := pvc.Status.Capacity[corev1.ResourceStorage]
+
+	if currentCapacity.Cmp(maxSize) >= 0 {
+		return
+	}
+
+	// Check usage via pod exec: df on the PostgreSQL data mount
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(pvc.Namespace),
+		client.MatchingLabels{"app": "rhtpa-postgresql"},
+	); err != nil || len(podList.Items) == 0 {
+		return
+	}
+
+	pod := podList.Items[0]
+	if pod.Status.Phase != corev1.PodRunning {
+		return
+	}
+
+	// Use the Kubernetes API to exec df in the pod
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return
+	}
+
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod.Name).
+		Namespace(pod.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "postgresql",
+			Command:   []string{"df", "--output=pcent", "/var/lib/pgsql/data"},
+			Stdout:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return
+	}
+
+	var stdout bytes.Buffer
+	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout}); err != nil {
+		return
+	}
+
+	// Parse "Use%" output — second line contains the percentage like " 80%"
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) < 2 {
+		return
+	}
+	pctStr := strings.TrimSpace(strings.TrimSuffix(lines[1], "%"))
+	pct, err := strconv.Atoi(pctStr)
+	if err != nil {
+		return
+	}
+
+	if pct < 80 {
+		return
+	}
+
+	// Double the current size, capped at max
+	newSize := currentCapacity.DeepCopy()
+	newSize.Add(currentCapacity)
+	if newSize.Cmp(maxSize) > 0 {
+		newSize = maxSize
+	}
+
+	logger.Info("Auto-expanding TPA PostgreSQL PVC",
+		"currentCapacity", currentCapacity.String(),
+		"usage", fmt.Sprintf("%d%%", pct),
+		"newSize", newSize.String(),
+		"maxSize", maxSize.String(),
+	)
+
+	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = newSize
+	if err := r.Update(ctx, pvc); err != nil {
+		logger.Error(err, "Failed to auto-expand TPA PostgreSQL PVC")
+	}
 }
 
 func (r *DisconnectedPlatformReconciler) checkKeycloakHealth(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {

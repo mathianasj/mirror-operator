@@ -186,6 +186,14 @@ type RHTPAInstallerConfig struct {
 	// OIDC configuration for RHTPA authentication
 	// +optional
 	OIDC *RHTPAOIDCConfig `json:"oidc,omitempty"`
+	// Size of the managed PostgreSQL PVC (ignored when external Database is set)
+	// +kubebuilder:default="50Gi"
+	// +optional
+	DatabaseStorageSize string `json:"databaseStorageSize,omitempty"`
+	// Maximum size the managed PostgreSQL PVC can auto-expand to when usage exceeds 80%
+	// +kubebuilder:default="200Gi"
+	// +optional
+	DatabaseMaxStorageSize string `json:"databaseMaxStorageSize,omitempty"`
 }
 
 type QuayInstallerConfig struct {

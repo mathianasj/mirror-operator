@@ -585,6 +585,16 @@ spec:
                         - password
                         - username
                         type: object
+                      databaseMaxStorageSize:
+                        default: 200Gi
+                        description: Maximum size the managed PostgreSQL PVC can auto-expand
+                          to when usage exceeds 80%
+                        type: string
+                      databaseStorageSize:
+                        default: 50Gi
+                        description: Size of the managed PostgreSQL PVC (ignored when
+                          external Database is set)
+                        type: string
                       oidc:
                         description: OIDC configuration for RHTPA authentication
                         properties:
