@@ -8440,20 +8440,6 @@ export COSIGN_EXPERIMENTAL=1
 echo "=== Initializing TUF root for private Sigstore ==="
 cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.json"
 
-# Remove trusted_root.json so cosign falls back to individual key files.
-# With trusted_root.json present, cosign matches SCT log IDs against protobuf
-# entries and ignores SIGSTORE_CT_LOG_PUBLIC_KEY_FILE. Removing it forces the
-# legacy code path that respects the env var.
-rm -f $HOME/.sigstore/root/targets/trusted_root.json
-rm -f $HOME/.sigstore/root/targets/signing_config.v0.2.json
-
-export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE=$HOME/.sigstore/root/targets/ctfe.pub
-
-echo "=== TUF targets after cleanup ==="
-ls -la $HOME/.sigstore/root/targets/
-echo "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE=$SIGSTORE_CT_LOG_PUBLIC_KEY_FILE"
-echo "==="
-
 # Sign each image in intermediate registry
 signed_count=0
 skipped_count=0
