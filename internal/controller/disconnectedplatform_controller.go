@@ -287,13 +287,13 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
-		// Ensure pipeline SA RBAC for UpdateService management (OSUS)
-		if err := r.ensurePipelineUpdateServiceRBAC(ctx); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure pipeline RBAC for UpdateService")
-		}
-		// Copy pull secret to OSUS namespace so UpdateService pods can pull graph images
+		// Copy pull secret to OSUS namespace and cluster pull secret so UpdateService pods can pull graph images
 		if err := r.ensureOSUSPullSecret(ctx); err != nil {
 			log.FromContext(ctx).Error(err, "failed to ensure pull secret in OSUS namespace")
+		}
+		// Create/update the singleton UpdateService CR for graph support
+		if err := r.ensureUpdateService(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure UpdateService CR")
 		}
 
 		// Reconcile ObjectBucketClaim for artifacts storage
@@ -4730,66 +4730,6 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 	return r.Create(ctx, sub)
 }
 
-func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceRBAC(ctx context.Context) error {
-	clusterRole := &unstructured.Unstructured{}
-	clusterRole.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole",
-	})
-	clusterRole.SetName("mirror-operator-pipeline-osus")
-
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(clusterRole.GroupVersionKind())
-	if err := r.Get(ctx, client.ObjectKeyFromObject(clusterRole), existing); err == nil {
-		return r.ensurePipelineUpdateServiceBinding(ctx)
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	clusterRole.Object["rules"] = []interface{}{
-		map[string]interface{}{
-			"apiGroups": []interface{}{"updateservice.operator.openshift.io"},
-			"resources": []interface{}{"updateservices"},
-			"verbs":     []interface{}{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-	}
-
-	if err := r.Create(ctx, clusterRole); err != nil {
-		return err
-	}
-	return r.ensurePipelineUpdateServiceBinding(ctx)
-}
-
-func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceBinding(ctx context.Context) error {
-	binding := &unstructured.Unstructured{}
-	binding.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding",
-	})
-	binding.SetName("mirror-operator-pipeline-osus")
-
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(binding.GroupVersionKind())
-	if err := r.Get(ctx, client.ObjectKeyFromObject(binding), existing); err == nil {
-		return nil
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	binding.Object["roleRef"] = map[string]interface{}{
-		"apiGroup": "rbac.authorization.k8s.io",
-		"kind":     "ClusterRole",
-		"name":     "mirror-operator-pipeline-osus",
-	}
-	binding.Object["subjects"] = []interface{}{
-		map[string]interface{}{
-			"kind":      "ServiceAccount",
-			"name":      "pipeline",
-			"namespace": architectNamespace,
-		},
-	}
-
-	return r.Create(ctx, binding)
-}
-
 func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 	osusNamespace := "openshift-update-service"
@@ -4905,6 +4845,75 @@ func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Contex
 		logger.Info("Added Quay credentials to cluster pull-secret", "quayHost", quayHostname)
 	}
 
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureUpdateService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	quayRegistry := &unstructured.Unstructured{}
+	quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry",
+	})
+	if err := r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay", Namespace: architectNamespace}, quayRegistry); err != nil {
+		logger.V(1).Info("QuayRegistry not found, skipping UpdateService")
+		return nil
+	}
+
+	quayHostname, err := r.getQuayHostname(ctx, quayRegistry)
+	if err != nil || quayHostname == "" {
+		logger.V(1).Info("Quay hostname not available yet, skipping UpdateService")
+		return nil
+	}
+
+	orgName := "mirror"
+	if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.OrganizationName != "" {
+		orgName = platform.Spec.Connected.Quay.Managed.OrganizationName
+	}
+
+	us := &unstructured.Unstructured{}
+	us.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
+	})
+	us.SetName("update-service-oc-mirror")
+	us.SetNamespace("openshift-update-service")
+
+	desired := map[string]interface{}{
+		"graphDataImage": "quay.io/openshift-release-dev/graph-image:latest",
+		"releases":       quayHostname + "/" + orgName + "/openshift/release-images",
+		"replicas":       int64(2),
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(us.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(us), existing); err == nil {
+		currentSpec, _, _ := unstructured.NestedMap(existing.Object, "spec")
+		needsUpdate := false
+		for k, v := range desired {
+			if fmt.Sprintf("%v", currentSpec[k]) != fmt.Sprintf("%v", v) {
+				needsUpdate = true
+				break
+			}
+		}
+		if needsUpdate {
+			if err := unstructured.SetNestedField(existing.Object, desired, "spec"); err != nil {
+				return err
+			}
+			if err := r.Update(ctx, existing); err != nil {
+				return fmt.Errorf("failed to update UpdateService: %w", err)
+			}
+			logger.Info("Updated UpdateService CR")
+		}
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	us.Object["spec"] = desired
+	if err := r.Create(ctx, us); err != nil {
+		return fmt.Errorf("failed to create UpdateService: %w", err)
+	}
+	logger.Info("Created UpdateService CR", "releases", desired["releases"])
 	return nil
 }
 
@@ -8379,89 +8388,13 @@ else
   echo "WARNING: ITMS file not found at $ITMS_FILE"
 fi
 
-# Preserve updateService.yaml and deploy OSUS for enclave graph support
+# Preserve updateService.yaml for reference
 US_FILE="/workspace/output/workspace-to-intermediate/working-dir/cluster-resources/updateService.yaml"
 US_BACKUP="/workspace/output/updateService.yaml"
 if [ -f "$US_FILE" ]; then
-  echo "=== Setting up OSUS for graph support ==="
+  echo "=== Preserving updateService.yaml ==="
   cp "$US_FILE" "$US_BACKUP"
   cat "$US_BACKUP"
-
-  # Tag the graph image with a run-specific tag to avoid conflicts between runs
-  RUN_TAG="run-$(date +%s)"
-  GRAPH_IMAGE=$(grep 'graphDataImage:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
-  if [ -n "$GRAPH_IMAGE" ]; then
-    # Derive the tagged reference (strip any existing tag/digest, add run tag)
-    GRAPH_REPO=$(echo "$GRAPH_IMAGE" | sed 's/@sha256:.*//; s/:.*$//')
-    TAGGED_IMAGE="${GRAPH_REPO}:${RUN_TAG}"
-    echo "Tagging graph image: $GRAPH_IMAGE -> $TAGGED_IMAGE"
-    skopeo copy --authfile=/workspace/pull-secret/.dockerconfigjson \
-      --src-tls-verify=false --dest-tls-verify=false \
-      "docker://${GRAPH_IMAGE}" "docker://${TAGGED_IMAGE}" || true
-
-    # Update the updateService.yaml with the tagged image
-    sed -i "s|graphDataImage:.*|graphDataImage: ${TAGGED_IMAGE}|" "$US_BACKUP"
-    echo "Updated updateService.yaml with tagged image: $TAGGED_IMAGE"
-  fi
-
-  # Save the run tag for mirror-from-intermediate to use for cleanup
-  echo "$RUN_TAG" > /workspace/output/osus-run-tag
-
-  # Apply UpdateService CR to the cluster via Kubernetes API
-  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-  API_SERVER="https://kubernetes.default.svc"
-  CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-
-  # Check if UpdateService CRD exists (OSUS operator installed)
-  if curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-    "$API_SERVER/apis/updateservice.operator.openshift.io/v1" >/dev/null 2>&1; then
-
-    # Use a per-run UpdateService name to avoid conflicts between concurrent runs
-    US_NAME="osus-${RUN_TAG}"
-    echo "UpdateService name: $US_NAME"
-    echo "$US_NAME" > /workspace/output/osus-name
-
-    # Apply the updateService.yaml
-    echo "Applying UpdateService CR to cluster..."
-    # Build JSON from the updateService.yaml values using jq (available in oc-mirror image)
-    US_GRAPH=$(grep 'graphDataImage:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
-    US_RELEASES=$(grep 'releases:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
-    US_REPLICAS=$(grep 'replicas:' "$US_BACKUP" | awk '{print $2}' | tr -d '"')
-    US_REPLICAS=${US_REPLICAS:-1}
-    US_JSON=$(jq -n \
-      --arg name "$US_NAME" \
-      --arg graph "$US_GRAPH" \
-      --arg releases "$US_RELEASES" \
-      --argjson replicas "$US_REPLICAS" \
-      '{
-        apiVersion: "updateservice.operator.openshift.io/v1",
-        kind: "UpdateService",
-        metadata: {name: $name, namespace: "openshift-update-service"},
-        spec: {graphDataImage: $graph, releases: $releases, replicas: $replicas}
-      }')
-
-    if [ -n "$US_JSON" ]; then
-      HTTP_CODE=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-        -H "Content-Type: application/json" \
-        -X POST "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices" \
-        -d "$US_JSON" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
-      if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
-        echo "✓ UpdateService CR created successfully"
-      elif [ "$HTTP_CODE" = "409" ]; then
-        echo "UpdateService already exists, updating..."
-        curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-          -H "Content-Type: application/json" \
-          -X PUT "$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/${US_NAME}" \
-          -d "$US_JSON" >/dev/null 2>&1 || true
-      else
-        echo "WARNING: Failed to create UpdateService (HTTP $HTTP_CODE)"
-      fi
-    else
-      echo "WARNING: Failed to convert updateService.yaml to JSON"
-    fi
-  else
-    echo "WARNING: UpdateService CRD not found - OSUS operator may not be installed"
-  fi
 else
   echo "INFO: updateService.yaml not found (graph: true may not be set in ImageSetConfig)"
 fi
@@ -9246,24 +9179,13 @@ echo "Source: $(params.intermediate-registry)"
 echo "Destination: file:///workspace/output"
 echo "Upstream access: BLOCKED (registries.conf + /etc/hosts)"
 
-# Discover OSUS graph URL from UpdateService CR for oc-mirror v2 enclave support
-# oc-mirror v2 removed --graph-image; uses UPDATE_URL_OVERRIDE to query
-# a local OSUS instance instead of the public Cincinnati API
+# Discover OSUS graph URL from the operator-managed UpdateService CR
+# oc-mirror v2 uses UPDATE_URL_OVERRIDE to query a local OSUS instance
 TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 API_SERVER="https://kubernetes.default.svc"
 CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-# Read per-run UpdateService name created by mirror-to-intermediate
-US_NAME=""
-if [ -f /workspace/output/osus-name ]; then
-  US_NAME=$(cat /workspace/output/osus-name)
-fi
-if [ -z "$US_NAME" ]; then
-  echo "WARNING: No OSUS name file found - UpdateService may not have been created"
-  US_NAME="osus-fallback"
-fi
-US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/${US_NAME}"
-echo "Using UpdateService: $US_NAME"
+US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror"
 
 echo "=== Waiting for OSUS to be ready ==="
 OSUS_READY=0
@@ -9305,22 +9227,11 @@ if ! oc-mirror \
   echo "Check that the intermediate registry has been populated with:"
   echo "  oc-mirror --v2 --config=imageset.yaml docker://$(params.intermediate-registry)/mirror"
   echo ""
-
-  # Clean up UpdateService CR even on failure
-  echo "=== Cleaning up UpdateService CR ==="
-  curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-    -X DELETE "$US_API" >/dev/null 2>&1 && echo "✓ UpdateService deleted" || echo "UpdateService cleanup skipped"
-
   exit 1
 fi
 
 echo ""
 echo "=== Mirror from intermediate complete ==="
-
-# Clean up UpdateService CR after successful mirror
-echo "=== Cleaning up UpdateService CR ==="
-curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-  -X DELETE "$US_API" >/dev/null 2>&1 && echo "✓ UpdateService deleted" || echo "UpdateService cleanup skipped"
 `},
 					},
 				},
