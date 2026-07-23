@@ -9483,36 +9483,39 @@ BUNDLE_SBOM="/workspace/output/sboms/bundle-${COLLECTION_NAME}.spdx.json"
 
 echo "Bundle: $BUNDLE_FILENAME (SHA256: $BUNDLE_SHA256)"
 
-# Collect child packages, external refs, and relationships from all child SBOMs
-CHILD_PACKAGES="[]"
-EXT_REFS="[]"
-CONTAINS_RELS="[]"
+# Collect child packages, external refs, and relationships into temp files to avoid ARG_MAX
+TMPDIR_SBOM=$(mktemp -d)
+echo '[]' > "$TMPDIR_SBOM/child_packages.json"
+echo '[]' > "$TMPDIR_SBOM/ext_refs.json"
+echo '[]' > "$TMPDIR_SBOM/contains_rels.json"
 
 for sbom_file in $(find /workspace/output/sboms -name "*.spdx.json" ! -name "bundle-*.spdx.json" -type f | sort); do
   sbom_name=$(basename "$sbom_file" .spdx.json)
 
   pkg=$(jq -c '.packages[0] // empty' "$sbom_file" 2>/dev/null)
   if [ -n "$pkg" ] && [ "$pkg" != "null" ]; then
-    CHILD_PACKAGES=$(echo "$CHILD_PACKAGES" | jq --argjson p "$pkg" '. + [$p]')
+    jq --argjson p "$pkg" '. + [$p]' "$TMPDIR_SBOM/child_packages.json" > "$TMPDIR_SBOM/tmp.json" && mv "$TMPDIR_SBOM/tmp.json" "$TMPDIR_SBOM/child_packages.json"
   fi
 
   sbom_checksum=$(sha256sum "$sbom_file" | awk '{print $1}')
-  EXT_REFS=$(echo "$EXT_REFS" | jq \
+  jq \
     --arg id "DocumentRef-${sbom_name}" \
     --arg uri "https://mirror-operator/sboms/${sbom_name}" \
     --arg sum "$sbom_checksum" \
-    '. + [{"externalDocumentId": $id, "spdxDocument": $uri, "checksum": {"algorithm": "SHA256", "checksumValue": $sum}}]')
+    '. + [{"externalDocumentId": $id, "spdxDocument": $uri, "checksum": {"algorithm": "SHA256", "checksumValue": $sum}}]' \
+    "$TMPDIR_SBOM/ext_refs.json" > "$TMPDIR_SBOM/tmp.json" && mv "$TMPDIR_SBOM/tmp.json" "$TMPDIR_SBOM/ext_refs.json"
 
   main_pkg_id=$(jq -r '.packages[0].SPDXID // "SPDXRef-Package"' "$sbom_file" 2>/dev/null || echo "SPDXRef-Package")
-  CONTAINS_RELS=$(echo "$CONTAINS_RELS" | jq \
+  jq \
     --arg bundle "$BUNDLE_PACKAGE_ID" \
     --arg child "$main_pkg_id" \
-    '. + [{"spdxElementId": $bundle, "relationshipType": "CONTAINS", "relatedSpdxElement": $child}]')
+    '. + [{"spdxElementId": $bundle, "relationshipType": "CONTAINS", "relatedSpdxElement": $child}]' \
+    "$TMPDIR_SBOM/contains_rels.json" > "$TMPDIR_SBOM/tmp.json" && mv "$TMPDIR_SBOM/tmp.json" "$TMPDIR_SBOM/contains_rels.json"
 done
 
-CHILD_COUNT=$(echo "$CHILD_PACKAGES" | jq 'length')
+CHILD_COUNT=$(jq 'length' "$TMPDIR_SBOM/child_packages.json")
 
-# Build the complete bundle SBOM in a single jq invocation
+# Build the complete bundle SBOM using --slurpfile to avoid ARG_MAX
 jq -n \
   --arg ns "https://mirror-operator/bundles/${COLLECTION_NAME}/$(date -u +%Y%m%d%H%M%S)" \
   --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -9522,9 +9525,9 @@ jq -n \
   --arg s3Bucket "$(params.s3-bucket)" \
   --arg bundleSha "$BUNDLE_SHA256" \
   --arg childCount "$CHILD_COUNT" \
-  --argjson childPkgs "$CHILD_PACKAGES" \
-  --argjson extRefs "$EXT_REFS" \
-  --argjson containsRels "$CONTAINS_RELS" \
+  --slurpfile childPkgs "$TMPDIR_SBOM/child_packages.json" \
+  --slurpfile extRefs "$TMPDIR_SBOM/ext_refs.json" \
+  --slurpfile containsRels "$TMPDIR_SBOM/contains_rels.json" \
   '{
     spdxVersion: "SPDX-2.3",
     dataLicense: "CC0-1.0",
@@ -9550,14 +9553,16 @@ jq -n \
       }],
       primaryPackagePurpose: "CONTAINER",
       description: ("OCI mirror bundle containing " + $childCount + " child components (OCI images, CLI tools, architect images)")
-    }] + $childPkgs),
-    externalDocumentRefs: $extRefs,
+    }] + $childPkgs[0]),
+    externalDocumentRefs: $extRefs[0],
     relationships: ([{
       spdxElementId: "SPDXRef-DOCUMENT",
       relationshipType: "DESCRIBES",
       relatedSpdxElement: $bundleId
-    }] + $containsRels)
+    }] + $containsRels[0])
   }' > "$BUNDLE_SBOM"
+
+rm -rf "$TMPDIR_SBOM"
 
 echo "=== Bundle SBOM Created ==="
 echo "File: bundle-${COLLECTION_NAME}.spdx.json"
