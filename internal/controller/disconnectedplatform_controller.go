@@ -8635,6 +8635,7 @@ ls -lh /workspace/output/sboms/ | head -20
 		// Task 4: sign-images (only for keyless signing in m2m workflow)
 		{
 			"name":     "sign-images",
+			"retries":  2,
 			"runAfter": []string{"syft-sbom"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-keyless-signing)", "operator": "in", "values": []string{"true"}},
@@ -9319,6 +9320,7 @@ echo "=== Bundle signing complete ==="
 		// Task 8: create-bundle-sbom (scan additional artifacts and create contextual SBOM for the signed bundle)
 		{
 			"name":     "create-bundle-sbom",
+			"retries":  2,
 			"runAfter": []string{"sign-bundles"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
@@ -9582,6 +9584,7 @@ jq -r '.relationships | map(select(.relationshipType == "CONTAINS")) | length | 
 		// Task 9: upload-sbom (upload SBOMs to TPA)
 		{
 			"name":     "upload-sbom",
+			"retries":  2,
 			"runAfter": []string{"create-bundle-sbom"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
@@ -9686,6 +9689,7 @@ fi
 		// Task 10: export-architect-images (save frontend/backend/plugin images as tarballs from intermediate registry)
 		{
 			"name":     "export-architect-images",
+			"retries":  2,
 			"runAfter": []string{"sign-images"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
@@ -9977,6 +9981,7 @@ echo "=== Bundle creation complete ==="
 		// Task 13: upload-to-s3 (upload artifacts to S3 bucket)
 		{
 			"name":     "upload-to-s3",
+			"retries":  2,
 			"runAfter": []string{"upload-sbom"},
 			"taskSpec": map[string]interface{}{
 				"results": []map[string]interface{}{

@@ -419,7 +419,7 @@ func (r *CollectionPipelineReconciler) trackPipelineRun(ctx context.Context, pip
 	}
 
 	if !pr.IsDone() {
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
 }
