@@ -4791,6 +4791,7 @@ func (r *DisconnectedPlatformReconciler) ensurePipelineUpdateServiceBinding(ctx 
 }
 
 func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {
+	logger := log.FromContext(ctx)
 	osusNamespace := "openshift-update-service"
 
 	sourceSecret := &corev1.Secret{}
@@ -4841,6 +4842,67 @@ func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Contex
 		if err := r.Update(ctx, sa); err != nil {
 			return fmt.Errorf("failed to link pull-secret to default SA: %w", err)
 		}
+	}
+
+	// Merge Quay robot credentials into the cluster-level pull secret
+	// (openshift-config/pull-secret). The OSUS operator creates its own pull
+	// secret from the cluster pull secret, so adding Quay creds here ensures
+	// the OSUS graph-builder can authenticate to the mirror registry.
+	robotUser, robotToken, err := r.getQuayRobotCredentials(ctx)
+	if err != nil {
+		logger.V(1).Info("Quay robot credentials not available yet, skipping cluster pull secret merge")
+		return nil
+	}
+
+	quayRegistry := &unstructured.Unstructured{}
+	quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "quay.redhat.com",
+		Version: "v1",
+		Kind:    "QuayRegistry",
+	})
+	if err := r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay", Namespace: architectNamespace}, quayRegistry); err != nil {
+		logger.V(1).Info("QuayRegistry not found, skipping cluster pull secret merge")
+		return nil
+	}
+
+	quayHostname, err := r.getQuayHostname(ctx, quayRegistry)
+	if err != nil || quayHostname == "" {
+		logger.V(1).Info("Quay hostname not available yet, skipping cluster pull secret merge")
+		return nil
+	}
+
+	clusterPullSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "openshift-config"}, clusterPullSecret); err != nil {
+		return fmt.Errorf("failed to get cluster pull-secret: %w", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(clusterPullSecret.Data[".dockerconfigjson"], &cfg); err != nil {
+		return fmt.Errorf("failed to parse cluster pull-secret: %w", err)
+	}
+
+	auths, _ := cfg["auths"].(map[string]interface{})
+	if auths == nil {
+		auths = make(map[string]interface{})
+	}
+
+	if _, exists := auths[quayHostname]; !exists {
+		authValue := base64.StdEncoding.EncodeToString([]byte(robotUser + ":" + robotToken))
+		auths[quayHostname] = map[string]interface{}{
+			"auth": authValue,
+		}
+		cfg["auths"] = auths
+
+		merged, err := json.Marshal(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal cluster pull-secret: %w", err)
+		}
+
+		clusterPullSecret.Data[".dockerconfigjson"] = merged
+		if err := r.Update(ctx, clusterPullSecret); err != nil {
+			return fmt.Errorf("failed to update cluster pull-secret: %w", err)
+		}
+		logger.Info("Added Quay credentials to cluster pull-secret", "quayHost", quayHostname)
 	}
 
 	return nil
