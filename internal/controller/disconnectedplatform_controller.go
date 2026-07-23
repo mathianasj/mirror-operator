@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
+	"github.com/mathianasj/mirror-operator/config/scripts"
 )
 
 const (
@@ -308,6 +309,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		// Sync S3 config from ConfigMap to Secret for backend
 		if err := r.syncS3ConfigToSecret(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to sync S3 config to secret")
+		}
+		// Ensure import script ConfigMap exists with the correct name
+		if err := r.ensureImportScriptConfigMap(ctx); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure import script ConfigMap")
 		}
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
@@ -10389,6 +10394,31 @@ func (r *DisconnectedPlatformReconciler) reconcileArtifactFileServer(ctx context
 	}
 
 	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureImportScriptConfigMap(ctx context.Context) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "airgap-architect-import-script",
+			Namespace: architectNamespace,
+		},
+		Data: map[string]string{
+			"import-airgap-architect.sh": scripts.ImportAirgapArchitectScript,
+		},
+	}
+
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+		if existing.Data["import-airgap-architect.sh"] != scripts.ImportAirgapArchitectScript {
+			existing.Data = cm.Data
+			return r.Update(ctx, existing)
+		}
+		return nil
+	} else if apierrors.IsNotFound(err) {
+		return r.Create(ctx, cm)
+	} else {
+		return err
+	}
 }
 
 func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
