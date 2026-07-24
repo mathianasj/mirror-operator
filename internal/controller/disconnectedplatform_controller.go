@@ -156,6 +156,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=oauth.openshift.io,resources=oauthclients,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=updateservice.operator.openshift.io,resources=updateservices,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	platform := &mirrorv1.DisconnectedPlatform{}
@@ -269,6 +271,13 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				mirrorv1.ComponentStatus{Name: "rhtpa-postgresql", Status: "Running",
 					Kind: "StatefulSet", APIGroup: "apps", Namespace: architectNamespace},
 			)
+		}
+	}
+
+	// Reconcile airgapped mode (Quay, import scanner, credentials, OSUS)
+	if platform.Spec.Mode == mirrorv1.PlatformModeAirgapped && platform.Spec.Airgapped != nil {
+		if err := r.reconcileAirgapped(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile airgapped mode")
 		}
 	}
 

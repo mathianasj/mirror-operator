@@ -49,8 +49,17 @@ spec:
                   bootstrapEnabled:
                     description: Enable cluster bootstrapping from mirrored content
                     type: boolean
+                  defaultImageSetConfig:
+                    description: Default ImageSetConfiguration YAML for auto-imported
+                      bundles
+                    type: string
                   importPath:
                     description: Filesystem path for physical media import (e.g. /mnt/physical-media)
+                    type: string
+                  importScanSchedule:
+                    default: '*/30 * * * *'
+                    description: Cron schedule for scanning importPath for new bundles
+                      (e.g. '*/15 * * * *')
                     type: string
                   managementCluster:
                     description: Whether this cluster serves as the management hub
@@ -72,6 +81,45 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                    type: object
+                  quay:
+                    description: Quay registry configuration for the airgapped cluster
+                    properties:
+                      adminPassword:
+                        description: Quay admin password
+                        type: string
+                      adminUser:
+                        description: Quay admin username
+                        type: string
+                      clair:
+                        description: Clair vulnerability scanner configuration
+                        properties:
+                          useRedHatVEXOnly:
+                            description: Configure Clair to use only Red Hat VEX data
+                              for vulnerability scanning
+                            type: boolean
+                        type: object
+                      enabled:
+                        default: true
+                        description: Deploy and manage a Quay registry on the airgapped
+                          cluster
+                        type: boolean
+                      organizationName:
+                        default: mirror
+                        description: Quay organization name for mirrored content
+                        type: string
+                      storage:
+                        description: Storage configuration for airgapped Quay (filesystem-backed)
+                        properties:
+                          size:
+                            default: 500Gi
+                            description: Storage size for the Quay registry PVC
+                            type: string
+                          storageClass:
+                            description: Kubernetes StorageClass for the Quay registry
+                              PVC
+                            type: string
+                        type: object
                     type: object
                   registryCredentials:
                     description: Reference to a Secret containing registry pull/push
@@ -108,6 +156,21 @@ spec:
                         type: object
                         x-kubernetes-map-type: atomic
                     type: object
+                  verifyPublicKey:
+                    description: Cosign public key secret for verifying bundle signatures
+                      during auto-import
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                 type: object
               architect:
                 description: Airgap Architect web UI configuration

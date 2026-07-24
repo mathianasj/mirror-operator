@@ -9,9 +9,14 @@ spec:
   mode: airgapped
   airgapped:
     managementCluster: true
-    mirrorRegistry: "quay.internal:8443/mirror"
     bootstrapEnabled: true
     importPath: /mnt/physical-media
+    importScanSchedule: "*/30 * * * *"
+    quay:
+      enabled: true
+      organizationName: mirror
+      storage:
+        size: 500Gi
     rhtas:
       trustedRootKeys:
         name: rhtas-trusted-root

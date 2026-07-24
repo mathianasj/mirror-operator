@@ -339,6 +339,39 @@ type MirrorRegistryConfig struct {
 	Port int32 `json:"port,omitempty"`
 }
 
+type AirgappedQuayConfig struct {
+	// Deploy and manage a Quay registry on the airgapped cluster
+	// +optional
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled,omitempty"`
+	// Quay organization name for mirrored content
+	// +kubebuilder:default="mirror"
+	// +optional
+	OrganizationName string `json:"organizationName,omitempty"`
+	// Storage configuration for airgapped Quay (filesystem-backed)
+	// +optional
+	Storage *AirgappedQuayStorageConfig `json:"storage,omitempty"`
+	// Quay admin username
+	// +optional
+	AdminUser string `json:"adminUser,omitempty"`
+	// Quay admin password
+	// +optional
+	AdminPassword string `json:"adminPassword,omitempty"`
+	// Clair vulnerability scanner configuration
+	// +optional
+	Clair *ClairConfig `json:"clair,omitempty"`
+}
+
+type AirgappedQuayStorageConfig struct {
+	// Storage size for the Quay registry PVC
+	// +kubebuilder:default="500Gi"
+	// +optional
+	Size string `json:"size,omitempty"`
+	// Kubernetes StorageClass for the Quay registry PVC
+	// +optional
+	StorageClass string `json:"storageClass,omitempty"`
+}
+
 type AirgappedConfig struct {
 	// Whether this cluster serves as the management hub
 	// +optional
@@ -352,15 +385,28 @@ type AirgappedConfig struct {
 	// Filesystem path for physical media import (e.g. /mnt/physical-media)
 	// +optional
 	ImportPath string `json:"importPath,omitempty"`
+	// Cron schedule for scanning importPath for new bundles (e.g. '*/15 * * * *')
+	// +kubebuilder:default="*/30 * * * *"
+	// +optional
+	ImportScanSchedule string `json:"importScanSchedule,omitempty"`
 	// Reference to a Secret containing registry pull/push credentials
 	// +optional
 	RegistryCredentials *corev1.LocalObjectReference `json:"registryCredentials,omitempty"`
+	// Quay registry configuration for the airgapped cluster
+	// +optional
+	Quay *AirgappedQuayConfig `json:"quay,omitempty"`
 	// Red Hat Trusted Artifact Signer configuration for airgapped signature verification
 	// +optional
 	RHTAS *AirgappedRHTASConfig `json:"rhtas,omitempty"`
 	// Mirror registry deployment configuration (for operator-managed registry)
 	// +optional
 	MirrorRegistryConfig *MirrorRegistryConfig `json:"mirrorRegistryConfig,omitempty"`
+	// Default ImageSetConfiguration YAML for auto-imported bundles
+	// +optional
+	DefaultImageSetConfig string `json:"defaultImageSetConfig,omitempty"`
+	// Cosign public key secret for verifying bundle signatures during auto-import
+	// +optional
+	VerifyPublicKey *corev1.LocalObjectReference `json:"verifyPublicKey,omitempty"`
 }
 
 type AirgappedRHTASConfig struct {
