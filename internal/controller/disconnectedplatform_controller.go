@@ -8204,6 +8204,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "oc-version", "type": "string", "default": "stable-4.16", "description": "OpenShift CLI version to download"},
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
+		{"name": "sbom-parallel-jobs", "type": "string", "default": "4", "description": "Number of parallel syft SBOM scans"},
 	}
 
 	// Define workspaces
@@ -8584,73 +8585,105 @@ else
   SCAN_FROM_REGISTRY=""
 fi
 
-# Generate SBOM for each image with caching
-current=0
-cached=0
-scanned=0
-while IFS='=' read -r source dest; do
-  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+# Parallel SBOM generation
+MAX_JOBS=$(params.sbom-parallel-jobs)
+COUNTER_DIR=$(mktemp -d)
+echo 0 > "$COUNTER_DIR/cached"
+echo 0 > "$COUNTER_DIR/scanned"
+echo 0 > "$COUNTER_DIR/uploaded_tpa"
+echo 0 > "$COUNTER_DIR/current"
 
-  current=$((current + 1))
-  dest_no_proto="${dest#docker://}"
+process_image() {
+  local source="$1"
+  local dest="$2"
+  local image_count="$3"
+
+  local idx
+  idx=$(( $(cat "$COUNTER_DIR/current") + 1 ))
+  echo "$idx" > "$COUNTER_DIR/current"
+
+  local dest_no_proto="${dest#docker://}"
 
   # Extract digest for cache lookup
+  local DIGEST
   DIGEST=$(echo "$dest" | grep -oP 'sha256:[a-f0-9]+' || echo "")
   if [ -z "$DIGEST" ]; then
     DIGEST=$(echo "$source" | grep -oP 'sha256:[a-f0-9]+' || echo "")
   fi
 
+  local SAFE_NAME
   SAFE_NAME=$(echo -n "$dest_no_proto" | sha256sum | cut -d' ' -f1)
-  OUTPUT_FILE="/workspace/output/sboms/${SAFE_NAME}.spdx.json"
+  local OUTPUT_FILE="/workspace/output/sboms/${SAFE_NAME}.spdx.json"
 
   # Check cache first if we have a digest
   if [ -n "$DIGEST" ]; then
-    CACHE_FILE="$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
+    local CACHE_FILE="$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
     if [ -f "$CACHE_FILE" ]; then
       cp "$CACHE_FILE" "$OUTPUT_FILE"
-      # Re-apply post-processing to fix any stale localhost:55000 references
-      fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
-      fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
+      local fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
+      local fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
       postprocess_sbom "$OUTPUT_FILE" "$fixed_source" "$fixed_dest"
+      local pkg_count
       pkg_count=$(jq '.packages | length // 0' "$OUTPUT_FILE" 2>/dev/null || echo 0)
-      echo "  [$current/$image_count] Cached: $fixed_dest ($pkg_count packages)"
-      cached=$((cached + 1))
+      echo "  [$idx/$image_count] Cached: $fixed_dest ($pkg_count packages)"
+      echo $(( $(cat "$COUNTER_DIR/cached") + 1 )) > "$COUNTER_DIR/cached"
       if upload_sbom_to_tpa "$OUTPUT_FILE"; then
-        uploaded_tpa=$((uploaded_tpa + 1))
+        echo $(( $(cat "$COUNTER_DIR/uploaded_tpa") + 1 )) > "$COUNTER_DIR/uploaded_tpa"
       fi
-      continue
+      return
     fi
   fi
 
   # Scan image
+  local IMAGE
   if [ -n "$SCAN_FROM_REGISTRY" ]; then
     IMAGE="registry:${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
   else
     if [ -z "$DIGEST" ]; then
-      echo "  [$current/$image_count] Skipping (no digest): $source"
-      continue
+      echo "  [$idx/$image_count] Skipping (no digest): $source"
+      return
     fi
     IMAGE="/workspace/output/.cache/blobs/sha256/${DIGEST#sha256:}"
   fi
 
-  echo "  [$current/$image_count] Scanning: $dest_no_proto"
+  echo "  [$idx/$image_count] Scanning: $dest_no_proto"
   if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" 2>/dev/null; then
-    scanned=$((scanned + 1))
-    # Post-process: replace localhost:55000 with intermediate registry and set upstream source
-    fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
-    fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
+    echo $(( $(cat "$COUNTER_DIR/scanned") + 1 )) > "$COUNTER_DIR/scanned"
+    local fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
+    local fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
     postprocess_sbom "$OUTPUT_FILE" "$fixed_source" "$fixed_dest"
-    # Cache the post-processed SBOM by digest for future runs
     if [ -n "$DIGEST" ]; then
       cp "$OUTPUT_FILE" "$SBOM_CACHE_DIR/$(echo "$DIGEST" | tr ':' '_').json"
     fi
     if upload_sbom_to_tpa "$OUTPUT_FILE"; then
-      uploaded_tpa=$((uploaded_tpa + 1))
+      echo $(( $(cat "$COUNTER_DIR/uploaded_tpa") + 1 )) > "$COUNTER_DIR/uploaded_tpa"
     fi
   else
-    echo "    Failed to scan"
+    echo "    Failed to scan: $dest_no_proto"
+  fi
+}
+
+export -f process_image postprocess_sbom upload_sbom_to_tpa refresh_tpa_token
+export SBOM_CACHE_DIR SCAN_FROM_REGISTRY COUNTER_DIR TPA_TOKEN TOKEN_TIME
+
+active_jobs=0
+while IFS='=' read -r source dest; do
+  [ -z "$source" ] || [[ "$source" =~ ^# ]] && continue
+
+  process_image "$source" "$dest" "$image_count" &
+  active_jobs=$((active_jobs + 1))
+
+  if [ "$active_jobs" -ge "$MAX_JOBS" ]; then
+    wait -n 2>/dev/null || wait
+    active_jobs=$((active_jobs - 1))
   fi
 done < "$MAPPING_FILE"
+wait
+
+cached=$(cat "$COUNTER_DIR/cached")
+scanned=$(cat "$COUNTER_DIR/scanned")
+uploaded_tpa=$(cat "$COUNTER_DIR/uploaded_tpa")
+rm -rf "$COUNTER_DIR"
 
 echo "=== SBOM generation complete ==="
 echo "Total: $image_count | Cached: $cached | Scanned: $scanned | Uploaded to TPA: $uploaded_tpa"

@@ -945,6 +945,11 @@ func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context
 		}
 	}
 
+	// Normalize short-form Docker Hub references to fully qualified docker.io/ prefix
+	for i, img := range config.Mirror.AdditionalImages {
+		config.Mirror.AdditionalImages[i].Name = normalizeImageRef(img.Name)
+	}
+
 	// Serialize back to YAML
 	enrichedYAML, err := yaml.Marshal(&config)
 	if err != nil {
@@ -952,6 +957,21 @@ func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context
 	}
 
 	return string(enrichedYAML), nil
+}
+
+// normalizeImageRef ensures image references have a fully qualified registry prefix.
+// Short-form references like "amazon/aws-cli:latest" or "library/nginx" are
+// implicitly pulled from docker.io but may not match registries.conf mirror rules
+// without the explicit prefix.
+func normalizeImageRef(ref string) string {
+	// Already has a registry (contains a dot or localhost before the first slash)
+	if i := strings.Index(ref, "/"); i > 0 {
+		prefix := ref[:i]
+		if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") || prefix == "localhost" {
+			return ref
+		}
+	}
+	return "docker.io/" + ref
 }
 
 func (r *CollectionPipelineReconciler) getClusterDomain(ctx context.Context) string {
