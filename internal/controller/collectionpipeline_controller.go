@@ -1205,6 +1205,9 @@ func rewriteImageReference(originalRef, intermediateRegistry string) string {
 	// Remove any docker:// prefix if present
 	ref := strings.TrimPrefix(originalRef, "docker://")
 
+	// Normalize short-form Docker Hub refs before rewriting
+	ref = normalizeImageRef(ref)
+
 	// Split into registry/repository and tag/digest
 	parts := strings.SplitN(ref, "/", 2)
 	if len(parts) < 2 {
