@@ -754,29 +754,8 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 
 					// Update importer sources
 					if err := unstructured.SetNestedMap(existingTPA.Object, map[string]interface{}{
-						"enabled": true,
-						"importers": map[string]interface{}{
-							"redhat-sboms": map[string]interface{}{
-								"sbom": map[string]interface{}{
-									"disabled": false,
-								},
-							},
-							"redhat-csaf": map[string]interface{}{
-								"csaf": map[string]interface{}{
-									"disabled": false,
-								},
-							},
-							"cve": map[string]interface{}{
-								"cve": map[string]interface{}{
-									"disabled": false,
-								},
-							},
-							"osv-github": map[string]interface{}{
-								"osv": map[string]interface{}{
-									"disabled": false,
-								},
-							},
-						},
+						"enabled":   true,
+						"importers": buildRHTPAImportersMap(cfg.Importers),
 					}, "spec", "modules", "createImporters"); err == nil {
 						needsUpdate = true
 					}
@@ -896,29 +875,8 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 				},
 			},
 			"createImporters": map[string]interface{}{
-				"enabled": true,
-				"importers": map[string]interface{}{
-					"redhat-sboms": map[string]interface{}{
-						"sbom": map[string]interface{}{
-							"disabled": false,
-						},
-					},
-					"redhat-csaf": map[string]interface{}{
-						"csaf": map[string]interface{}{
-							"disabled": false,
-						},
-					},
-					"cve": map[string]interface{}{
-						"cve": map[string]interface{}{
-							"disabled": false,
-						},
-					},
-					"osv-github": map[string]interface{}{
-						"osv": map[string]interface{}{
-							"disabled": false,
-						},
-					},
-				},
+				"enabled":   true,
+				"importers": buildRHTPAImportersMap(cfg.Importers),
 			},
 			"server": map[string]interface{}{
 				"enabled":  true,
@@ -2039,6 +1997,40 @@ func (r *DisconnectedPlatformReconciler) assignRoleToServiceAccount(ctx context.
 	return nil
 }
 
+func buildRHTPAImportersMap(importers *mirrorv1.RHTPAImportersConfig) map[string]interface{} {
+	m := map[string]interface{}{
+		"redhat-csaf": map[string]interface{}{
+			"csaf": map[string]interface{}{
+				"disabled": false,
+			},
+		},
+	}
+	if importers != nil {
+		if importers.RedHatSBOMs {
+			m["redhat-sboms"] = map[string]interface{}{
+				"sbom": map[string]interface{}{
+					"disabled": false,
+				},
+			}
+		}
+		if importers.CVE {
+			m["cve"] = map[string]interface{}{
+				"cve": map[string]interface{}{
+					"disabled": false,
+				},
+			}
+		}
+		if importers.OSVGitHub {
+			m["osv-github"] = map[string]interface{}{
+				"osv": map[string]interface{}{
+					"disabled": false,
+				},
+			}
+		}
+	}
+	return m
+}
+
 func (r *DisconnectedPlatformReconciler) ensureRHTPAPostgreSQL(ctx context.Context, storageSize, maxStorageSize string) (string, string, string, string, error) {
 	// Create PostgreSQL StatefulSet for TPA persistence
 	// Returns: host, dbname, username, password, error
@@ -2224,49 +2216,62 @@ func (r *DisconnectedPlatformReconciler) autoExpandPVC(ctx context.Context, pvc 
 	}
 
 	pod := podList.Items[0]
-	if pod.Status.Phase != corev1.PodRunning {
-		return
+
+	// If the pod is crash-looping, expand immediately — likely disk full
+	podCrashing := pod.Status.Phase == corev1.PodFailed
+	if !podCrashing {
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+				podCrashing = true
+				break
+			}
+		}
 	}
 
-	// Use the Kubernetes API to exec df in the pod
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return
-	}
+	pct := 0
+	if podCrashing {
+		pct = 100
+	} else if pod.Status.Phase == corev1.PodRunning {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			return
+		}
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			return
+		}
 
-	req := clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(pod.Name).
-		Namespace(pod.Namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "postgresql",
-			Command:   []string{"df", "--output=pcent", "/var/lib/pgsql/data"},
-			Stdout:    true,
-		}, scheme.ParameterCodec)
+		req := clientset.CoreV1().RESTClient().Post().
+			Resource("pods").
+			Name(pod.Name).
+			Namespace(pod.Namespace).
+			SubResource("exec").
+			VersionedParams(&corev1.PodExecOptions{
+				Container: "postgresql",
+				Command:   []string{"df", "--output=pcent", "/var/lib/pgsql/data"},
+				Stdout:    true,
+			}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
-	if err != nil {
-		return
-	}
+		exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+		if err != nil {
+			return
+		}
 
-	var stdout bytes.Buffer
-	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout}); err != nil {
-		return
-	}
+		var stdout bytes.Buffer
+		if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout}); err != nil {
+			return
+		}
 
-	// Parse "Use%" output — second line contains the percentage like " 80%"
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	if len(lines) < 2 {
-		return
-	}
-	pctStr := strings.TrimSpace(strings.TrimSuffix(lines[1], "%"))
-	pct, err := strconv.Atoi(pctStr)
-	if err != nil {
+		lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+		if len(lines) < 2 {
+			return
+		}
+		pctStr := strings.TrimSpace(strings.TrimSuffix(lines[1], "%"))
+		pct, err = strconv.Atoi(pctStr)
+		if err != nil {
+			return
+		}
+	} else {
 		return
 	}
 

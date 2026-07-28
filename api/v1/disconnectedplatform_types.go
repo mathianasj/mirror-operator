@@ -197,6 +197,21 @@ type RHTPAInstallerConfig struct {
 	// +kubebuilder:default="200Gi"
 	// +optional
 	DatabaseMaxStorageSize string `json:"databaseMaxStorageSize,omitempty"`
+	// Importer sources to enable (redhat-csaf is always enabled)
+	// +optional
+	Importers *RHTPAImportersConfig `json:"importers,omitempty"`
+}
+
+type RHTPAImportersConfig struct {
+	// Enable Red Hat SBOM importer
+	// +optional
+	RedHatSBOMs bool `json:"redhatSBOMs,omitempty"`
+	// Enable CVE importer
+	// +optional
+	CVE bool `json:"cve,omitempty"`
+	// Enable OSV GitHub importer
+	// +optional
+	OSVGitHub bool `json:"osvGitHub,omitempty"`
 }
 
 type QuayInstallerConfig struct {

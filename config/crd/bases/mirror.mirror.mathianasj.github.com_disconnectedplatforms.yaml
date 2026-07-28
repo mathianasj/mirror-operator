@@ -751,6 +751,20 @@ spec:
                         description: Size of the managed PostgreSQL PVC (ignored when
                           external Database is set)
                         type: string
+                      importers:
+                        description: Importer sources to enable (redhat-csaf is always
+                          enabled)
+                        properties:
+                          cve:
+                            description: Enable CVE importer
+                            type: boolean
+                          osvGitHub:
+                            description: Enable OSV GitHub importer
+                            type: boolean
+                          redhatSBOMs:
+                            description: Enable Red Hat SBOM importer
+                            type: boolean
+                        type: object
                       oidc:
                         description: OIDC configuration for RHTPA authentication
                         properties:
