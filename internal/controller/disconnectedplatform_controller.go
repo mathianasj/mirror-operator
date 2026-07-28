@@ -9132,14 +9132,18 @@ blocked = true
 [[registry.mirror]]
 location="$(params.intermediate-registry)"
 
-# Block CDN and other registries (no mirror needed, just block)
+# Docker Hub images (e.g. amazon/aws-cli) resolve to docker.io - mirror them
 [[registry]]
 location="docker.io"
 blocked = true
+[[registry.mirror]]
+location="$(params.intermediate-registry)"
 
 [[registry]]
 location="registry-1.docker.io"
 blocked = true
+[[registry.mirror]]
+location="$(params.intermediate-registry)"
 
 [[registry]]
 location="gcr.io"
