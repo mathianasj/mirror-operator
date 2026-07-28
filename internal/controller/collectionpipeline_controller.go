@@ -869,6 +869,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			Workspaces: workspaces,
 			Timeouts: &pipelinev1.TimeoutFields{
 				Pipeline: timeout,
+				Tasks:    &metav1.Duration{Duration: 4 * time.Hour},
 			},
 		},
 	}
