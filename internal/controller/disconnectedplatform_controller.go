@@ -158,6 +158,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=updateservice.operator.openshift.io,resources=updateservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=multiclusterhubs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=multiclusterhubs/status,verbs=get;list;watch
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	platform := &mirrorv1.DisconnectedPlatform{}
@@ -409,6 +411,7 @@ func (r *DisconnectedPlatformReconciler) cleanup(ctx context.Context, platform *
 		r.deleteManagedKeycloak(ctx)
 		r.deleteRHTASConfig(ctx)
 		r.deleteRHTPAConfig(ctx)
+		r.deleteAirgappedACM(ctx)
 		platform.SetFinalizers(removeString(platform.GetFinalizers(), platformFinalizer))
 		return ctrl.Result{}, r.Update(ctx, platform)
 	}

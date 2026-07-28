@@ -45,6 +45,12 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 		logger.Error(err, "failed to ensure airgapped UpdateService")
 	}
 
+	if platform.Spec.Airgapped.ACM != nil && platform.Spec.Airgapped.ACM.Enabled {
+		if err := r.reconcileAirgappedACM(ctx, platform); err != nil {
+			logger.Error(err, "failed to reconcile airgapped ACM")
+		}
+	}
+
 	return nil
 }
 
@@ -602,4 +608,183 @@ func (r *DisconnectedPlatformReconciler) ensureAirgappedUpdateService(ctx contex
 	}
 	logger.Info("Created airgapped UpdateService CR", "graphDataImage", graphDataImage, "releases", releases)
 	return nil
+}
+
+// reconcileAirgappedACM installs the ACM operator via OLM and creates a MultiClusterHub CR.
+func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	acmConfig := platform.Spec.Airgapped.ACM
+
+	acmOp := operatorDef{
+		name:      "advanced-cluster-management",
+		pkg:       "advanced-cluster-management",
+		channel:   "release-2.12",
+		catalog:   "redhat-operators",
+		catalogNS: "openshift-marketplace",
+		ns:        "open-cluster-management",
+	}
+
+	var subCfg *mirrorv1.OLMSubscriptionConfig
+	if acmConfig.Subscription != nil {
+		subCfg = acmConfig.Subscription
+	}
+
+	if err := r.ensureNamespace(ctx, acmOp.ns); err != nil {
+		return fmt.Errorf("namespace for ACM: %w", err)
+	}
+
+	if err := r.ensureOperatorGroup(ctx, acmOp); err != nil {
+		return fmt.Errorf("operatorgroup for ACM: %w", err)
+	}
+
+	if err := r.ensureSubscription(ctx, acmOp, subCfg); err != nil {
+		return fmt.Errorf("subscription for ACM: %w", err)
+	}
+
+	csvPhase := r.csvStatus(ctx, acmOp)
+	subStatus := csvPhase
+	if subStatus == "" {
+		subStatus = "Installing"
+	}
+	platform.Status.Components = append(platform.Status.Components,
+		mirrorv1.ComponentStatus{
+			Name: "advanced-cluster-management", Status: subStatus,
+			Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: acmOp.ns,
+		},
+	)
+
+	if csvPhase != "Succeeded" {
+		logger.Info("ACM operator CSV not yet ready, deferring MultiClusterHub creation", "csvPhase", csvPhase)
+		return nil
+	}
+
+	if err := r.ensureACMPullSecret(ctx, platform); err != nil {
+		logger.Error(err, "failed to ensure pull secret in ACM namespace")
+	}
+
+	if err := r.ensureMultiClusterHub(ctx, platform); err != nil {
+		return fmt.Errorf("failed to ensure MultiClusterHub: %w", err)
+	}
+
+	return nil
+}
+
+// ensureACMPullSecret copies the pull secret to the open-cluster-management namespace.
+func (r *DisconnectedPlatformReconciler) ensureACMPullSecret(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	acmNamespace := "open-cluster-management"
+
+	sourceSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: architectNamespace}, sourceSecret); err != nil {
+		return fmt.Errorf("failed to get pull-secret from %s: %w", architectNamespace, err)
+	}
+
+	targetSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pull-secret",
+			Namespace: acmNamespace,
+		},
+		Data: sourceSecret.Data,
+		Type: sourceSecret.Type,
+	}
+
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(targetSecret), existing); err == nil {
+		if string(existing.Data[".dockerconfigjson"]) != string(sourceSecret.Data[".dockerconfigjson"]) {
+			existing.Data = sourceSecret.Data
+			return r.Update(ctx, existing)
+		}
+		return nil
+	} else if apierrors.IsNotFound(err) {
+		return r.Create(ctx, targetSecret)
+	} else {
+		return err
+	}
+}
+
+// ensureMultiClusterHub creates or monitors the MultiClusterHub CR with mirror registry configuration.
+func (r *DisconnectedPlatformReconciler) ensureMultiClusterHub(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+	acmConfig := platform.Spec.Airgapped.ACM
+
+	mch := &unstructured.Unstructured{}
+	mch.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+	})
+	mch.SetName("multiclusterhub")
+	mch.SetNamespace("open-cluster-management")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(mch.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mch), existing); err == nil {
+		phase, _, _ := unstructured.NestedString(existing.Object, "status", "phase")
+		mchStatus := "Installing"
+		if phase == "Running" {
+			mchStatus = "Running"
+		}
+		platform.Status.Components = append(platform.Status.Components,
+			mirrorv1.ComponentStatus{
+				Name: "multiclusterhub", Status: mchStatus,
+				Kind: "MultiClusterHub", APIGroup: "operator.open-cluster-management.io",
+				Namespace: "open-cluster-management",
+			},
+		)
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	spec := map[string]interface{}{}
+
+	if acmConfig.MultiClusterHub != nil && acmConfig.MultiClusterHub.ImagePullSecret != nil {
+		spec["imagePullSecret"] = acmConfig.MultiClusterHub.ImagePullSecret.Name
+	} else if platform.Spec.Airgapped.RegistryCredentials != nil {
+		spec["imagePullSecret"] = platform.Spec.Airgapped.RegistryCredentials.Name
+	} else {
+		spec["imagePullSecret"] = "pull-secret"
+	}
+
+	if acmConfig.MultiClusterHub != nil && acmConfig.MultiClusterHub.CustomCAConfigMap != "" {
+		spec["customCAConfigmap"] = acmConfig.MultiClusterHub.CustomCAConfigMap
+	}
+
+	if acmConfig.MultiClusterHub != nil && acmConfig.MultiClusterHub.DisableHubSelfManagement {
+		spec["disableHubSelfManagement"] = true
+	}
+
+	mch.Object["spec"] = spec
+
+	if err := r.Create(ctx, mch); err != nil {
+		return fmt.Errorf("failed to create MultiClusterHub: %w", err)
+	}
+
+	logger.Info("Created MultiClusterHub CR for airgapped ACM")
+	platform.Status.Components = append(platform.Status.Components,
+		mirrorv1.ComponentStatus{
+			Name: "multiclusterhub", Status: "Installing",
+			Kind: "MultiClusterHub", APIGroup: "operator.open-cluster-management.io",
+			Namespace: "open-cluster-management",
+		},
+	)
+	return nil
+}
+
+// deleteAirgappedACM removes the MultiClusterHub CR and ACM subscription.
+func (r *DisconnectedPlatformReconciler) deleteAirgappedACM(ctx context.Context) {
+	mch := &unstructured.Unstructured{}
+	mch.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+	})
+	mch.SetName("multiclusterhub")
+	mch.SetNamespace("open-cluster-management")
+	if err := r.Delete(ctx, mch); err != nil && !apierrors.IsNotFound(err) {
+		log.FromContext(ctx).Error(err, "failed to delete MultiClusterHub")
+	}
+
+	sub := &unstructured.Unstructured{}
+	sub.SetGroupVersionKind(subscriptionGVK)
+	sub.SetName("mirror-operator-advanced-cluster-management")
+	sub.SetNamespace("open-cluster-management")
+	if err := r.Delete(ctx, sub); err != nil && !apierrors.IsNotFound(err) {
+		log.FromContext(ctx).Error(err, "failed to delete ACM subscription")
+	}
 }

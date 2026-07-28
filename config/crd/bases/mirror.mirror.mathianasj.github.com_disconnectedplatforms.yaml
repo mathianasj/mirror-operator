@@ -46,6 +46,71 @@ spec:
                 description: Airgapped mode configuration for importing and serving
                   mirrored content
                 properties:
+                  acm:
+                    description: Red Hat Advanced Cluster Management configuration
+                      for airgapped multi-cluster management
+                    properties:
+                      enabled:
+                        description: Enable ACM operator installation and MultiClusterHub
+                          creation
+                        type: boolean
+                      multiClusterHub:
+                        description: MultiClusterHub configuration
+                        properties:
+                          customCAConfigMap:
+                            description: Custom CA bundle ConfigMap name for the mirror
+                              registry TLS
+                            type: string
+                          disableHubSelfManagement:
+                            description: Disable default self-management of the hub
+                              cluster
+                            type: boolean
+                          imagePullSecret:
+                            description: |-
+                              Reference to the image pull secret for the mirror registry
+                              If empty, uses the platform's airgapped registry credentials
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                      subscription:
+                        description: OLM subscription overrides for ACM in the airgapped
+                          catalog
+                        properties:
+                          approvalStrategy:
+                            default: Automatic
+                            description: OLM install plan approval strategy
+                            enum:
+                            - Automatic
+                            - Manual
+                            type: string
+                          catalogSource:
+                            description: OLM catalog source name
+                            type: string
+                          catalogSourceNamespace:
+                            description: OLM catalog source namespace
+                            type: string
+                          channel:
+                            description: OLM subscription channel
+                            type: string
+                          disabled:
+                            description: Set to true to skip installation of this
+                              operator
+                            type: boolean
+                          startingCSV:
+                            description: Starting CSV version for the subscription
+                            type: string
+                        type: object
+                    type: object
                   bootstrapEnabled:
                     description: Enable cluster bootstrapping from mirrored content
                     type: boolean

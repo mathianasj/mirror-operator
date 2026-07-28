@@ -2031,6 +2031,9 @@ mirror_to_registry() {
             log "Found IDMS file: ${idms_file}"
             cp "${idms_file}" "${DATA_DIR}/imageDigestMirrorSet.yaml"
             chmod 644 "${DATA_DIR}/imageDigestMirrorSet.yaml"
+            if command -v chcon &>/dev/null; then
+                chcon -t container_file_t "${DATA_DIR}/imageDigestMirrorSet.yaml" 2>/dev/null || true
+            fi
             log "✓ Copied IDMS file to ${DATA_DIR}/imageDigestMirrorSet.yaml"
         else
             log "⚠ No IDMS file found"
@@ -2041,9 +2044,46 @@ mirror_to_registry() {
             log "Found ITMS file: ${itms_file}"
             cp "${itms_file}" "${DATA_DIR}/imageTagMirrorSet.yaml"
             chmod 644 "${DATA_DIR}/imageTagMirrorSet.yaml"
+            if command -v chcon &>/dev/null; then
+                chcon -t container_file_t "${DATA_DIR}/imageTagMirrorSet.yaml" 2>/dev/null || true
+            fi
             log "✓ Copied ITMS file to ${DATA_DIR}/imageTagMirrorSet.yaml"
         else
             log "⚠ No ITMS file found"
+        fi
+
+        # Find and copy CatalogSource files from oc-mirror output
+        local catalogsources_dir="${DATA_DIR}/catalogsources"
+        mkdir -p "${catalogsources_dir}"
+        chmod 755 "${catalogsources_dir}"
+        if command -v chcon &>/dev/null; then
+            chcon -t container_file_t "${catalogsources_dir}" 2>/dev/null || true
+        fi
+        local cs_files_found=()
+
+        for search_path in "${search_paths[@]}"; do
+            if [ -d "${search_path}" ]; then
+                while IFS= read -r cs_file; do
+                    local cs_basename
+                    cs_basename=$(basename "${cs_file}")
+                    cp "${cs_file}" "${catalogsources_dir}/${cs_basename}"
+                    chmod 644 "${catalogsources_dir}/${cs_basename}"
+                    if command -v chcon &>/dev/null; then
+                        chcon -t container_file_t "${catalogsources_dir}/${cs_basename}" 2>/dev/null || true
+                    fi
+                    cs_files_found+=("${catalogsources_dir}/${cs_basename}")
+                    log "✓ Copied CatalogSource file: ${cs_basename}"
+                done < <(find "${search_path}" -maxdepth 2 -type f -name "cs-*.yaml" 2>/dev/null)
+            fi
+        done
+
+        if [ ${#cs_files_found[@]} -eq 0 ]; then
+            log "⚠ No CatalogSource files found"
+        else
+            local cs_list
+            cs_list=$(IFS=,; echo "${cs_files_found[*]}")
+            export AGENT_ISO_CATALOGSOURCES="${cs_list}"
+            log "✓ Set AGENT_ISO_CATALOGSOURCES=${cs_list}"
         fi
 
         # Check for IDMS/ITMS files and display instructions
@@ -2056,6 +2096,14 @@ mirror_to_registry() {
             fi
             if [ -f "${DATA_DIR}/imageTagMirrorSet.yaml" ]; then
                 log "  kubectl apply -f ${DATA_DIR}/imageTagMirrorSet.yaml"
+            fi
+            if [ ${#cs_files_found[@]} -gt 0 ]; then
+                log ""
+                log "  CatalogSource files for agent-based installs:"
+                log "  AGENT_ISO_CATALOGSOURCES=${cs_list}"
+                for cs in "${cs_files_found[@]}"; do
+                    log "    kubectl apply -f ${cs}"
+                done
             fi
             log ""
         fi

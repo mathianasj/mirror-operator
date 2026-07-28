@@ -372,6 +372,31 @@ type AirgappedQuayStorageConfig struct {
 	StorageClass string `json:"storageClass,omitempty"`
 }
 
+type AirgappedACMConfig struct {
+	// Enable ACM operator installation and MultiClusterHub creation
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// OLM subscription overrides for ACM in the airgapped catalog
+	// +optional
+	Subscription *OLMSubscriptionConfig `json:"subscription,omitempty"`
+	// MultiClusterHub configuration
+	// +optional
+	MultiClusterHub *MultiClusterHubConfig `json:"multiClusterHub,omitempty"`
+}
+
+type MultiClusterHubConfig struct {
+	// Reference to the image pull secret for the mirror registry
+	// If empty, uses the platform's airgapped registry credentials
+	// +optional
+	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
+	// Custom CA bundle ConfigMap name for the mirror registry TLS
+	// +optional
+	CustomCAConfigMap string `json:"customCAConfigMap,omitempty"`
+	// Disable default self-management of the hub cluster
+	// +optional
+	DisableHubSelfManagement bool `json:"disableHubSelfManagement,omitempty"`
+}
+
 type AirgappedConfig struct {
 	// Whether this cluster serves as the management hub
 	// +optional
@@ -395,6 +420,9 @@ type AirgappedConfig struct {
 	// Quay registry configuration for the airgapped cluster
 	// +optional
 	Quay *AirgappedQuayConfig `json:"quay,omitempty"`
+	// Red Hat Advanced Cluster Management configuration for airgapped multi-cluster management
+	// +optional
+	ACM *AirgappedACMConfig `json:"acm,omitempty"`
 	// Red Hat Trusted Artifact Signer configuration for airgapped signature verification
 	// +optional
 	RHTAS *AirgappedRHTASConfig `json:"rhtas,omitempty"`

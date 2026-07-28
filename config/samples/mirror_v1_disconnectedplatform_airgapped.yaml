@@ -17,6 +17,14 @@ spec:
       organizationName: mirror
       storage:
         size: 500Gi
+    acm:
+      enabled: true
+      subscription:
+        catalogSource: cs-redhat-operator-index
+        channel: release-2.12
+      multiClusterHub:
+        imagePullSecret:
+          name: pull-secret
     rhtas:
       trustedRootKeys:
         name: rhtas-trusted-root
