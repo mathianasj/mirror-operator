@@ -8474,6 +8474,27 @@ upload_sbom_to_tpa() {
     echo "    Refreshing TPA OIDC token..."
     refresh_tpa_token
   fi
+
+  # Check if SBOM already exists in TPA by documentNamespace
+  local doc_ns
+  doc_ns=$(jq -r '.documentNamespace // empty' "$sbom_file" 2>/dev/null)
+  if [ -n "$doc_ns" ]; then
+    local check_code
+    check_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer $TPA_TOKEN" \
+      "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)")
+    if [ "$check_code" = "200" ]; then
+      local exists
+      exists=$(curl -s \
+        -H "Authorization: Bearer $TPA_TOKEN" \
+        "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)" | jq '.items | length // 0')
+      if [ "$exists" -gt 0 ] 2>/dev/null; then
+        echo "    -> Already exists in TPA, skipping upload"
+        return 0
+      fi
+    fi
+  fi
+
   local response
   response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
     -H "Authorization: Bearer $TPA_TOKEN" \
@@ -9376,6 +9397,27 @@ upload_sbom_to_tpa() {
     echo "  Refreshing TPA OIDC token..."
     refresh_tpa_token
   fi
+
+  # Check if SBOM already exists in TPA by documentNamespace
+  local doc_ns
+  doc_ns=$(jq -r '.documentNamespace // empty' "$sbom_file" 2>/dev/null)
+  if [ -n "$doc_ns" ]; then
+    local check_code
+    check_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer $TPA_TOKEN" \
+      "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)")
+    if [ "$check_code" = "200" ]; then
+      local exists
+      exists=$(curl -s \
+        -H "Authorization: Bearer $TPA_TOKEN" \
+        "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)" | jq '.items | length // 0')
+      if [ "$exists" -gt 0 ] 2>/dev/null; then
+        echo "  -> Already exists in TPA, skipping upload"
+        return 0
+      fi
+    fi
+  fi
+
   local response
   response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
     -H "Authorization: Bearer $TPA_TOKEN" \
