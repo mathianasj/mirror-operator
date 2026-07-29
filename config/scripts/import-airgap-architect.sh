@@ -519,6 +519,50 @@ check_podman() {
     fi
 }
 
+validate_network_route() {
+    local registry_host="$1"
+    # Strip port if present
+    registry_host="${registry_host%%:*}"
+
+    # Check default route exists
+    local default_iface
+    default_iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    if [ -z "$default_iface" ]; then
+        error "No default route found"
+        error "A default route is required for podman networking"
+        error "Add a default route: ip route add default via <gateway> dev <interface>"
+        exit 1
+    fi
+
+    # Get the IP of the default route interface
+    local iface_ip
+    iface_ip=$(ip -4 addr show dev "$default_iface" 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+    if [ -z "$iface_ip" ]; then
+        error "No IPv4 address found on default route interface: $default_iface"
+        exit 1
+    fi
+
+    # Resolve the hostname
+    local host_ip
+    host_ip=$(getent hosts "$registry_host" 2>/dev/null | awk '{print $1; exit}')
+    if [ -z "$host_ip" ]; then
+        error "Cannot resolve hostname: $registry_host"
+        error "Ensure the hostname resolves via DNS or /etc/hosts"
+        exit 1
+    fi
+
+    # Validate the hostname resolves to the default route interface IP
+    if [ "$host_ip" != "$iface_ip" ]; then
+        error "Hostname '$registry_host' resolves to $host_ip"
+        error "but the default route interface ($default_iface) has IP $iface_ip"
+        error "The registry hostname must resolve to the IP of the default route interface"
+        error "Either update DNS/hosts or fix the default route"
+        exit 1
+    fi
+
+    log "✓ Network validated: $registry_host -> $host_ip (interface $default_iface)"
+}
+
 check_cli_tools() {
     if [ -d "${CLI_TOOLS_DIR}" ]; then
         log "CLI tools found in bundle"
@@ -1524,6 +1568,17 @@ EOF
         ca_cert_path="${DATA_DIR}/mirror-registry-ca.pem"
         log "CA certificate copied to ${DATA_DIR}/mirror-registry-ca.pem"
         log "CA certificate also saved to ${config_dir}/mirror-registry-ca.pem"
+
+        # Add generated CA to system PKI trust
+        if [ -d /etc/pki/ca-trust/source/anchors ]; then
+            if confirm_sudo "Add mirror-registry CA to system trust" "Allows oc-mirror and other tools to verify the registry TLS certificate"; then
+                run_sudo cp "${DATA_DIR}/mirror-registry-ca.pem" /etc/pki/ca-trust/source/anchors/mirror-registry-ca.pem
+                run_sudo update-ca-trust
+                log "✓ Mirror-registry CA added to system PKI trust"
+            else
+                log "WARNING: CA not added to system trust - oc-mirror may fail TLS verification"
+            fi
+        fi
     fi
 
     # Write JSON config with CA path if available to BOTH locations
@@ -1709,6 +1764,13 @@ start_containers() {
         prompt_for_registry_config
     fi
 
+    # Validate network routing before proceeding
+    if [ -n "${MIRROR_REGISTRY_HOSTNAME}" ]; then
+        validate_network_route "${MIRROR_REGISTRY_HOSTNAME}"
+    elif [ -n "${EXISTING_REGISTRY_URL}" ]; then
+        validate_network_route "${EXISTING_REGISTRY_URL}"
+    fi
+
     # Either install mirror-registry or configure existing registry
     if [ "${MIRROR_REGISTRY_INSTALL}" = "true" ]; then
         install_mirror_registry
@@ -1718,6 +1780,11 @@ start_containers() {
 
     # Wait for registry to be ready
     wait_for_mirror_registry
+
+    # Mirror bundle archives to registry if archives exist
+    if [ -d "${SCRIPT_DIR}/archives" ]; then
+        mirror_to_registry
+    fi
 
     # Check if images exist, import if not
     if ! check_images_exist; then
