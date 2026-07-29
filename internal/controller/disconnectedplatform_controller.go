@@ -9568,7 +9568,7 @@ echo "Uploaded $uploaded_tpa additional SBOMs to TPA"
 # === Build Bundle SBOM ===
 echo "--- Building Bundle SBOM ---"
 
-BUNDLE_FILE=$(find /workspace/output -maxdepth 1 -name "*-complete.tar.gz" -type f | head -1)
+BUNDLE_FILE=$(find /workspace/output -maxdepth 1 -name "*-complete.tar" -type f | head -1)
 if [ -z "$BUNDLE_FILE" ]; then
   echo "No complete bundle file found, skipping bundle SBOM creation"
   exit 0
@@ -10006,7 +10006,7 @@ if [ -f "/workspace/config/imageset-config.yaml" ]; then
 fi
 
 COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
-FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar.gz"
+FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
 
 # Create archives directory structure
 echo "=== Creating archives directory structure ==="
@@ -10054,10 +10054,10 @@ fi
 
 # Create final bundle
 echo "=== Creating final bundle ==="
-tar -czf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
+tar -cf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
 
-echo "Bundle structure:"
-tar -tzf "$FINAL_BUNDLE_NAME" | head -100
+echo "Bundle contents:"
+echo "$BUNDLE_CONTENTS" | tr ' ' '\n'
 
 echo "Final bundle created: $FINAL_BUNDLE_NAME"
 ls -lh "$FINAL_BUNDLE_NAME"
@@ -10104,16 +10104,16 @@ COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-
 BUNDLE_FILE=""
 SIG_FILE=""
 
-# The final bundle is named ${COLLECTION_NAME}-complete.tar.gz from repackage-bundle
-FINAL_BUNDLE="/workspace/output/${COLLECTION_NAME}-complete.tar.gz"
+# The final bundle is named ${COLLECTION_NAME}-complete.tar from repackage-bundle
+FINAL_BUNDLE="/workspace/output/${COLLECTION_NAME}-complete.tar"
 
 if [ -f "$FINAL_BUNDLE" ]; then
-  BUNDLE_FILENAME="${COLLECTION_NAME}-complete.tar.gz"
+  BUNDLE_FILENAME="${COLLECTION_NAME}-complete.tar"
   echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
   aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
     --region="$(params.s3-region)" \
-    --content-type="application/gzip"
+    --content-type="application/x-tar"
   BUNDLE_FILE="$BUNDLE_FILENAME"
 
   # Upload signature if it exists
