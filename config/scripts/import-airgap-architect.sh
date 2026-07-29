@@ -542,9 +542,9 @@ validate_network_route() {
         exit 1
     fi
 
-    # Resolve the hostname
+    # Resolve the hostname (IPv4 only)
     local host_ip
-    host_ip=$(getent hosts "$registry_host" 2>/dev/null | awk '{print $1; exit}')
+    host_ip=$(getent ahostsv4 "$registry_host" 2>/dev/null | awk '{print $1; exit}')
     if [ -z "$host_ip" ]; then
         error "Cannot resolve hostname: $registry_host"
         error "Ensure the hostname resolves via DNS or /etc/hosts"
