@@ -745,7 +745,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 	)
 
 	// Auto-detect CLI tool versions from ImageSetConfiguration
-	ocVersion := "stable-4.16" // default fallback
+	ocVersion := "latest" // default fallback
 	mirrorRegistryVersion := "latest"
 
 	// Parse the ImageSetConfiguration YAML to find the OCP version

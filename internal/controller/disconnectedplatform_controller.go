@@ -8201,7 +8201,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "s3-secret-name", "type": "string", "default": ""},
 		{"name": "architect-frontend-image", "type": "string", "description": "Airgap Architect frontend container image"},
 		{"name": "architect-backend-image", "type": "string", "description": "Airgap Architect backend container image"},
-		{"name": "oc-version", "type": "string", "default": "stable-4.16", "description": "OpenShift CLI version to download"},
+		{"name": "oc-version", "type": "string", "default": "latest", "description": "OpenShift CLI version to download"},
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
 		{"name": "sbom-parallel-jobs", "type": "string", "default": "4", "description": "Number of parallel syft SBOM scans"},
