@@ -10114,7 +10114,8 @@ if [ -f "$FINAL_BUNDLE" ]; then
   echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
   aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
-    --region="$(params.s3-region)"
+    --region="$(params.s3-region)" \
+    --content-type="application/gzip"
   BUNDLE_FILE="$BUNDLE_FILENAME"
 
   # Upload signature if it exists
