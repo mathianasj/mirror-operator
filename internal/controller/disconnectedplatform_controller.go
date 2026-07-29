@@ -9864,17 +9864,15 @@ echo "Downloading oc CLI (version: $OC_VERSION)..."
 curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-client-linux.tar.gz" \
   -o "$CLI_DIR/openshift-client-linux.tar.gz"
 
-echo "Downloading openshift-install (version: $OC_VERSION)..."
-curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-linux.tar.gz" \
+echo "Downloading openshift-install (version: $OC_VERSION, RHEL9/FIPS)..."
+curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-rhel9-amd64.tar.gz" \
   -o "$CLI_DIR/openshift-install-linux.tar.gz"
 
-echo "Downloading oc-mirror standalone binary..."
-# oc-mirror is in a subdirectory with the version
-OC_MIRROR_URL="${MIRROR_BASE}/ocp/${OC_VERSION}/oc-mirror.tar.gz"
+echo "Downloading oc-mirror standalone binary (RHEL9/FIPS)..."
+OC_MIRROR_URL="${MIRROR_BASE}/ocp/${OC_VERSION}/oc-mirror.rhel9.tar.gz"
 if ! curl -f -L "$OC_MIRROR_URL" -o "$CLI_DIR/oc-mirror.tar.gz" 2>/dev/null; then
-  # Try alternative location in ocp-dev-preview
-  echo "WARNING: oc-mirror not found in stable, trying dev-preview..."
-  curl -f -L "${MIRROR_BASE}/ocp-dev-preview/latest/oc-mirror.tar.gz" \
+  echo "WARNING: oc-mirror rhel9 not found in stable, trying dev-preview..."
+  curl -f -L "${MIRROR_BASE}/ocp-dev-preview/latest/oc-mirror.rhel9.tar.gz" \
     -o "$CLI_DIR/oc-mirror.tar.gz" || echo "WARNING: oc-mirror download failed, skipping"
 fi
 
