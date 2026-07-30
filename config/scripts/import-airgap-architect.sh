@@ -1846,8 +1846,8 @@ start_containers() {
         -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
         -e APP_BRANCH="${APP_BRANCH:-main}" \
         --security-opt label=disable \
+        --network host \
         -v "${SCRIPT_DIR}:/data" \
-        -p 127.0.0.1:4000:4000 \
         --stop-timeout 3 \
         "${BACKEND_IMAGE}"
 
