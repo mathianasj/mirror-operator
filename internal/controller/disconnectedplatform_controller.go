@@ -8204,7 +8204,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "oc-version", "type": "string", "default": "latest", "description": "OpenShift CLI version to download"},
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
-		{"name": "sbom-parallel-jobs", "type": "string", "default": "4", "description": "Number of parallel syft SBOM scans"},
+		{"name": "sbom-parallel-jobs", "type": "string", "default": "8", "description": "Number of parallel syft SBOM scans"},
 	}
 
 	// Define workspaces
@@ -8457,38 +8457,49 @@ export DOCKER_CONFIG=$HOME/.docker
 
 # === TPA Upload Setup ===
 CLIENT_SECRET=$(cat /workspace/tpa-oidc-secret/clientSecret)
-TPA_TOKEN=""
-TOKEN_TIME=0
+TOKEN_FILE=$(mktemp)
+echo "0" > "${TOKEN_FILE}.time"
 
 refresh_tpa_token() {
-  TPA_TOKEN=$(curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
-    -d "client_id=$(params.tpa-oidc-client-id)" \
-    -d "client_secret=$CLIENT_SECRET" \
-    -d "grant_type=client_credentials" | jq -r '.access_token')
-  TOKEN_TIME=$(date +%s)
+  local now=$(date +%s)
+  local last=$(cat "${TOKEN_FILE}.time" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 240 ]; then
+    TPA_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+    return
+  fi
+  (
+    flock -x 200
+    last=$(cat "${TOKEN_FILE}.time" 2>/dev/null || echo 0)
+    if [ $((now - last)) -lt 240 ]; then
+      :
+    else
+      curl -s -X POST "$(params.tpa-oidc-issuer)/protocol/openid-connect/token" \
+        -d "client_id=$(params.tpa-oidc-client-id)" \
+        -d "client_secret=$CLIENT_SECRET" \
+        -d "grant_type=client_credentials" | jq -r '.access_token' > "$TOKEN_FILE"
+      date +%s > "${TOKEN_FILE}.time"
+    fi
+  ) 200>"${TOKEN_FILE}.lock"
+  TPA_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
 }
 
 upload_sbom_to_tpa() {
   local sbom_file="$1"
-  local now=$(date +%s)
-  if [ $((now - TOKEN_TIME)) -ge 240 ]; then
-    echo "    Refreshing TPA OIDC token..."
-    refresh_tpa_token
-  fi
+  refresh_tpa_token
 
   # Check if SBOM already exists in TPA by documentNamespace
   local doc_ns
   doc_ns=$(jq -r '.documentNamespace // empty' "$sbom_file" 2>/dev/null)
   if [ -n "$doc_ns" ]; then
-    local check_code
-    check_code=$(curl -s -o /dev/null -w "%{http_code}" \
+    local check_resp check_code check_body
+    check_resp=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
       -H "Authorization: Bearer $TPA_TOKEN" \
       "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)")
+    check_code=$(echo "$check_resp" | grep "HTTP_CODE:" | cut -d: -f2)
+    check_body=$(echo "$check_resp" | grep -v "HTTP_CODE:")
     if [ "$check_code" = "200" ]; then
       local exists
-      exists=$(curl -s \
-        -H "Authorization: Bearer $TPA_TOKEN" \
-        "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns" | jq -sRr @uri)" | jq '.items | length // 0')
+      exists=$(echo "$check_body" | jq '.items | length // 0')
       if [ "$exists" -gt 0 ] 2>/dev/null; then
         echo "    -> Already exists in TPA, skipping upload"
         return 0
@@ -8647,7 +8658,7 @@ process_image() {
   fi
 
   echo "  [$idx/$image_count] Scanning: $dest_no_proto"
-  if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" 2>/dev/null; then
+  if syft "$IMAGE" -o spdx-json="$OUTPUT_FILE" --select-catalogers "-file-metadata-cataloger,-file-digest-cataloger,-file-content-cataloger" 2>/dev/null; then
     echo $(( $(cat "$COUNTER_DIR/scanned") + 1 )) > "$COUNTER_DIR/scanned"
     local fixed_source="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
     local fixed_dest="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
@@ -8664,7 +8675,7 @@ process_image() {
 }
 
 export -f process_image postprocess_sbom upload_sbom_to_tpa refresh_tpa_token
-export SBOM_CACHE_DIR SCAN_FROM_REGISTRY COUNTER_DIR TPA_TOKEN TOKEN_TIME
+export SBOM_CACHE_DIR SCAN_FROM_REGISTRY COUNTER_DIR TOKEN_FILE CLIENT_SECRET
 
 active_jobs=0
 while IFS='=' read -r source dest; do
@@ -8684,6 +8695,7 @@ cached=$(cat "$COUNTER_DIR/cached")
 scanned=$(cat "$COUNTER_DIR/scanned")
 uploaded_tpa=$(cat "$COUNTER_DIR/uploaded_tpa")
 rm -rf "$COUNTER_DIR"
+rm -f "$TOKEN_FILE" "${TOKEN_FILE}.time" "${TOKEN_FILE}.lock"
 
 echo "=== SBOM generation complete ==="
 echo "Total: $image_count | Cached: $cached | Scanned: $scanned | Uploaded to TPA: $uploaded_tpa"
