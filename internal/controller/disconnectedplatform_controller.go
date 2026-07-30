@@ -10054,7 +10054,7 @@ fi
 
 # Create final bundle
 echo "=== Creating final bundle ==="
-tar -cf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
+tar --remove-files -cf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
 
 echo "Bundle contents:"
 echo "$BUNDLE_CONTENTS" | tr ' ' '\n'
