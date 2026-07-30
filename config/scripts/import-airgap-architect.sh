@@ -889,29 +889,26 @@ create_cli_symlinks() {
         fi
     done
 
-    # If no tools were found in PATH or CLI_INSTALL_DIR, check if they exist in cli-tools bundle
-    # and extract them directly to SCRIPT_DIR for use
-    if [ "${created_links}" = false ] && [ -d "${CLI_TOOLS_DIR}" ]; then
-        log "  No installed CLI tools found - extracting from bundle to ${SCRIPT_DIR}"
+    # For any tools not yet in SCRIPT_DIR, extract from the cli-tools bundle
+    if [ -d "${CLI_TOOLS_DIR}" ]; then
+        local temp_dir=""
 
-        # Try to create temp directory - use SCRIPT_DIR if mktemp fails (DISA STIG mode)
-        local temp_dir
-        if ! temp_dir=$(mktemp -d 2>/dev/null); then
-            temp_dir="${SCRIPT_DIR}/.tmp-extract-$$"
-            mkdir -p "${temp_dir}"
-            log "  Using ${temp_dir} for extraction (mktemp unavailable)"
-        fi
-
-        # Extract oc and kubectl
-        if [ -f "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" ]; then
+        # Extract oc and kubectl if missing
+        if { [ ! -x "${SCRIPT_DIR}/oc" ] || [ ! -x "${SCRIPT_DIR}/kubectl" ]; } && [ -f "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" ]; then
+            if [ -z "$temp_dir" ]; then
+                if ! temp_dir=$(mktemp -d 2>/dev/null); then
+                    temp_dir="${SCRIPT_DIR}/.tmp-extract-$$"
+                    mkdir -p "${temp_dir}"
+                fi
+            fi
             tar -xzf "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" -C "$temp_dir" 2>/dev/null || true
-            if [ -f "$temp_dir/oc" ]; then
+            if [ ! -x "${SCRIPT_DIR}/oc" ] && [ -f "$temp_dir/oc" ]; then
                 cp "$temp_dir/oc" "${SCRIPT_DIR}/oc"
                 chmod +x "${SCRIPT_DIR}/oc"
                 log "  Extracted oc to ${SCRIPT_DIR}"
                 created_links=true
             fi
-            if [ -f "$temp_dir/kubectl" ]; then
+            if [ ! -x "${SCRIPT_DIR}/kubectl" ] && [ -f "$temp_dir/kubectl" ]; then
                 cp "$temp_dir/kubectl" "${SCRIPT_DIR}/kubectl"
                 chmod +x "${SCRIPT_DIR}/kubectl"
                 log "  Extracted kubectl to ${SCRIPT_DIR}"
@@ -920,8 +917,14 @@ create_cli_symlinks() {
             rm -f "$temp_dir/oc" "$temp_dir/kubectl"
         fi
 
-        # Extract openshift-install
-        if [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
+        # Extract openshift-install if missing
+        if [ ! -x "${SCRIPT_DIR}/openshift-install" ] && [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
+            if [ -z "$temp_dir" ]; then
+                if ! temp_dir=$(mktemp -d 2>/dev/null); then
+                    temp_dir="${SCRIPT_DIR}/.tmp-extract-$$"
+                    mkdir -p "${temp_dir}"
+                fi
+            fi
             tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir" 2>/dev/null || true
             if [ -f "$temp_dir/openshift-install" ]; then
                 cp "$temp_dir/openshift-install" "${SCRIPT_DIR}/openshift-install"
