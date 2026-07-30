@@ -1782,8 +1782,10 @@ start_containers() {
     wait_for_mirror_registry
 
     # Mirror bundle archives to registry if archives exist
-    if [ -d "${SCRIPT_DIR}/archives" ]; then
+    if [ -d "${SCRIPT_DIR}/archives" ] && [ "${SKIP_MIRROR}" != "true" ]; then
         mirror_to_registry
+    elif [ "${SKIP_MIRROR}" = "true" ]; then
+        log "Skipping mirror step (--skip-mirror)"
     fi
 
     # Check if images exist, import if not
@@ -1833,7 +1835,8 @@ start_containers() {
         -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
         -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
         -e APP_BRANCH="${APP_BRANCH:-main}" \
-        -v "${SCRIPT_DIR}:/data:z" \
+        --security-opt label=disable \
+        -v "${SCRIPT_DIR}:/data" \
         -p 127.0.0.1:4000:4000 \
         --stop-timeout 3 \
         "${BACKEND_IMAGE}"
@@ -1853,9 +1856,15 @@ start_containers() {
 
     log "Containers started successfully"
     log ""
-    log "Airgap Architect is now running:"
-    log "  Frontend UI: http://localhost:5173"
+    log "============================================================"
+    log "  Airgap Architect is ready!"
+    log ""
+    log "  To create your first cluster, open your web browser to:"
+    log ""
+    log "    http://localhost:5173"
+    log ""
     log "  Backend API: http://localhost:4000"
+    log "============================================================"
     log ""
     log "To view logs: $0 logs"
     log "To stop:      $0 stop"
@@ -2389,6 +2398,7 @@ uninstall_mirror_registry() {
 
 # Parse arguments
 COMMAND=""
+SKIP_MIRROR="${SKIP_MIRROR:-false}"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --bundle-dir)
@@ -2398,6 +2408,10 @@ while [[ $# -gt 0 ]]; do
         --data-dir)
             DATA_DIR="$2"
             shift 2
+            ;;
+        --skip-mirror)
+            SKIP_MIRROR=true
+            shift
             ;;
         --help)
             usage
