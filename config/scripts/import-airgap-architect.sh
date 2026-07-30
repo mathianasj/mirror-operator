@@ -696,6 +696,10 @@ EOSUDO
         fi
         if [ ${install_choice} -eq 0 ]; then
             tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir"
+            # Handle FIPS variant naming (openshift-install-fips)
+            if [ ! -f "$temp_dir/openshift-install" ] && [ -f "$temp_dir/openshift-install-fips" ]; then
+                mv "$temp_dir/openshift-install-fips" "$temp_dir/openshift-install"
+            fi
             [ -f "$temp_dir/openshift-install" ] && has_openshift_install=true
         fi
     fi
@@ -926,6 +930,9 @@ create_cli_symlinks() {
                 fi
             fi
             tar -xzf "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" -C "$temp_dir" 2>/dev/null || true
+            if [ ! -f "$temp_dir/openshift-install" ] && [ -f "$temp_dir/openshift-install-fips" ]; then
+                mv "$temp_dir/openshift-install-fips" "$temp_dir/openshift-install"
+            fi
             if [ -f "$temp_dir/openshift-install" ]; then
                 cp "$temp_dir/openshift-install" "${SCRIPT_DIR}/openshift-install"
                 chmod +x "${SCRIPT_DIR}/openshift-install"
