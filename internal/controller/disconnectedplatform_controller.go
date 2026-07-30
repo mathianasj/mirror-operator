@@ -8467,8 +8467,9 @@ refresh_tpa_token() {
     TPA_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
     return
   fi
-  (
-    flock -x 200
+  local lockdir="${TOKEN_FILE}.lock"
+  if mkdir "$lockdir" 2>/dev/null; then
+    trap 'rmdir "$lockdir" 2>/dev/null' RETURN
     last=$(cat "${TOKEN_FILE}.time" 2>/dev/null || echo 0)
     if [ $((now - last)) -lt 240 ]; then
       :
@@ -8479,7 +8480,9 @@ refresh_tpa_token() {
         -d "grant_type=client_credentials" | jq -r '.access_token' > "$TOKEN_FILE"
       date +%s > "${TOKEN_FILE}.time"
     fi
-  ) 200>"${TOKEN_FILE}.lock"
+  else
+    while [ -d "$lockdir" ]; do sleep 0.1; done
+  fi
   TPA_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
 }
 
