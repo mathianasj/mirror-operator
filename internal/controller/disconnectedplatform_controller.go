@@ -9356,40 +9356,49 @@ cosign initialize --mirror="$(params.tuf-url)" --root="$(params.tuf-url)/root.js
 
 echo "=== Signing tar bundles with cosign ==="
 
-# Get OIDC token
-OIDC_TOKEN=$(curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
-  -d "client_id=$(params.oidc-client-id)" \
-  -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
-  -d "grant_type=client_credentials" \
-  -d "audience=trusted-artifact-signer" | jq -r '.access_token')
-
 export COSIGN_EXPERIMENTAL=1
 
-# Find and sign all tar/tar.gz files
-find /workspace/output -maxdepth 1 \( -name "*.tar" -o -name "*.tar.gz" \) -type f | while read tarfile; do
-  echo "Signing $tarfile"
+# Increase cosign HTTP timeout for large file operations (default 30s is too short)
+export COSIGN_TIMEOUT=300
+
+fetch_oidc_token() {
+  curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
+    -d "client_id=$(params.oidc-client-id)" \
+    -d "client_secret=$(cat /workspace/oidc-secret/clientSecret)" \
+    -d "grant_type=client_credentials" \
+    -d "audience=trusted-artifact-signer" | jq -r '.access_token'
+}
+
+sign_file() {
+  local filepath="$1"
+  echo "Signing $filepath ($(du -h "$filepath" | cut -f1))"
+  # Fetch a fresh OIDC token before each signing to avoid expiry
+  local token=$(fetch_oidc_token)
   cosign sign-blob \
     --fulcio-url=$(params.fulcio-url) \
     --rekor-url=$(params.rekor-url) \
     --oidc-issuer=$(params.oidc-issuer) \
-    --identity-token="$OIDC_TOKEN" \
+    --identity-token="$token" \
     --yes \
-    --bundle="${tarfile}.bundle" \
-    "$tarfile" > "${tarfile}.sig" || echo "Failed to sign $tarfile"
+    --bundle="${filepath}.bundle" \
+    "$filepath" > "${filepath}.sig" || echo "Failed to sign $filepath"
+}
+
+# Sign small files first (fast, validates the signing pipeline works)
+for tarfile in $(find /workspace/output -maxdepth 1 -name "*.tar.gz" -type f); do
+  sign_file "$tarfile"
+done
+
+# Sign large tar files last (these take longest to hash)
+for tarfile in $(find /workspace/output -maxdepth 1 -name "*.tar" -type f); do
+  sign_file "$tarfile"
 done
 
 # Sign bundle SBOM if it exists
 if [ -f /workspace/output/sboms/bundle-*.spdx.json ]; then
   for sbomfile in /workspace/output/sboms/bundle-*.spdx.json; do
     echo "Signing bundle SBOM: $(basename $sbomfile)"
-    cosign sign-blob \
-      --fulcio-url=$(params.fulcio-url) \
-      --rekor-url=$(params.rekor-url) \
-      --oidc-issuer=$(params.oidc-issuer) \
-      --identity-token="$OIDC_TOKEN" \
-      --yes \
-      --bundle="${sbomfile}.bundle" \
-      "$sbomfile" > "${sbomfile}.sig" || echo "Failed to sign $sbomfile"
+    sign_file "$sbomfile"
   done
 fi
 
@@ -10020,56 +10029,52 @@ fi
 COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
 FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
 
-# Create archives directory structure
-echo "=== Creating archives directory structure ==="
-mkdir -p archives
-
-# Move mirror tar files to archives/
-echo "=== Moving mirror tar files to archives/ ==="
-OC_MIRROR_BUNDLE=$(ls -1 *.tar 2>/dev/null | head -1 || ls -1 mirror_seq*.tar 2>/dev/null | head -1 || echo "")
-if [ -n "$OC_MIRROR_BUNDLE" ]; then
-  echo "Found oc-mirror bundle: $OC_MIRROR_BUNDLE"
-  mv $OC_MIRROR_BUNDLE archives/
-  # Move all mirror_*.tar files
-  for tarfile in mirror_*.tar; do
-    if [ -f "$tarfile" ]; then
-      mv "$tarfile" archives/
-    fi
-  done
-else
+# Collect mirror tar files (will be added under archives/ prefix via --transform)
+MIRROR_TARS=$(ls -1 mirror_*.tar 2>/dev/null || echo "")
+if [ -z "$MIRROR_TARS" ]; then
   echo "WARNING: No oc-mirror .tar bundle found"
 fi
 
-# Build bundle contents list
-# Note: Cache is NOT included - airgapped import builds its own cache
-BUNDLE_CONTENTS="archives airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
+# Build small files list (everything except mirror tars)
+SMALL_CONTENTS="airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
 
-# Include ImageSetConfiguration if present
 if [ -f "imageset-config.yaml" ]; then
   echo "Including ImageSetConfiguration in bundle"
-  BUNDLE_CONTENTS="$BUNDLE_CONTENTS imageset-config.yaml"
+  SMALL_CONTENTS="$SMALL_CONTENTS imageset-config.yaml"
 fi
 
-# Include IDMS/ITMS files if present
 if [ -f "idms-oc-mirror.yaml" ]; then
-  BUNDLE_CONTENTS="$BUNDLE_CONTENTS idms-oc-mirror.yaml"
+  SMALL_CONTENTS="$SMALL_CONTENTS idms-oc-mirror.yaml"
 fi
 if [ -f "itms-oc-mirror.yaml" ]; then
-  BUNDLE_CONTENTS="$BUNDLE_CONTENTS itms-oc-mirror.yaml"
+  SMALL_CONTENTS="$SMALL_CONTENTS itms-oc-mirror.yaml"
 fi
 
-# Include CLI tools if present
 if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
   echo "Including CLI tools in bundle"
-  BUNDLE_CONTENTS="$BUNDLE_CONTENTS cli-tools"
+  SMALL_CONTENTS="$SMALL_CONTENTS cli-tools"
 fi
 
-# Create final bundle
-echo "=== Creating final bundle ==="
-tar --remove-files -cf "$FINAL_BUNDLE_NAME" $BUNDLE_CONTENTS
+# Phase 1: Create tar with small files (~2.5GB, fast)
+# Use 1MB block size (-b 2048) for better I/O throughput on block storage
+echo "=== Creating bundle (small files) ==="
+tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
+
+# Phase 2: Append mirror tars under archives/ prefix using --transform
+# This avoids creating an archives/ directory and moving 69GB+ files into it
+if [ -n "$MIRROR_TARS" ]; then
+  echo "=== Appending mirror archives ($(du -sh $MIRROR_TARS | cut -f1)) ==="
+  tar -b 2048 -rf "$FINAL_BUNDLE_NAME" --transform='s,^,archives/,' $MIRROR_TARS
+fi
+
+# Clean up source files to free PVC space
+rm -rf $SMALL_CONTENTS $MIRROR_TARS
 
 echo "Bundle contents:"
-echo "$BUNDLE_CONTENTS" | tr ' ' '\n'
+echo "$SMALL_CONTENTS" | tr ' ' '\n'
+if [ -n "$MIRROR_TARS" ]; then
+  echo "$MIRROR_TARS" | sed 's/^/archives\//'
+fi
 
 echo "Final bundle created: $FINAL_BUNDLE_NAME"
 ls -lh "$FINAL_BUNDLE_NAME"
