@@ -1019,6 +1019,32 @@ update_container_config() {
         log "  Added ITMS path to container config"
     fi
 
+    # Add catalogSourcePaths if catalogsource files exist
+    local cs_dir="${DATA_DIR}/catalogsources"
+    if [ -d "${cs_dir}" ]; then
+        local cs_json_array=""
+        while IFS= read -r cs_file; do
+            local cs_name
+            cs_name=$(basename "${cs_file}")
+            if [ -n "${cs_json_array}" ]; then
+                cs_json_array="${cs_json_array}, "
+            fi
+            cs_json_array="${cs_json_array}\"/data/data/catalogsources/${cs_name}\""
+        done < <(find "${cs_dir}" -maxdepth 1 -type f -name "*.yaml" 2>/dev/null | sort)
+
+        if [ -n "${cs_json_array}" ]; then
+            if grep -q '"catalogSourcePaths"' "${DATA_DIR}/mirror-registry-config-container.json"; then
+                sed -i.bak "s|\"catalogSourcePaths\": *\[[^]]*\]|\"catalogSourcePaths\": [${cs_json_array}]|g" \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            else
+                sed -i.bak "s|}$|,\n  \"catalogSourcePaths\": [${cs_json_array}]\n}|" \
+                    "${DATA_DIR}/mirror-registry-config-container.json"
+            fi
+            rm -f "${DATA_DIR}/mirror-registry-config-container.json.bak"
+            log "  Added catalogSourcePaths to container config"
+        fi
+    fi
+
     chmod 644 "${DATA_DIR}/mirror-registry-config-container.json"
     log "✓ Container config updated"
 }
