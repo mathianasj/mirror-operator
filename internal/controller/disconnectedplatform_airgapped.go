@@ -26,6 +26,21 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciling airgapped mode")
 
+	// ACM must be installed first — its policies typically configure storage
+	// classes and other infrastructure that Quay and other components depend on.
+	if platform.Spec.Airgapped.ACM != nil && platform.Spec.Airgapped.ACM.Enabled {
+		mchReady, err := r.reconcileAirgappedACM(ctx, platform)
+		if err != nil {
+			logger.Error(err, "failed to reconcile airgapped ACM")
+			needsRequeue = true
+		}
+		if !mchReady {
+			logger.Info("MultiClusterHub not yet running, deferring Quay and other components until ACM policies are applied")
+			needsRequeue = true
+			return needsRequeue, nil
+		}
+	}
+
 	if err := r.reconcileAirgappedQuay(ctx, platform); err != nil {
 		logger.Error(err, "failed to reconcile airgapped Quay (will retry)")
 		needsRequeue = true
@@ -46,13 +61,6 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 	if err := r.ensureAirgappedUpdateService(ctx, platform); err != nil {
 		logger.Error(err, "failed to ensure airgapped UpdateService")
 		needsRequeue = true
-	}
-
-	if platform.Spec.Airgapped.ACM != nil && platform.Spec.Airgapped.ACM.Enabled {
-		if err := r.reconcileAirgappedACM(ctx, platform); err != nil {
-			logger.Error(err, "failed to reconcile airgapped ACM")
-			needsRequeue = true
-		}
 	}
 
 	return needsRequeue, nil
@@ -615,18 +623,25 @@ func (r *DisconnectedPlatformReconciler) ensureAirgappedUpdateService(ctx contex
 }
 
 // reconcileAirgappedACM installs the ACM operator via OLM and creates a MultiClusterHub CR.
-func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+// Returns mchReady=true when the MultiClusterHub is in Running phase.
+func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (mchReady bool, err error) {
 	logger := log.FromContext(ctx)
 	acmConfig := platform.Spec.Airgapped.ACM
 
 	acmOp := operatorDef{
-		name:      "advanced-cluster-management",
-		pkg:       "advanced-cluster-management",
-		channel:   "release-2.12",
-		catalog:   "redhat-operators",
-		catalogNS: "openshift-marketplace",
-		ns:        "open-cluster-management",
+		name: "advanced-cluster-management",
+		pkg:  "advanced-cluster-management",
+		ns:   "open-cluster-management",
 	}
+
+	catalog, catalogNS, channel, err := r.discoverPackageInfo(ctx, acmOp.pkg)
+	if err != nil {
+		logger.Info("ACM package not available yet", "error", err.Error())
+		return false, nil
+	}
+	acmOp.catalog = catalog
+	acmOp.catalogNS = catalogNS
+	acmOp.channel = channel
 
 	var subCfg *mirrorv1.OLMSubscriptionConfig
 	if acmConfig.Subscription != nil {
@@ -634,15 +649,15 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Conte
 	}
 
 	if err := r.ensureNamespace(ctx, acmOp.ns); err != nil {
-		return fmt.Errorf("namespace for ACM: %w", err)
+		return false, fmt.Errorf("namespace for ACM: %w", err)
 	}
 
 	if err := r.ensureOperatorGroup(ctx, acmOp); err != nil {
-		return fmt.Errorf("operatorgroup for ACM: %w", err)
+		return false, fmt.Errorf("operatorgroup for ACM: %w", err)
 	}
 
 	if err := r.ensureSubscription(ctx, acmOp, subCfg); err != nil {
-		return fmt.Errorf("subscription for ACM: %w", err)
+		return false, fmt.Errorf("subscription for ACM: %w", err)
 	}
 
 	csvPhase := r.csvStatus(ctx, acmOp)
@@ -659,7 +674,7 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Conte
 
 	if csvPhase != "Succeeded" {
 		logger.Info("ACM operator CSV not yet ready, deferring MultiClusterHub creation", "csvPhase", csvPhase)
-		return nil
+		return false, nil
 	}
 
 	if err := r.ensureACMPullSecret(ctx, platform); err != nil {
@@ -667,10 +682,26 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Conte
 	}
 
 	if err := r.ensureMultiClusterHub(ctx, platform); err != nil {
-		return fmt.Errorf("failed to ensure MultiClusterHub: %w", err)
+		return false, fmt.Errorf("failed to ensure MultiClusterHub: %w", err)
 	}
 
-	return nil
+	// Check if MCH is Running
+	mch := &unstructured.Unstructured{}
+	mch.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+	})
+	mch.SetName("multiclusterhub")
+	mch.SetNamespace("open-cluster-management")
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mch), mch); err == nil {
+		phase, _, _ := unstructured.NestedString(mch.Object, "status", "phase")
+		if phase == "Running" {
+			logger.Info("MultiClusterHub is Running, proceeding with remaining airgapped components")
+			return true, nil
+		}
+		logger.Info("MultiClusterHub not yet Running", "phase", phase)
+	}
+
+	return false, nil
 }
 
 // ensureACMPullSecret copies the pull secret to the open-cluster-management namespace.
