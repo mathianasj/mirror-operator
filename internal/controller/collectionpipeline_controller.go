@@ -1103,8 +1103,9 @@ type OperatorConfig struct {
 }
 
 type PackageConfig struct {
-	Name     string          `json:"name" yaml:"name"`
-	Channels []ChannelConfig `json:"channels,omitempty" yaml:"channels,omitempty"`
+	Name           string          `json:"name" yaml:"name"`
+	DefaultChannel string          `json:"defaultChannel,omitempty" yaml:"defaultChannel,omitempty"`
+	Channels       []ChannelConfig `json:"channels,omitempty" yaml:"channels,omitempty"`
 }
 
 type ImageConfig struct {
