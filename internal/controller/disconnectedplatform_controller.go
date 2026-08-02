@@ -123,6 +123,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=subscriptions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=operatorgroups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=clusterserviceversions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=packages.operators.coreos.com,resources=packagemanifests,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rhtpa.io,resources=trustedprofileanalyzers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rhtas.redhat.com,resources=tufs,verbs=get;list;watch
@@ -277,8 +278,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
-	// Reconcile airgapped mode (Quay, import scanner, credentials, OSUS)
+	// Reconcile airgapped mode (operator subscriptions, Quay, import scanner, credentials, OSUS)
 	if platform.Spec.Mode == mirrorv1.PlatformModeAirgapped && platform.Spec.Airgapped != nil {
+		if err := r.reconcileAirgappedSubscriptions(ctx, platform); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile airgapped OLM subscriptions")
+		}
 		if err := r.reconcileAirgapped(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile airgapped mode")
 		}
@@ -571,6 +575,86 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 	}
 
 	platform.Status.Components = components
+	return nil
+}
+
+var airgappedOperators = []operatorDef{
+	{
+		name:    "quay-operator",
+		pkg:     "quay-operator",
+		channel: "stable-3.13",
+		ns:      "openshift-operators",
+	},
+	{
+		name:    "cincinnati-operator",
+		pkg:     "cincinnati-operator",
+		channel: "v1",
+		ns:      "openshift-update-service",
+	},
+	{
+		name:    "openshift-pipelines",
+		pkg:     "openshift-pipelines-operator-rh",
+		channel: "latest",
+		ns:      "openshift-operators",
+	},
+}
+
+func (r *DisconnectedPlatformReconciler) discoverCatalogForPackage(ctx context.Context, pkg string) (string, string, error) {
+	pm := &unstructured.Unstructured{}
+	pm.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "packages.operators.coreos.com",
+		Version: "v1",
+		Kind:    "PackageManifest",
+	})
+
+	if err := r.Get(ctx, client.ObjectKey{Name: pkg, Namespace: "openshift-marketplace"}, pm); err != nil {
+		return "", "", fmt.Errorf("PackageManifest %q not found: %w", pkg, err)
+	}
+
+	catalog, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSource")
+	catalogNS, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSourceNamespace")
+	if catalog == "" {
+		return "", "", fmt.Errorf("PackageManifest %q has no catalogSource in status", pkg)
+	}
+
+	return catalog, catalogNS, nil
+}
+
+func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	for _, op := range airgappedOperators {
+		catalog, catalogNS, err := r.discoverCatalogForPackage(ctx, op.pkg)
+		if err != nil {
+			logger.Info("Package not available yet, skipping subscription", "package", op.pkg, "error", err.Error())
+			continue
+		}
+		op.catalog = catalog
+		op.catalogNS = catalogNS
+
+		if err := r.ensureNamespace(ctx, op.ns); err != nil {
+			return fmt.Errorf("namespace for %s: %w", op.name, err)
+		}
+		if err := r.ensureOperatorGroup(ctx, op); err != nil {
+			return fmt.Errorf("operatorgroup for %s: %w", op.name, err)
+		}
+		if err := r.ensureSubscription(ctx, op, nil); err != nil {
+			return fmt.Errorf("subscription for %s: %w", op.name, err)
+		}
+
+		compStatus := r.csvStatus(ctx, op)
+		if compStatus == "" {
+			compStatus = "Installing"
+		}
+		platform.Status.Components = append(platform.Status.Components,
+			mirrorv1.ComponentStatus{
+				Name: op.name, Status: compStatus,
+				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
+			},
+		)
+		logger.Info("Ensured airgapped operator subscription", "operator", op.name, "catalog", catalog)
+	}
+
 	return nil
 }
 

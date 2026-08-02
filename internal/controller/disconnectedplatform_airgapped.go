@@ -28,7 +28,6 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 
 	if err := r.reconcileAirgappedQuay(ctx, platform); err != nil {
 		logger.Error(err, "failed to reconcile airgapped Quay")
-		return err
 	}
 
 	if err := r.ensureAirgappedRegistryCredentials(ctx, platform); err != nil {

@@ -296,6 +296,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - packages.operators.coreos.com
+  resources:
+  - packagemanifests
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - quay.redhat.com
   resources:
   - quayregistries
