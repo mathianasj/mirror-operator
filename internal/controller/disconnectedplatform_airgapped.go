@@ -22,35 +22,40 @@ import (
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
 )
 
-func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (needsRequeue bool, err error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciling airgapped mode")
 
 	if err := r.reconcileAirgappedQuay(ctx, platform); err != nil {
-		logger.Error(err, "failed to reconcile airgapped Quay")
+		logger.Error(err, "failed to reconcile airgapped Quay (will retry)")
+		needsRequeue = true
 	}
 
 	if err := r.ensureAirgappedRegistryCredentials(ctx, platform); err != nil {
 		logger.Error(err, "failed to ensure airgapped registry credentials")
+		needsRequeue = true
 	}
 
 	if platform.Spec.Airgapped.ImportPath != "" {
 		if err := r.reconcileImportScanner(ctx, platform); err != nil {
 			logger.Error(err, "failed to reconcile import scanner")
+			needsRequeue = true
 		}
 	}
 
 	if err := r.ensureAirgappedUpdateService(ctx, platform); err != nil {
 		logger.Error(err, "failed to ensure airgapped UpdateService")
+		needsRequeue = true
 	}
 
 	if platform.Spec.Airgapped.ACM != nil && platform.Spec.Airgapped.ACM.Enabled {
 		if err := r.reconcileAirgappedACM(ctx, platform); err != nil {
 			logger.Error(err, "failed to reconcile airgapped ACM")
+			needsRequeue = true
 		}
 	}
 
-	return nil
+	return needsRequeue, nil
 }
 
 // reconcileAirgappedQuay deploys a QuayRegistry CR with filesystem-backed storage for airgapped clusters.

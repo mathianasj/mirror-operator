@@ -279,12 +279,19 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 
 	// Reconcile airgapped mode (operator subscriptions, Quay, import scanner, credentials, OSUS)
+	airgappedRequeue := false
 	if platform.Spec.Mode == mirrorv1.PlatformModeAirgapped && platform.Spec.Airgapped != nil {
-		if err := r.reconcileAirgappedSubscriptions(ctx, platform); err != nil {
+		if requeue, err := r.reconcileAirgappedSubscriptions(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile airgapped OLM subscriptions")
+			airgappedRequeue = true
+		} else if requeue {
+			airgappedRequeue = true
 		}
-		if err := r.reconcileAirgapped(ctx, platform); err != nil {
+		if requeue, err := r.reconcileAirgapped(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile airgapped mode")
+			airgappedRequeue = true
+		} else if requeue {
+			airgappedRequeue = true
 		}
 	}
 
@@ -399,6 +406,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		if !apierrors.IsConflict(err) {
 			return ctrl.Result{}, err
 		}
+	}
+
+	if airgappedRequeue {
+		log.FromContext(ctx).Info("Airgapped operators still installing, requeuing reconciliation")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -618,13 +630,14 @@ func (r *DisconnectedPlatformReconciler) discoverPackageInfo(ctx context.Context
 	return catalog, catalogNS, channel, nil
 }
 
-func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (needsRequeue bool, err error) {
 	logger := log.FromContext(ctx)
 
 	for _, op := range airgappedOperators {
 		catalog, catalogNS, channel, err := r.discoverPackageInfo(ctx, op.pkg)
 		if err != nil {
 			logger.Info("Package not available yet, skipping subscription", "package", op.pkg, "error", err.Error())
+			needsRequeue = true
 			continue
 		}
 		op.catalog = catalog
@@ -632,18 +645,21 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx con
 		op.channel = channel
 
 		if err := r.ensureNamespace(ctx, op.ns); err != nil {
-			return fmt.Errorf("namespace for %s: %w", op.name, err)
+			return true, fmt.Errorf("namespace for %s: %w", op.name, err)
 		}
 		if err := r.ensureOperatorGroup(ctx, op); err != nil {
-			return fmt.Errorf("operatorgroup for %s: %w", op.name, err)
+			return true, fmt.Errorf("operatorgroup for %s: %w", op.name, err)
 		}
 		if err := r.ensureSubscription(ctx, op, nil); err != nil {
-			return fmt.Errorf("subscription for %s: %w", op.name, err)
+			return true, fmt.Errorf("subscription for %s: %w", op.name, err)
 		}
 
 		compStatus := r.csvStatus(ctx, op)
 		if compStatus == "" {
 			compStatus = "Installing"
+		}
+		if compStatus != "Succeeded" {
+			needsRequeue = true
 		}
 		platform.Status.Components = append(platform.Status.Components,
 			mirrorv1.ComponentStatus{
@@ -651,10 +667,10 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx con
 				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			},
 		)
-		logger.Info("Ensured airgapped operator subscription", "operator", op.name, "catalog", catalog)
+		logger.Info("Ensured airgapped operator subscription", "operator", op.name, "catalog", catalog, "csvStatus", compStatus)
 	}
 
-	return nil
+	return needsRequeue, nil
 }
 
 func (r *DisconnectedPlatformReconciler) ensureNamespace(ctx context.Context, ns string) error {
