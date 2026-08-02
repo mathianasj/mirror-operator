@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -33,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -166,6 +169,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	tektonAvailable := isAPIGroupAvailable(clientSet, "tekton.dev/v1")
+	securesignAvailable := isAPIGroupAvailable(clientSet, "rhtas.redhat.com/v1alpha1")
+
 	if err = (&controller.DisconnectedPlatformReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
@@ -174,19 +180,53 @@ func main() {
 		ArchitectConsolePluginImage: architectConsolePluginImage,
 		ClientSet:                   clientSet,
 		RESTConfig:                  mgr.GetConfig(),
+		TektonAvailable:             tektonAvailable,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DisconnectedPlatform")
 		os.Exit(1)
 	}
-	if err = (&controller.CollectionPipelineReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		MirrorImage: mirrorImage,
-		ClientSet:   clientSet,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CollectionPipeline")
-		os.Exit(1)
+
+	if tektonAvailable {
+		if err = (&controller.CollectionPipelineReconciler{
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			MirrorImage: mirrorImage,
+			ClientSet:   clientSet,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CollectionPipeline")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("Tekton CRDs not available, CollectionPipeline controller will be registered when CRDs appear")
+		if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					if isAPIGroupAvailable(clientSet, "tekton.dev/v1") {
+						setupLog.Info("Tekton CRDs detected, registering CollectionPipeline controller")
+						if err := (&controller.CollectionPipelineReconciler{
+							Client:      mgr.GetClient(),
+							Scheme:      mgr.GetScheme(),
+							MirrorImage: mirrorImage,
+							ClientSet:   clientSet,
+						}).SetupWithManager(mgr); err != nil {
+							setupLog.Error(err, "failed to register CollectionPipeline controller dynamically")
+							continue
+						}
+						return nil
+					}
+				}
+			}
+		})); err != nil {
+			setupLog.Error(err, "unable to add Tekton CRD watcher")
+			os.Exit(1)
+		}
 	}
+
 	if err = (&controller.MirrorImportReconciler{
 		Client:      mgr.GetClient(),
 		Scheme:      mgr.GetScheme(),
@@ -202,11 +242,40 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterBootstrap")
 		os.Exit(1)
 	}
-	if err = (&controller.RHTASHealthCheckReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "RHTASHealthCheck")
-		os.Exit(1)
+
+	if securesignAvailable {
+		if err = (&controller.RHTASHealthCheckReconciler{
+			Client: mgr.GetClient(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "RHTASHealthCheck")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("Securesign CRDs not available, RHTASHealthCheck controller will be registered when CRDs appear")
+		if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					if isAPIGroupAvailable(clientSet, "rhtas.redhat.com/v1alpha1") {
+						setupLog.Info("Securesign CRDs detected, registering RHTASHealthCheck controller")
+						if err := (&controller.RHTASHealthCheckReconciler{
+							Client: mgr.GetClient(),
+						}).SetupWithManager(mgr); err != nil {
+							setupLog.Error(err, "failed to register RHTASHealthCheck controller dynamically")
+							continue
+						}
+						return nil
+					}
+				}
+			}
+		})); err != nil {
+			setupLog.Error(err, "unable to add Securesign CRD watcher")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
@@ -224,4 +293,9 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func isAPIGroupAvailable(clientSet kubernetes.Interface, groupVersion string) bool {
+	_, err := clientSet.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	return err == nil
 }

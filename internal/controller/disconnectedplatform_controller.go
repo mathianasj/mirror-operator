@@ -109,6 +109,7 @@ type DisconnectedPlatformReconciler struct {
 	ArchitectConsolePluginImage string
 	ClientSet                   kubernetes.Interface
 	RESTConfig                  *rest.Config
+	TektonAvailable             bool
 }
 
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms,verbs=get;list;watch;create;update;patch;delete
@@ -10547,7 +10548,7 @@ func (r *DisconnectedPlatformReconciler) ensureImportScriptConfigMap(ctx context
 }
 
 func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&mirrorv1.DisconnectedPlatform{}).
 		Owns(&unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "apps/v1",
@@ -10560,11 +10561,16 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		Owns(&unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "route.openshift.io/v1",
 			"kind":       "Route",
-		}}).
-		Owns(&unstructured.Unstructured{Object: map[string]interface{}{
+		}})
+
+	if r.TektonAvailable {
+		b = b.Owns(&unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "tekton.dev/v1",
 			"kind":       "Pipeline",
-		}}).
+		}})
+	}
+
+	return b.
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
 		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
 		Complete(r)
