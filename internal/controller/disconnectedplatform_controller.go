@@ -580,26 +580,23 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 
 var airgappedOperators = []operatorDef{
 	{
-		name:    "quay-operator",
-		pkg:     "quay-operator",
-		channel: "stable-3.13",
-		ns:      "openshift-operators",
+		name: "quay-operator",
+		pkg:  "quay-operator",
+		ns:   "openshift-operators",
 	},
 	{
-		name:    "cincinnati-operator",
-		pkg:     "cincinnati-operator",
-		channel: "v1",
-		ns:      "openshift-update-service",
+		name: "cincinnati-operator",
+		pkg:  "cincinnati-operator",
+		ns:   "openshift-update-service",
 	},
 	{
-		name:    "openshift-pipelines",
-		pkg:     "openshift-pipelines-operator-rh",
-		channel: "latest",
-		ns:      "openshift-operators",
+		name: "openshift-pipelines",
+		pkg:  "openshift-pipelines-operator-rh",
+		ns:   "openshift-operators",
 	},
 }
 
-func (r *DisconnectedPlatformReconciler) discoverCatalogForPackage(ctx context.Context, pkg string) (string, string, error) {
+func (r *DisconnectedPlatformReconciler) discoverPackageInfo(ctx context.Context, pkg string) (catalog, catalogNS, channel string, err error) {
 	pm := &unstructured.Unstructured{}
 	pm.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "packages.operators.coreos.com",
@@ -608,29 +605,31 @@ func (r *DisconnectedPlatformReconciler) discoverCatalogForPackage(ctx context.C
 	})
 
 	if err := r.Get(ctx, client.ObjectKey{Name: pkg, Namespace: "openshift-marketplace"}, pm); err != nil {
-		return "", "", fmt.Errorf("PackageManifest %q not found: %w", pkg, err)
+		return "", "", "", fmt.Errorf("PackageManifest %q not found: %w", pkg, err)
 	}
 
-	catalog, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSource")
-	catalogNS, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSourceNamespace")
+	catalog, _, _ = unstructured.NestedString(pm.Object, "status", "catalogSource")
+	catalogNS, _, _ = unstructured.NestedString(pm.Object, "status", "catalogSourceNamespace")
+	channel, _, _ = unstructured.NestedString(pm.Object, "status", "defaultChannel")
 	if catalog == "" {
-		return "", "", fmt.Errorf("PackageManifest %q has no catalogSource in status", pkg)
+		return "", "", "", fmt.Errorf("PackageManifest %q has no catalogSource in status", pkg)
 	}
 
-	return catalog, catalogNS, nil
+	return catalog, catalogNS, channel, nil
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
 
 	for _, op := range airgappedOperators {
-		catalog, catalogNS, err := r.discoverCatalogForPackage(ctx, op.pkg)
+		catalog, catalogNS, channel, err := r.discoverPackageInfo(ctx, op.pkg)
 		if err != nil {
 			logger.Info("Package not available yet, skipping subscription", "package", op.pkg, "error", err.Error())
 			continue
 		}
 		op.catalog = catalog
 		op.catalogNS = catalogNS
+		op.channel = channel
 
 		if err := r.ensureNamespace(ctx, op.ns); err != nil {
 			return fmt.Errorf("namespace for %s: %w", op.name, err)
