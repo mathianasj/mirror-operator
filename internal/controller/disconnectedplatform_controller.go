@@ -9132,17 +9132,27 @@ fetch_oidc_token() {
 
 sign_file() {
   local filepath="$1"
+  local max_retries=3
+  local attempt=0
   echo "Signing $filepath ($(du -h "$filepath" | cut -f1))"
-  # Fetch a fresh OIDC token before each signing to avoid expiry
-  local token=$(fetch_oidc_token)
-  cosign sign-blob \
-    --fulcio-url=$(params.fulcio-url) \
-    --rekor-url=$(params.rekor-url) \
-    --oidc-issuer=$(params.oidc-issuer) \
-    --identity-token="$token" \
-    --yes \
-    --bundle="${filepath}.bundle" \
-    "$filepath" > "${filepath}.sig" || echo "Failed to sign $filepath"
+  while [ $attempt -lt $max_retries ]; do
+    attempt=$((attempt + 1))
+    local token=$(fetch_oidc_token)
+    if cosign sign-blob \
+      --fulcio-url=$(params.fulcio-url) \
+      --rekor-url=$(params.rekor-url) \
+      --oidc-issuer=$(params.oidc-issuer) \
+      --identity-token="$token" \
+      --yes \
+      --bundle="${filepath}.bundle" \
+      "$filepath" > "${filepath}.sig" 2>&1; then
+      echo "  ✓ Signed successfully"
+      return 0
+    fi
+    echo "  Signing attempt $attempt/$max_retries failed, retrying in 10s..."
+    sleep 10
+  done
+  echo "  Failed to sign $filepath after $max_retries attempts"
 }
 
 # Sign small files first (fast, validates the signing pipeline works)
