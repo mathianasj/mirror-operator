@@ -8382,6 +8382,28 @@ process_image() {
     fi
   fi
 
+  # Check TPA before scanning to avoid slow syft scan for existing SBOMs
+  local fixed_source_pre="${source//localhost:55000/$SCAN_FROM_REGISTRY}"
+  local src_no_proto_pre="${fixed_source_pre#docker://}"
+  local doc_ns_pre="https://mirror-operator/sboms/${src_no_proto_pre}"
+  refresh_tpa_token
+  local tpa_check_resp tpa_check_code tpa_check_body
+  tpa_check_resp=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+    -H "Authorization: Bearer $TPA_TOKEN" \
+    "https://$(params.tpa-host)/api/v2/sbom?q=$(printf '%s' "$doc_ns_pre" | jq -sRr @uri)" 2>/dev/null)
+  tpa_check_code=$(echo "$tpa_check_resp" | grep "HTTP_CODE:" | cut -d: -f2)
+  tpa_check_body=$(echo "$tpa_check_resp" | grep -v "HTTP_CODE:")
+  if [ "$tpa_check_code" = "200" ]; then
+    local tpa_exists
+    tpa_exists=$(echo "$tpa_check_body" | jq '.items | length // 0' 2>/dev/null)
+    if [ "$tpa_exists" -gt 0 ] 2>/dev/null; then
+      local fixed_dest_pre="${dest_no_proto//localhost:55000/$SCAN_FROM_REGISTRY}"
+      echo "  [$idx/$image_count] TPA exists: $fixed_dest_pre"
+      echo $(( $(cat "$COUNTER_DIR/cached") + 1 )) > "$COUNTER_DIR/cached"
+      return
+    fi
+  fi
+
   # Scan image
   local IMAGE
   if [ -n "$SCAN_FROM_REGISTRY" ]; then
