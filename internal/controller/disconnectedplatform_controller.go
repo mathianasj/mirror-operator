@@ -7911,6 +7911,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2"},
 		{"name": "working-pvc-name", "type": "string", "description": "PVC for working directory/cache"},
 		{"name": "collection-name", "type": "string", "description": "Name of the CollectionPipeline resource"},
+		{"name": "parent-pipeline", "type": "string", "default": "", "description": "Parent pipeline name (non-empty for update/child collections)"},
 		{"name": "intermediate-registry", "type": "string", "default": "", "description": "Intermediate registry for m2m workflow (empty = local cache)"},
 		{"name": "has-keyless-signing", "type": "string", "default": "false", "description": "Enable keyless signing"},
 		{"name": "fulcio-url", "type": "string", "default": ""},
@@ -8587,6 +8588,7 @@ fi
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
+touch /workspace/output/.mirror-marker
 oc-mirror \
   --v2 \
   --config=/workspace/config/imageset-config.yaml \
@@ -8627,6 +8629,7 @@ oc-mirror \
 						"args": []string{`
 set -e
 echo "=== Mirroring FROM intermediate registry TO disk ==="
+touch /workspace/output/.mirror-marker
 
 # Setup temp and cache directories on PVC (not ephemeral storage)
 mkdir -p /workspace/output/tmp
@@ -9325,9 +9328,9 @@ echo "Uploaded $uploaded_tpa additional SBOMs to TPA"
 # === Build Bundle SBOM ===
 echo "--- Building Bundle SBOM ---"
 
-BUNDLE_FILE=$(find /workspace/output -maxdepth 1 -name "*-complete.tar" -type f | head -1)
+BUNDLE_FILE=$(find /workspace/output -maxdepth 1 \( -name "*-complete.tar" -o -name "*-update.tar" \) -type f | head -1)
 if [ -z "$BUNDLE_FILE" ]; then
-  echo "No complete bundle file found, skipping bundle SBOM creation"
+  echo "No bundle file found, skipping bundle SBOM creation"
   exit 0
 fi
 
@@ -9763,54 +9766,88 @@ if [ -f "/workspace/config/imageset-config.yaml" ]; then
 fi
 
 COLLECTION_NAME="$(params.collection-name)"
-FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
+PARENT_PIPELINE="$(params.parent-pipeline)"
 
-# Collect mirror tar files (will be added under archives/ prefix via --transform)
-MIRROR_TARS=$(ls -1 mirror_*.tar 2>/dev/null || echo "")
+# Collect mirror tar files
+if [ -n "$PARENT_PIPELINE" ] && [ -f ".mirror-marker" ]; then
+  # Update collection: only include NEW tars created during this run
+  MIRROR_TARS=$(find . -maxdepth 1 -name "mirror_*.tar" -newer .mirror-marker -type f -printf '%f\n' 2>/dev/null | sort)
+  if [ -z "$MIRROR_TARS" ]; then
+    # Fallback for systems without -printf
+    MIRROR_TARS=$(find . -maxdepth 1 -name "mirror_*.tar" -newer .mirror-marker -type f 2>/dev/null | sed 's|^\./||' | sort)
+  fi
+  echo "Found NEW mirror tars for update bundle: $MIRROR_TARS"
+else
+  MIRROR_TARS=$(ls -1 mirror_*.tar 2>/dev/null || echo "")
+fi
+
 if [ -z "$MIRROR_TARS" ]; then
   echo "WARNING: No oc-mirror .tar bundle found"
 fi
 
-# Build small files list (everything except mirror tars)
-SMALL_CONTENTS="airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
+if [ -n "$PARENT_PIPELINE" ]; then
+  # Update/child collection: lightweight bundle with only delta content
+  FINAL_BUNDLE_NAME="${COLLECTION_NAME}-update.tar"
+  echo "=== Creating lightweight update bundle ==="
 
-if [ -f "imageset-config.yaml" ]; then
-  echo "Including ImageSetConfiguration in bundle"
-  SMALL_CONTENTS="$SMALL_CONTENTS imageset-config.yaml"
+  SMALL_CONTENTS=""
+  if [ -f "imageset-config.yaml" ]; then
+    SMALL_CONTENTS="$SMALL_CONTENTS imageset-config.yaml"
+  fi
+  if [ -f "idms-oc-mirror.yaml" ]; then
+    SMALL_CONTENTS="$SMALL_CONTENTS idms-oc-mirror.yaml"
+  fi
+  if [ -f "itms-oc-mirror.yaml" ]; then
+    SMALL_CONTENTS="$SMALL_CONTENTS itms-oc-mirror.yaml"
+  fi
+
+  if [ -n "$SMALL_CONTENTS" ]; then
+    tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
+  fi
+
+  if [ -n "$MIRROR_TARS" ]; then
+    echo "=== Appending mirror archives ($(du -sh $MIRROR_TARS | cut -f1)) ==="
+    if [ -f "$FINAL_BUNDLE_NAME" ]; then
+      tar -b 2048 -rf "$FINAL_BUNDLE_NAME" --transform='s,^,archives/,' $MIRROR_TARS
+    else
+      tar -b 2048 -cf "$FINAL_BUNDLE_NAME" --transform='s,^,archives/,' $MIRROR_TARS
+    fi
+  fi
+else
+  # Root collection: full standalone bundle
+  FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
+  echo "=== Creating full bundle ==="
+
+  SMALL_CONTENTS="airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
+
+  if [ -f "imageset-config.yaml" ]; then
+    echo "Including ImageSetConfiguration in bundle"
+    SMALL_CONTENTS="$SMALL_CONTENTS imageset-config.yaml"
+  fi
+
+  if [ -f "idms-oc-mirror.yaml" ]; then
+    SMALL_CONTENTS="$SMALL_CONTENTS idms-oc-mirror.yaml"
+  fi
+  if [ -f "itms-oc-mirror.yaml" ]; then
+    SMALL_CONTENTS="$SMALL_CONTENTS itms-oc-mirror.yaml"
+  fi
+
+  if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
+    echo "Including CLI tools in bundle"
+    SMALL_CONTENTS="$SMALL_CONTENTS cli-tools"
+  fi
+
+  tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
+
+  if [ -n "$MIRROR_TARS" ]; then
+    echo "=== Appending mirror archives ($(du -sh $MIRROR_TARS | cut -f1)) ==="
+    tar -b 2048 -rf "$FINAL_BUNDLE_NAME" --transform='s,^,archives/,' $MIRROR_TARS
+  fi
 fi
-
-if [ -f "idms-oc-mirror.yaml" ]; then
-  SMALL_CONTENTS="$SMALL_CONTENTS idms-oc-mirror.yaml"
-fi
-if [ -f "itms-oc-mirror.yaml" ]; then
-  SMALL_CONTENTS="$SMALL_CONTENTS itms-oc-mirror.yaml"
-fi
-
-if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
-  echo "Including CLI tools in bundle"
-  SMALL_CONTENTS="$SMALL_CONTENTS cli-tools"
-fi
-
-# Phase 1: Create tar with small files (~2.5GB, fast)
-# Use 1MB block size (-b 2048) for better I/O throughput on block storage
-echo "=== Creating bundle (small files) ==="
-tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
-
-# Phase 2: Append mirror tars under archives/ prefix using --transform
-# This avoids creating an archives/ directory and moving 69GB+ files into it
-if [ -n "$MIRROR_TARS" ]; then
-  echo "=== Appending mirror archives ($(du -sh $MIRROR_TARS | cut -f1)) ==="
-  tar -b 2048 -rf "$FINAL_BUNDLE_NAME" --transform='s,^,archives/,' $MIRROR_TARS
-fi
-
-# Clean up source files to free PVC space
-rm -rf $SMALL_CONTENTS $MIRROR_TARS
 
 echo "Bundle contents:"
-echo "$SMALL_CONTENTS" | tr ' ' '\n'
-if [ -n "$MIRROR_TARS" ]; then
-  echo "$MIRROR_TARS" | sed 's/^/archives\//'
-fi
+tar tf "$FINAL_BUNDLE_NAME" | head -20
+echo "..."
 
 echo "Final bundle created: $FINAL_BUNDLE_NAME"
 ls -lh "$FINAL_BUNDLE_NAME"
@@ -9853,15 +9890,19 @@ echo "Uploading artifacts to S3..."
 # Collection name from working-pvc-name (format: collection-storage-<name>)
 COLLECTION_NAME="$(params.collection-name)"
 
-# Upload only the final complete bundle and its signature/attestation
+# Upload only the final bundle and its signature/attestation
 BUNDLE_FILE=""
 SIG_FILE=""
 
-# The final bundle is named ${COLLECTION_NAME}-complete.tar from repackage-bundle
-FINAL_BUNDLE="/workspace/output/${COLLECTION_NAME}-complete.tar"
+# Determine bundle filename based on whether this is an update or root collection
+if [ -n "$(params.parent-pipeline)" ]; then
+  BUNDLE_FILENAME="${COLLECTION_NAME}-update.tar"
+else
+  BUNDLE_FILENAME="${COLLECTION_NAME}-complete.tar"
+fi
+FINAL_BUNDLE="/workspace/output/${BUNDLE_FILENAME}"
 
 if [ -f "$FINAL_BUNDLE" ]; then
-  BUNDLE_FILENAME="${COLLECTION_NAME}-complete.tar"
   echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
   aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
@@ -9962,64 +10003,6 @@ fi
 			},
 		},
 
-		// Task 14: cleanup-working-storage (remove artifacts, keep caches for child runs)
-		{
-			"name":     "cleanup-working-storage",
-			"runAfter": []string{"upload-to-s3"},
-			"taskSpec": map[string]interface{}{
-				"steps": []map[string]interface{}{
-					{
-						"name":    "cleanup",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
-						"command": []string{"/bin/sh", "-c"},
-						"args": []string{`
-set -e
-echo "=== Cleaning up working storage after S3 upload ==="
-echo "=== Disk usage BEFORE cleanup ==="
-df -h /workspace/output
-du -sh /workspace/output/* 2>/dev/null || true
-
-cd /workspace/output
-
-# Remove bundle artifacts
-rm -f *.tar *.tar.gz *.sig *.bundle
-rm -rf archives/
-
-# Remove SBOMs (but keep sbom-cache for incremental runs)
-rm -rf sboms/
-
-# Remove exported architect images and import script
-rm -f airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz
-rm -f import-airgap-architect.sh
-
-# Remove CLI tools
-rm -rf cli-tools/
-
-# Remove temp files and container storage
-rm -rf tmp/
-rm -rf containers/
-rm -f storage.conf
-
-# Remove copied config files
-rm -f imageset-config.yaml
-rm -f idms-oc-mirror.yaml itms-oc-mirror.yaml
-
-echo ""
-echo "=== Disk usage AFTER cleanup ==="
-df -h /workspace/output
-du -sh /workspace/output/* 2>/dev/null || true
-echo ""
-echo "=== Preserved directories ==="
-ls -la /workspace/output/
-echo "=== Cleanup complete ==="
-`},
-					},
-				},
-			},
-			"workspaces": []map[string]interface{}{
-				{"name": "output"},
-			},
-		},
 	}
 }
 
