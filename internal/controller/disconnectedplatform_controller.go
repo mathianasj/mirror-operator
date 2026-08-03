@@ -7536,251 +7536,6 @@ func (r *DisconnectedPlatformReconciler) syncS3ConfigToSecret(ctx context.Contex
 	return nil
 }
 
-// ensureQuayRobotAccount creates or retrieves a robot account in Quay
-func (r *DisconnectedPlatformReconciler) ensureQuayRobotAccount(ctx context.Context, quayURL, hostname, orgName, robotShortName string) (string, error) {
-	logger := log.FromContext(ctx)
-
-	// First, ensure there's a user to create the robot account
-	// Check if we have saved admin credentials in a secret
-	adminSecret := &corev1.Secret{}
-	adminSecretName := "quay-admin-credentials"
-	adminUser := "admin"
-	adminPassword := ""
-
-	err := r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: architectNamespace}, adminSecret)
-	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return "", err
-		}
-
-		// Admin secret doesn't exist - try to initialize Quay with admin user
-		logger.Info("Initializing Quay with admin user")
-		adminPassword = generateRandomPassword(16)
-
-		// Try user initialization endpoint
-		initData := map[string]interface{}{
-			"username":     adminUser,
-			"password":     adminPassword,
-			"email":        "admin@example.com",
-			"access_token": true,
-		}
-
-		client := &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-			Timeout: 10 * time.Second,
-		}
-
-		initBody, _ := json.Marshal(initData)
-		resp, err := client.Post(quayURL+"/api/v1/user/initialize", "application/json", bytes.NewReader(initBody))
-		if err != nil {
-			logger.Info("Failed to initialize Quay user (may already exist)", "error", err.Error())
-		} else {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				logger.Info("Successfully initialized Quay admin user")
-
-				// Save admin credentials for future use
-				adminSecret = &corev1.Secret{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      adminSecretName,
-						Namespace: architectNamespace,
-					},
-					StringData: map[string]string{
-						"username": adminUser,
-						"password": adminPassword,
-					},
-					Type: corev1.SecretTypeOpaque,
-				}
-				if err := r.Create(ctx, adminSecret); err != nil {
-					logger.Error(err, "failed to save admin credentials")
-				}
-			} else {
-				bodyBytes, _ := io.ReadAll(resp.Body)
-				logger.Info("Quay initialization response", "status", resp.StatusCode, "body", string(bodyBytes))
-			}
-		}
-	} else {
-		// Load saved admin credentials
-		adminPassword = string(adminSecret.Data["password"])
-		if savedUser := string(adminSecret.Data["username"]); savedUser != "" {
-			adminUser = savedUser
-		}
-	}
-
-	// If we still don't have admin password, generate one and try to create user directly
-	if adminPassword == "" {
-		logger.Info("No admin credentials available, attempting to create user via API")
-		adminPassword = generateRandomPassword(16)
-	}
-
-	// Create organization if it doesn't exist
-	if err := r.ensureQuayOrganization(ctx, quayURL, adminUser, adminPassword, orgName); err != nil {
-		logger.Error(err, "failed to ensure Quay organization", "org", orgName)
-	}
-
-	// Create or get robot account
-	robotFullName := orgName + "+" + robotShortName
-	robotToken, err := r.createQuayRobotAccount(ctx, quayURL, adminUser, adminPassword, orgName, robotShortName)
-	if err != nil {
-		return "", fmt.Errorf("failed to create robot account: %w", err)
-	}
-
-	// Save robot credentials to a secret for reuse
-	robotSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "quay-robot-credentials",
-			Namespace: architectNamespace,
-		},
-		StringData: map[string]string{
-			"username": robotFullName,
-			"token":    robotToken,
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-
-	existing := &corev1.Secret{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(robotSecret), existing); err == nil {
-		// Update existing
-		robotSecret.ResourceVersion = existing.ResourceVersion
-		if err := r.Update(ctx, robotSecret); err != nil {
-			logger.Error(err, "failed to update robot credentials secret")
-		}
-	} else if apierrors.IsNotFound(err) {
-		// Create new
-		if err := r.Create(ctx, robotSecret); err != nil {
-			logger.Error(err, "failed to create robot credentials secret")
-		}
-	}
-
-	logger.Info("Robot account ready", "robot", robotFullName)
-	return robotToken, nil
-}
-
-// ensureQuayOrganization creates an organization in Quay if it doesn't exist
-func (r *DisconnectedPlatformReconciler) ensureQuayOrganization(ctx context.Context, quayURL, username, password, orgName string) error {
-	logger := log.FromContext(ctx)
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	// Check if organization exists
-	req, _ := http.NewRequest("GET", quayURL+"/api/v1/organization/"+orgName, nil)
-	req.SetBasicAuth(username, password)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		logger.Info("Quay organization already exists", "org", orgName)
-		return nil
-	}
-
-	// Create organization
-	logger.Info("Creating Quay organization", "org", orgName)
-	orgData := map[string]interface{}{
-		"name":  orgName,
-		"email": "mirror@example.com",
-	}
-
-	orgBody, _ := json.Marshal(orgData)
-	req, _ = http.NewRequest("POST", quayURL+"/api/v1/organization/", bytes.NewReader(orgBody))
-	req.SetBasicAuth(username, password)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create organization: %s (status %d)", string(bodyBytes), resp.StatusCode)
-	}
-
-	logger.Info("Successfully created Quay organization", "org", orgName)
-	return nil
-}
-
-// createQuayRobotAccount creates a robot account in Quay and returns its token
-func (r *DisconnectedPlatformReconciler) createQuayRobotAccount(ctx context.Context, quayURL, username, password, orgName, robotName string) (string, error) {
-	logger := log.FromContext(ctx)
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 10 * time.Second,
-	}
-
-	// Check if robot already exists
-	robotFullName := orgName + "+" + robotName
-	req, _ := http.NewRequest("GET", quayURL+"/api/v1/organization/"+orgName+"/robots/"+robotName, nil)
-	req.SetBasicAuth(username, password)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		// Robot exists, get its token
-		var robotData map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&robotData); err != nil {
-			return "", err
-		}
-
-		if token, ok := robotData["token"].(string); ok && token != "" {
-			logger.Info("Using existing robot account", "robot", robotFullName)
-			return token, nil
-		}
-	}
-
-	// Create new robot account
-	logger.Info("Creating robot account", "robot", robotFullName)
-	robotData := map[string]interface{}{
-		"description": "Mirror operator robot account for image mirroring",
-	}
-
-	robotBody, _ := json.Marshal(robotData)
-	req, _ = http.NewRequest("PUT", quayURL+"/api/v1/organization/"+orgName+"/robots/"+robotName, bytes.NewReader(robotBody))
-	req.SetBasicAuth(username, password)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err = client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create robot account: %s (status %d)", string(bodyBytes), resp.StatusCode)
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	token, ok := result["token"].(string)
-	if !ok || token == "" {
-		return "", fmt.Errorf("robot account created but no token returned")
-	}
-
-	logger.Info("Successfully created robot account", "robot", robotFullName)
-	return token, nil
-}
 
 // mergeQuayCredentialsIntoPullSecret adds Quay robot credentials to the pull-secret
 func (r *DisconnectedPlatformReconciler) mergeQuayCredentialsIntoPullSecret(ctx context.Context, hostname, username, token string) error {
@@ -7981,144 +7736,6 @@ func (r *DisconnectedPlatformReconciler) execCommandInPod(ctx context.Context, n
 	return nil
 }
 
-// ensureQuayOrganizationViaAPI creates organization using REST API
-func (r *DisconnectedPlatformReconciler) ensureQuayOrganizationViaAPI(ctx context.Context, quayURL, apiToken, orgName string) error {
-	logger := log.FromContext(ctx)
-
-	// Check if organization exists
-	checkURL := quayURL + "/api/v1/organization/" + orgName
-	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to check organization: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		logger.Info("Organization already exists", "org", orgName)
-		return nil
-	}
-
-	// Create organization
-	createURL := quayURL + "/api/v1/organization/"
-	payload := map[string]interface{}{
-		"name": orgName,
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	req, err = http.NewRequestWithContext(ctx, "POST", createURL, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err = client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to create organization: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create organization (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	logger.Info("Successfully created organization", "org", orgName)
-	return nil
-}
-
-// ensureQuayRobotViaAPI creates or retrieves a robot account using REST API
-func (r *DisconnectedPlatformReconciler) ensureQuayRobotViaAPI(ctx context.Context, quayURL, apiToken, orgName, robotShortName string) (string, error) {
-	logger := log.FromContext(ctx)
-
-	// Create or update robot account
-	robotURL := quayURL + "/api/v1/organization/" + orgName + "/robots/" + robotShortName
-	payload := map[string]interface{}{
-		"description": "Mirror operator robot account",
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "PUT", robotURL, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to create robot: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create robot (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	// Parse response to get robot token
-	var robotResp map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&robotResp); err != nil {
-		return "", fmt.Errorf("failed to parse robot response: %w", err)
-	}
-
-	token, ok := robotResp["token"].(string)
-	if !ok || token == "" {
-		return "", fmt.Errorf("robot response missing token field")
-	}
-
-	logger.Info("Successfully created/updated robot account", "org", orgName, "robot", robotShortName)
-
-	// Add robot to owners team for admin permissions
-	if err := r.addRobotToOwnersTeam(ctx, quayURL, apiToken, orgName, robotShortName); err != nil {
-		logger.Error(err, "failed to add robot to owners team, continuing anyway")
-	}
-
-	return token, nil
-}
-
-// addRobotToOwnersTeam adds robot to the owners team for admin permissions
-func (r *DisconnectedPlatformReconciler) addRobotToOwnersTeam(ctx context.Context, quayURL, apiToken, orgName, robotShortName string) error {
-	logger := log.FromContext(ctx)
-	robotFullName := orgName + "+" + robotShortName
-
-	teamURL := quayURL + "/api/v1/organization/" + orgName + "/team/owners/members/" + robotFullName
-	req, err := http.NewRequestWithContext(ctx, "PUT", teamURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to add robot to team: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to add robot to team (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	logger.Info("Successfully added robot to owners team", "robot", robotFullName)
-	return nil
-}
-
 // saveQuayRobotCredentials saves robot credentials to a secret for reuse
 func (r *DisconnectedPlatformReconciler) saveQuayRobotCredentials(ctx context.Context, robotName, robotToken string) error {
 	secret := &corev1.Secret{}
@@ -8202,6 +7819,16 @@ try:
         print(f"Robot {robot_full_name} already exists", file=sys.stderr)
         # Get the robot's token
         robot_token = model.user.retrieve_robot_token(existing_robot)
+
+        # Ensure robot is in owners team (may have been missed on initial creation)
+        try:
+            owners_team = model.team.get_organization_team(org_name, "owners")
+            from data.database import TeamMember
+            TeamMember.get_or_create(user=existing_robot, team=owners_team)
+            print(f"Ensured robot is in owners team", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not verify robot owners team membership: {e}", file=sys.stderr)
+
         print(robot_token)
     except:
         print(f"Creating robot {robot_full_name}", file=sys.stderr)
@@ -8456,10 +8083,15 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $SUCCESS -eq 0 ]; do
     --workspace=file:///workspace/output/workspace-to-intermediate \
     docker://$(params.intermediate-registry) 2>&1 | tee "$OUTPUT_FILE" || true
 
-  if grep -q "✓.*release images mirrored successfully" "$OUTPUT_FILE" || \
-     grep -q "✓.*operator images mirrored successfully" "$OUTPUT_FILE" || \
-     grep -q "✓.*additional images mirrored successfully" "$OUTPUT_FILE"; then
-    echo "=== Mirror completed successfully (detected success message) ==="
+  if grep -q "✗" "$OUTPUT_FILE"; then
+    echo "=== Mirror completed with errors (some images failed to mirror) ==="
+    grep "✗" "$OUTPUT_FILE"
+    grep "\[ERROR\]" "$OUTPUT_FILE" || true
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+  elif grep -q "✓.*release images mirrored successfully" "$OUTPUT_FILE" || \
+       grep -q "✓.*operator images mirrored successfully" "$OUTPUT_FILE" || \
+       grep -q "✓.*additional images mirrored successfully" "$OUTPUT_FILE"; then
+    echo "=== Mirror completed successfully (all images mirrored) ==="
     SUCCESS=1
     break
   else
