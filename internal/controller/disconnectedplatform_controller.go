@@ -7910,6 +7910,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "config-map-name", "type": "string", "description": "ConfigMap containing ImageSetConfiguration"},
 		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2"},
 		{"name": "working-pvc-name", "type": "string", "description": "PVC for working directory/cache"},
+		{"name": "collection-name", "type": "string", "description": "Name of the CollectionPipeline resource"},
 		{"name": "intermediate-registry", "type": "string", "default": "", "description": "Intermediate registry for m2m workflow (empty = local cache)"},
 		{"name": "has-keyless-signing", "type": "string", "default": "false", "description": "Enable keyless signing"},
 		{"name": "fulcio-url", "type": "string", "default": ""},
@@ -9240,7 +9241,7 @@ postprocess_sbom() {
 refresh_tpa_token
 uploaded_tpa=0
 
-COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+COLLECTION_NAME="$(params.collection-name)"
 mkdir -p /workspace/output/sboms
 
 # === Scan Architect Images ===
@@ -9470,7 +9471,7 @@ refresh_token() {
 refresh_token
 
 # Get collection name from working PVC
-COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+COLLECTION_NAME="$(params.collection-name)"
 
 upload_sbom() {
   local sbom_file="$1"
@@ -9761,7 +9762,7 @@ if [ -f "/workspace/config/imageset-config.yaml" ]; then
   cp /workspace/config/imageset-config.yaml .
 fi
 
-COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+COLLECTION_NAME="$(params.collection-name)"
 FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
 
 # Collect mirror tar files (will be added under archives/ prefix via --transform)
@@ -9850,7 +9851,7 @@ set -ex
 echo "Uploading artifacts to S3..."
 
 # Collection name from working-pvc-name (format: collection-storage-<name>)
-COLLECTION_NAME=$(echo "$(params.working-pvc-name)" | sed 's/collection-storage-//')
+COLLECTION_NAME="$(params.collection-name)"
 
 # Upload only the final complete bundle and its signature/attestation
 BUNDLE_FILE=""

@@ -653,6 +653,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		{Name: "config-map-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: cm.Name}},
 		{Name: "mirror-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getMirrorImage()}},
 		{Name: "working-pvc-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: workingPVCName}},
+		{Name: "collection-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: pipeline.Name}},
 	}
 
 	// Determine intermediate registry (for m2m workflow)
