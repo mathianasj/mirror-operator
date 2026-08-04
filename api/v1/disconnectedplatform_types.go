@@ -66,6 +66,7 @@ type ConnectedConfig struct {
 // RHCOSCollectionConfig controls downloading RHCOS boot images and packaging them into a server container image
 type RHCOSCollectionConfig struct {
 	// Enable RHCOS image download and server image build in the collection pipeline
+	// +kubebuilder:default=true
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 	// Base image for the RHCOS server container (nginx serving RHCOS files)

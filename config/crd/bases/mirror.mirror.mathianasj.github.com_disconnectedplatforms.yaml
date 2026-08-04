@@ -674,6 +674,7 @@ spec:
                       airgapped environments
                     properties:
                       enabled:
+                        default: true
                         description: Enable RHCOS image download and server image
                           build in the collection pipeline
                         type: boolean

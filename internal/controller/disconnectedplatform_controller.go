@@ -7948,7 +7948,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
 		{"name": "sbom-parallel-jobs", "type": "string", "default": "8", "description": "Number of parallel syft SBOM scans"},
-		{"name": "rhcos-download-enabled", "type": "string", "default": "false", "description": "Download RHCOS boot images for ACM host inventory"},
+		{"name": "rhcos-download-enabled", "type": "string", "default": "true", "description": "Download RHCOS boot images for ACM host inventory"},
 		{"name": "rhcos-server-base-image", "type": "string", "default": "registry.access.redhat.com/ubi9/nginx-122:latest", "description": "Base image for RHCOS server container"},
 	}
 

@@ -788,11 +788,13 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "cli-tools-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: "true"}},
 	)
 
-	// Add RHCOS collection parameters
-	rhcosEnabled := "false"
+	// Add RHCOS collection parameters (enabled by default)
+	rhcosEnabled := "true"
 	rhcosServerBaseImage := "registry.access.redhat.com/ubi9/nginx-122:latest"
-	if platform != nil && platform.Spec.Connected != nil && platform.Spec.Connected.RHCOSCollection != nil && platform.Spec.Connected.RHCOSCollection.Enabled {
-		rhcosEnabled = "true"
+	if platform != nil && platform.Spec.Connected != nil && platform.Spec.Connected.RHCOSCollection != nil {
+		if !platform.Spec.Connected.RHCOSCollection.Enabled {
+			rhcosEnabled = "false"
+		}
 		if platform.Spec.Connected.RHCOSCollection.ServerBaseImage != "" {
 			rhcosServerBaseImage = platform.Spec.Connected.RHCOSCollection.ServerBaseImage
 		}
@@ -987,7 +989,10 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 	if err != nil || platform == nil {
 		return configYAML, nil
 	}
-	if platform.Spec.Connected == nil || platform.Spec.Connected.RHCOSCollection == nil || !platform.Spec.Connected.RHCOSCollection.Enabled {
+	if platform.Spec.Connected == nil {
+		return configYAML, nil
+	}
+	if platform.Spec.Connected.RHCOSCollection != nil && !platform.Spec.Connected.RHCOSCollection.Enabled {
 		return configYAML, nil
 	}
 	if intermediateRegistry == "" {
