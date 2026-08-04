@@ -49,7 +49,7 @@ const (
 	defaultPullSecretName = "pull-secret"
 	defaultPullSecretNS   = "openshift-config"
 	pullSecretVolumeName = "pull-secret"
-	pullSecretMountPath  = "/etc/pull-secret"
+	pullSecretMountPath  = "/opt/app-root/src/.openshift"
 	pullSecretFile       = "pull-secret"
 	pullSecretKey        = ".dockerconfigjson"
 )
@@ -5737,7 +5737,7 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			},
 			map[string]interface{}{
 				"name":  "PULL_SECRET_FILE",
-				"value": pullSecretMountPath + "/" + pullSecretKey,
+				"value": pullSecretMountPath + "/" + pullSecretFile,
 			},
 			map[string]interface{}{
 				"name":  "OPENSHIFT_OPERATOR_MANAGED",
@@ -6362,6 +6362,9 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"name": pullSecretVolumeName,
 			"secret": map[string]interface{}{
 				"secretName": pullSecretName,
+				"items": []map[string]interface{}{
+					{"key": pullSecretKey, "path": pullSecretFile},
+				},
 			},
 		})
 	}
