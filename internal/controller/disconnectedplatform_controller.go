@@ -9900,23 +9900,25 @@ INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
 
 RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
 
-# Create container from nginx base (rootless with vfs, chroot isolation)
-CONTAINER=$(buildah --storage-driver=vfs --isolation=chroot from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
-
-# Copy RHCOS files into nginx serving directory
-buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/rhcos-live.x86_64.iso" "/opt/app-root/src/rhcos-live.x86_64.iso"
-buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" "/opt/app-root/src/rhcos-live-rootfs.x86_64.img"
-buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/RHCOS_VERSION.txt" "/opt/app-root/src/RHCOS_VERSION.txt"
-
-# Set labels
-buildah --storage-driver=vfs config --label "io.openshift.rhcos.version=${RHCOS_VERSION}" $CONTAINER
-buildah --storage-driver=vfs config --label "io.openshift.mirror-operator/component=rhcos-server" $CONTAINER
-
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
 
-# Commit and push to intermediate registry
-buildah --storage-driver=vfs commit $CONTAINER "$FULL_IMAGE"
-buildah --storage-driver=vfs push --authfile=/workspace/pull-secret/.dockerconfigjson "$FULL_IMAGE" "docker://${FULL_IMAGE}"
+cat > "$RHCOS_DIR/Containerfile" <<CEOF
+FROM ${BASE_IMAGE}
+COPY rhcos-live.x86_64.iso /opt/app-root/src/rhcos-live.x86_64.iso
+COPY rhcos-live-rootfs.x86_64.img /opt/app-root/src/rhcos-live-rootfs.x86_64.img
+COPY RHCOS_VERSION.txt /opt/app-root/src/RHCOS_VERSION.txt
+LABEL io.openshift.rhcos.version="${RHCOS_VERSION}"
+LABEL io.openshift.mirror-operator/component="rhcos-server"
+CEOF
+
+buildah bud --storage-driver=vfs --isolation=chroot \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  -t "$FULL_IMAGE" \
+  -f "$RHCOS_DIR/Containerfile" \
+  "$RHCOS_DIR"
+
+buildah push --storage-driver=vfs --authfile=/workspace/pull-secret/.dockerconfigjson \
+  "$FULL_IMAGE" "docker://${FULL_IMAGE}"
 
 echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
