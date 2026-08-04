@@ -8031,9 +8031,10 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 // All tasks are defined with 'when' expressions - Tekton will skip tasks based on params
 func (r *DisconnectedPlatformReconciler) buildPipelineTasks() []map[string]interface{} {
 	return []map[string]interface{}{
-		// Task 1: dry-run (only for m2m workflow)
+		// Task 1: dry-run (only for m2m workflow, runs after RHCOS server image is pushed so it appears in mapping.txt)
 		{
-			"name": "dry-run",
+			"name":     "dry-run",
+			"runAfter": []string{"build-rhcos-server"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
 			},
@@ -8066,7 +8067,7 @@ oc-mirror \
 		// Task 2: mirror-to-intermediate (only for m2m workflow, waits for RHCOS server image if enabled)
 		{
 			"name":     "mirror-to-intermediate",
-			"runAfter": []string{"dry-run", "build-rhcos-server"},
+			"runAfter": []string{"dry-run"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
 			},
@@ -9794,9 +9795,6 @@ cat "$CLI_DIR/VERSIONS.txt"
 		// Runs early with no dependencies so the RHCOS server image is ready before oc-mirror
 		{
 			"name":     "download-rhcos-images",
-			"when": []map[string]interface{}{
-				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
-			},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -9805,6 +9803,12 @@ cat "$CLI_DIR/VERSIONS.txt"
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
 set -ex
+
+if [ "$(params.rhcos-download-enabled)" != "true" ]; then
+  echo "RHCOS download skipped (rhcos-download-enabled=$(params.rhcos-download-enabled))"
+  exit 0
+fi
+
 echo "=== Downloading RHCOS boot images for ACM Host Inventory ==="
 
 OC_VERSION="$(params.oc-version)"
@@ -9870,10 +9874,6 @@ echo "=== RHCOS download complete ==="
 		{
 			"name":     "build-rhcos-server",
 			"runAfter": []string{"download-rhcos-images"},
-			"when": []map[string]interface{}{
-				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
-				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
-			},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -9885,6 +9885,12 @@ echo "=== RHCOS download complete ==="
 						},
 						"args": []string{`
 set -ex
+
+if [ "$(params.rhcos-download-enabled)" != "true" ] || [ -z "$(params.intermediate-registry)" ]; then
+  echo "RHCOS server build skipped (rhcos-download-enabled=$(params.rhcos-download-enabled), intermediate-registry=$(params.intermediate-registry))"
+  exit 0
+fi
+
 echo "=== Building RHCOS server OCI image ==="
 
 RHCOS_DIR="/workspace/output/rhcos"
