@@ -9900,8 +9900,8 @@ INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
 
 RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
 
-# Create container from nginx base (rootless with vfs)
-CONTAINER=$(buildah --storage-driver=vfs from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
+# Create container from nginx base (rootless with vfs, chroot isolation)
+CONTAINER=$(buildah --storage-driver=vfs --isolation=chroot from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
 
 # Copy RHCOS files into nginx serving directory
 buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/rhcos-live.x86_64.iso" "/opt/app-root/src/rhcos-live.x86_64.iso"
