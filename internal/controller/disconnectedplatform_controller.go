@@ -9844,7 +9844,7 @@ echo "RHCOS downloads:"
 ls -lh "$RHCOS_DIR/"
 
 # Validate file sizes (ISO and rootFS should each be > 500MB)
-for file in "$RHCOS_DIR"/*; do
+for file in "$RHCOS_DIR"/*.iso "$RHCOS_DIR"/*.img; do
   if [ -f "$file" ]; then
     size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
     if [ "$size" -lt 500000000 ]; then
