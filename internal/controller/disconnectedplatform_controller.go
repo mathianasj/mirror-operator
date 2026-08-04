@@ -5694,8 +5694,13 @@ func (r *DisconnectedPlatformReconciler) ensureArchitectBackend(ctx context.Cont
 		githubTokenSecretName = platform.Spec.Architect.GitHubTokenSecret.Name
 	}
 
-	// Create container builder with GitHub token secret
-	containerBuilder := makeBackendContainerBuilder(githubTokenSecretName)
+	deploymentSide := "connected"
+	if platform.Spec.Mode == "airgapped" {
+		deploymentSide = "disconnected"
+	}
+
+	// Create container builder with GitHub token secret and deployment side
+	containerBuilder := makeBackendContainerBuilder(githubTokenSecretName, deploymentSide)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
 		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, containerBuilder)
@@ -5718,7 +5723,7 @@ func architectBackendDeployment(name, image string, replicas int32, labels map[s
 }
 
 // makeBackendContainerBuilder creates a container builder function with GitHub token secret support
-func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder {
+func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) containerBuilder {
 	return func(name, image string, labels map[string]string) map[string]interface{} {
 		env := []interface{}{
 			map[string]interface{}{
@@ -5736,6 +5741,10 @@ func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder 
 			map[string]interface{}{
 				"name":  "OPENSHIFT_OPERATOR_MANAGED",
 				"value": "true",
+			},
+			map[string]interface{}{
+				"name":  "DEPLOYMENT_SIDE",
+				"value": deploymentSide,
 			},
 			map[string]interface{}{
 				"name":  "S3_SECRET_NAME",
@@ -5824,8 +5833,7 @@ func makeBackendContainerBuilder(githubTokenSecretName string) containerBuilder 
 }
 
 func backendContainer(name, image string, labels map[string]string) map[string]interface{} {
-	// Default backend container without GitHub token (deprecated - use makeBackendContainerBuilder)
-	return makeBackendContainerBuilder("")(name, image, labels)
+	return makeBackendContainerBuilder("", "connected")(name, image, labels)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureArchitectService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name string, port int32, labels map[string]string) error {
