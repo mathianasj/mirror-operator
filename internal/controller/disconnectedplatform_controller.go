@@ -5737,7 +5737,7 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			},
 			map[string]interface{}{
 				"name":  "PULL_SECRET_FILE",
-				"value": pullSecretMountPath + "/" + pullSecretFile,
+				"value": pullSecretMountPath + "/" + pullSecretKey,
 			},
 			map[string]interface{}{
 				"name":  "OPENSHIFT_OPERATOR_MANAGED",
@@ -6362,9 +6362,6 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"name": pullSecretVolumeName,
 			"secret": map[string]interface{}{
 				"secretName": pullSecretName,
-				"items": []map[string]interface{}{
-					{"key": pullSecretKey, "path": pullSecretFile},
-				},
 			},
 		})
 	}

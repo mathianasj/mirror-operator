@@ -57,6 +57,10 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || '0.0.1' }}
 
   bundle-and-catalog:
     needs: build-and-push
