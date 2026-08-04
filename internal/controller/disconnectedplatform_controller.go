@@ -48,9 +48,10 @@ const (
 	architectNamespace    = "mirror-operator-system"
 	defaultPullSecretName = "pull-secret"
 	defaultPullSecretNS   = "openshift-config"
-	pullSecretVolumeName  = "pull-secret"
-	pullSecretMountPath   = "/var/run/secrets/openshift.io/pull-secret"
-	pullSecretKey         = ".dockerconfigjson"
+	pullSecretVolumeName = "pull-secret"
+	pullSecretMountPath  = "/run/secrets"
+	pullSecretFile       = "pull-secret"
+	pullSecretKey        = ".dockerconfigjson"
 )
 
 var (
@@ -5736,7 +5737,7 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			},
 			map[string]interface{}{
 				"name":  "PULL_SECRET_FILE",
-				"value": pullSecretMountPath + "/" + pullSecretKey,
+				"value": pullSecretMountPath + "/" + pullSecretFile,
 			},
 			map[string]interface{}{
 				"name":  "OPENSHIFT_OPERATOR_MANAGED",
@@ -5763,7 +5764,8 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			},
 			map[string]interface{}{
 				"name":      pullSecretVolumeName,
-				"mountPath": pullSecretMountPath,
+				"mountPath": pullSecretMountPath + "/" + pullSecretFile,
+				"subPath":   pullSecretKey,
 				"readOnly":  true,
 			},
 			map[string]interface{}{
