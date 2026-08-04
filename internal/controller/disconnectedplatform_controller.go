@@ -9884,6 +9884,11 @@ echo "=== RHCOS download complete ==="
 							{"name": "BUILDAH_ISOLATION", "value": "chroot"},
 							{"name": "STORAGE_DRIVER", "value": "vfs"},
 						},
+						"securityContext": map[string]interface{}{
+							"capabilities": map[string]interface{}{
+								"add": []string{"SETFCAP"},
+							},
+						},
 						"args": []string{`
 set -ex
 
