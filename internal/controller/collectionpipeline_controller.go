@@ -495,8 +495,9 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 		return nil, fmt.Errorf("failed to inject architect images: %w", err)
 	}
 
-	// Inject RHCOS server base image so oc-mirror mirrors it for airgapped deployment
-	enrichedConfig, err = r.injectRHCOSServerImage(ctx, enrichedConfig)
+	// Inject RHCOS server image from intermediate registry so oc-mirror mirrors it for airgapped deployment
+	intReg := r.getIntermediateRegistry(ctx, pipeline)
+	enrichedConfig, err = r.injectRHCOSServerImage(ctx, enrichedConfig, intReg)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to inject RHCOS server image, continuing without it")
 	}
@@ -981,12 +982,15 @@ func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context
 	return string(enrichedYAML), nil
 }
 
-func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Context, configYAML string) (string, error) {
+func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Context, configYAML string, intermediateRegistry string) (string, error) {
 	platform, err := r.findPlatform(ctx)
 	if err != nil || platform == nil {
 		return configYAML, nil
 	}
 	if platform.Spec.Connected == nil || platform.Spec.Connected.RHCOSCollection == nil || !platform.Spec.Connected.RHCOSCollection.Enabled {
+		return configYAML, nil
+	}
+	if intermediateRegistry == "" {
 		return configYAML, nil
 	}
 
@@ -995,11 +999,9 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 		return "", fmt.Errorf("failed to parse ImageSetConfiguration: %w", err)
 	}
 
-	serverBaseImage := "registry.access.redhat.com/ubi9/nginx-122:latest"
-	if platform.Spec.Connected.RHCOSCollection.ServerBaseImage != "" {
-		serverBaseImage = platform.Spec.Connected.RHCOSCollection.ServerBaseImage
-	}
-	serverBaseImage = normalizeImageRef(serverBaseImage)
+	// Extract OCP version for the image tag
+	ocVersion := r.extractOCPVersion(configYAML)
+	rhcosServerImage := fmt.Sprintf("%s/rhcos-server:%s", intermediateRegistry, ocVersion)
 
 	if config.Mirror.AdditionalImages == nil {
 		config.Mirror.AdditionalImages = []ImageConfig{}
@@ -1007,13 +1009,13 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 
 	found := false
 	for _, img := range config.Mirror.AdditionalImages {
-		if img.Name == serverBaseImage {
+		if strings.HasPrefix(img.Name, intermediateRegistry+"/rhcos-server:") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: serverBaseImage})
+		config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: rhcosServerImage})
 	}
 
 	enrichedYAML, err := yaml.Marshal(&config)
@@ -1021,6 +1023,52 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 		return "", fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return string(enrichedYAML), nil
+}
+
+// getIntermediateRegistry returns the intermediate registry URL for the m2m workflow.
+func (r *CollectionPipelineReconciler) getIntermediateRegistry(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) string {
+	platform, err := r.findPlatform(ctx)
+	if err != nil || platform == nil {
+		return ""
+	}
+	if platform.Spec.Connected == nil || platform.Spec.Connected.Quay == nil ||
+		platform.Spec.Connected.Quay.Managed == nil || !platform.Spec.Connected.Quay.Managed.Enabled {
+		return ""
+	}
+	return fmt.Sprintf("mirror-operator-quay-quay-%s.%s/%s",
+		pipeline.Namespace, r.getClusterDomain(ctx), platform.Spec.Connected.Quay.Managed.OrganizationName)
+}
+
+// extractOCPVersion parses the OCP major.minor version from an ImageSetConfiguration YAML.
+func (r *CollectionPipelineReconciler) extractOCPVersion(configYAML string) string {
+	var imageSetConfig map[string]interface{}
+	if err := yaml.Unmarshal([]byte(configYAML), &imageSetConfig); err != nil {
+		return "latest"
+	}
+	if mirror, ok := imageSetConfig["mirror"].(map[string]interface{}); ok {
+		if platformConfig, ok := mirror["platform"].(map[string]interface{}); ok {
+			if channels, ok := platformConfig["channels"].([]interface{}); ok && len(channels) > 0 {
+				if channel, ok := channels[0].(map[string]interface{}); ok {
+					if minVersion, ok := channel["minVersion"].(string); ok && minVersion != "" {
+						// Extract major.minor from e.g. "4.18.3"
+						parts := strings.SplitN(minVersion, ".", 3)
+						if len(parts) >= 2 {
+							return parts[0] + "." + parts[1]
+						}
+						return minVersion
+					}
+					if name, ok := channel["name"].(string); ok {
+						// Extract version from e.g. "stable-4.18"
+						if idx := strings.LastIndex(name, "-"); idx >= 0 {
+							return name[idx+1:]
+						}
+						return name
+					}
+				}
+			}
+		}
+	}
+	return "latest"
 }
 
 // normalizeImageRef ensures image references have a fully qualified registry prefix.

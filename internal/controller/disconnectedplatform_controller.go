@@ -8054,10 +8054,10 @@ oc-mirror \
 			},
 		},
 
-		// Task 2: mirror-to-intermediate (only for m2m workflow)
+		// Task 2: mirror-to-intermediate (only for m2m workflow, waits for RHCOS server image if enabled)
 		{
 			"name":     "mirror-to-intermediate",
-			"runAfter": []string{"dry-run"},
+			"runAfter": []string{"dry-run", "build-rhcos-server"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
 			},
@@ -9782,9 +9782,9 @@ cat "$CLI_DIR/VERSIONS.txt"
 		},
 
 		// Task 10.6: download-rhcos-images (download RHCOS ISO and rootFS for ACM host inventory)
+		// Runs early with no dependencies so the RHCOS server image is ready before oc-mirror
 		{
 			"name":     "download-rhcos-images",
-			"runAfter": []string{"download-cli-tools"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
 			},
@@ -9857,12 +9857,13 @@ echo "=== RHCOS download complete ==="
 			},
 		},
 
-		// Task 10.7: build-rhcos-server (build OCI image with nginx + RHCOS boot files)
+		// Task 10.7: build-rhcos-server (build OCI image with nginx + RHCOS boot files, push to intermediate registry)
 		{
 			"name":     "build-rhcos-server",
 			"runAfter": []string{"download-rhcos-images"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
+				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
 			},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
@@ -9895,22 +9896,13 @@ buildah copy $CONTAINER "$RHCOS_DIR/RHCOS_VERSION.txt" "/opt/app-root/src/RHCOS_
 buildah config --label "io.openshift.rhcos.version=${RHCOS_VERSION}" $CONTAINER
 buildah config --label "io.openshift.mirror-operator/component=rhcos-server" $CONTAINER
 
-IMAGE_TAG="rhcos-server:${RHCOS_VERSION}"
+FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
 
-# Commit the image
-buildah commit $CONTAINER "$IMAGE_TAG"
+# Commit and push to intermediate registry
+buildah commit $CONTAINER "$FULL_IMAGE"
+buildah push --authfile=/workspace/pull-secret/.dockerconfigjson "$FULL_IMAGE" "docker://${FULL_IMAGE}"
 
-# Push to intermediate registry if available
-if [ -n "$INTERMEDIATE_REGISTRY" ]; then
-  FULL_IMAGE="${INTERMEDIATE_REGISTRY}/${IMAGE_TAG}"
-  buildah push --authfile=/workspace/pull-secret/.dockerconfigjson "$IMAGE_TAG" "docker://${FULL_IMAGE}"
-  echo "RHCOS server image pushed: $FULL_IMAGE"
-fi
-
-# Always save as docker-archive for bundle inclusion
-buildah push "$IMAGE_TAG" \
-  "docker-archive:/workspace/output/rhcos-server.tar.gz:${IMAGE_TAG}"
-
+echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
 `},
 					},
@@ -9951,7 +9943,7 @@ ls -lh /workspace/output/import-airgap-architect.sh
 		// Task 12: repackage-bundle (combine oc-mirror output with architect artifacts)
 		{
 			"name":     "repackage-bundle",
-			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools", "build-rhcos-server"},
+			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -10031,11 +10023,6 @@ else
   if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
     echo "Including CLI tools in bundle"
     SMALL_CONTENTS="$SMALL_CONTENTS cli-tools"
-  fi
-
-  if [ -f "rhcos-server.tar.gz" ] && [ "$(params.rhcos-download-enabled)" = "true" ]; then
-    echo "Including RHCOS server image in bundle"
-    SMALL_CONTENTS="$SMALL_CONTENTS rhcos-server.tar.gz"
   fi
 
   tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
