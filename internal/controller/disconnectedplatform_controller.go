@@ -9883,8 +9883,9 @@ echo "=== RHCOS download complete ==="
 						"name":    "build-and-push",
 						"image":   "quay.io/buildah/stable:latest",
 						"command": []string{"/bin/bash", "-c"},
-						"securityContext": map[string]interface{}{
-							"privileged": true,
+						"env": []map[string]interface{}{
+							{"name": "BUILDAH_ISOLATION", "value": "chroot"},
+							{"name": "STORAGE_DRIVER", "value": "vfs"},
 						},
 						"args": []string{`
 set -ex
@@ -9902,23 +9903,23 @@ INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
 
 RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
 
-# Create container from nginx base
-CONTAINER=$(buildah from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
+# Create container from nginx base (rootless with vfs)
+CONTAINER=$(buildah --storage-driver=vfs from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
 
 # Copy RHCOS files into nginx serving directory
-buildah copy $CONTAINER "$RHCOS_DIR/rhcos-live.x86_64.iso" "/opt/app-root/src/rhcos-live.x86_64.iso"
-buildah copy $CONTAINER "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" "/opt/app-root/src/rhcos-live-rootfs.x86_64.img"
-buildah copy $CONTAINER "$RHCOS_DIR/RHCOS_VERSION.txt" "/opt/app-root/src/RHCOS_VERSION.txt"
+buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/rhcos-live.x86_64.iso" "/opt/app-root/src/rhcos-live.x86_64.iso"
+buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" "/opt/app-root/src/rhcos-live-rootfs.x86_64.img"
+buildah --storage-driver=vfs copy $CONTAINER "$RHCOS_DIR/RHCOS_VERSION.txt" "/opt/app-root/src/RHCOS_VERSION.txt"
 
 # Set labels
-buildah config --label "io.openshift.rhcos.version=${RHCOS_VERSION}" $CONTAINER
-buildah config --label "io.openshift.mirror-operator/component=rhcos-server" $CONTAINER
+buildah --storage-driver=vfs config --label "io.openshift.rhcos.version=${RHCOS_VERSION}" $CONTAINER
+buildah --storage-driver=vfs config --label "io.openshift.mirror-operator/component=rhcos-server" $CONTAINER
 
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
 
 # Commit and push to intermediate registry
-buildah commit $CONTAINER "$FULL_IMAGE"
-buildah push --authfile=/workspace/pull-secret/.dockerconfigjson "$FULL_IMAGE" "docker://${FULL_IMAGE}"
+buildah --storage-driver=vfs commit $CONTAINER "$FULL_IMAGE"
+buildah --storage-driver=vfs push --authfile=/workspace/pull-secret/.dockerconfigjson "$FULL_IMAGE" "docker://${FULL_IMAGE}"
 
 echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
