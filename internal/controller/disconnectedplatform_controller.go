@@ -48,10 +48,10 @@ const (
 	architectNamespace    = "mirror-operator-system"
 	defaultPullSecretName = "pull-secret"
 	defaultPullSecretNS   = "openshift-config"
-	pullSecretVolumeName = "pull-secret"
-	pullSecretMountPath  = "/opt/app-root/src/.openshift"
-	pullSecretFile       = "pull-secret"
-	pullSecretKey        = ".dockerconfigjson"
+	pullSecretVolumeName  = "pull-secret"
+	pullSecretMountPath   = "/opt/app-root/src/.openshift"
+	pullSecretFile        = "pull-secret"
+	pullSecretKey         = ".dockerconfigjson"
 )
 
 var (
@@ -9797,7 +9797,7 @@ cat "$CLI_DIR/VERSIONS.txt"
 		// Task 10.6: download-rhcos-images (download RHCOS ISO and rootFS for ACM host inventory)
 		// Runs early with no dependencies so the RHCOS server image is ready before oc-mirror
 		{
-			"name":     "download-rhcos-images",
+			"name": "download-rhcos-images",
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -9828,10 +9828,10 @@ mkdir -p "$RHCOS_DIR"
 RHCOS_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/latest"
 
 echo "Downloading RHCOS live ISO for version $RHCOS_VERSION..."
-if ! curl -L -f "${RHCOS_BASE}/rhcos-live.x86_64.iso" \
+if ! curl -L -f "${RHCOS_BASE}/rhcos-live-iso.x86_64.iso" \
   -o "$RHCOS_DIR/rhcos-live.x86_64.iso" 2>/dev/null; then
   echo "Trying versioned filename..."
-  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}-live.x86_64.iso" \
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}.0-x86_64-live-iso.x86_64.iso" \
     -o "$RHCOS_DIR/rhcos-live.x86_64.iso"
 fi
 
@@ -9839,7 +9839,7 @@ echo "Downloading RHCOS rootFS for version $RHCOS_VERSION..."
 if ! curl -L -f "${RHCOS_BASE}/rhcos-live-rootfs.x86_64.img" \
   -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" 2>/dev/null; then
   echo "Trying versioned filename..."
-  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}-live-rootfs.x86_64.img" \
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}.0-x86_64-live-rootfs.x86_64.img" \
     -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img"
 fi
 
