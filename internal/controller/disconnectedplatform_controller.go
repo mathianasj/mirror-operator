@@ -49,7 +49,7 @@ const (
 	defaultPullSecretName = "pull-secret"
 	defaultPullSecretNS   = "openshift-config"
 	pullSecretVolumeName = "pull-secret"
-	pullSecretMountPath  = "/run/secrets"
+	pullSecretMountPath  = "/etc/pull-secret"
 	pullSecretFile       = "pull-secret"
 	pullSecretKey        = ".dockerconfigjson"
 )
