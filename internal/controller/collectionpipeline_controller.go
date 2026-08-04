@@ -495,6 +495,12 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 		return nil, fmt.Errorf("failed to inject architect images: %w", err)
 	}
 
+	// Inject RHCOS server base image so oc-mirror mirrors it for airgapped deployment
+	enrichedConfig, err = r.injectRHCOSServerImage(ctx, enrichedConfig)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to inject RHCOS server image, continuing without it")
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -781,6 +787,20 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "cli-tools-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: "true"}},
 	)
 
+	// Add RHCOS collection parameters
+	rhcosEnabled := "false"
+	rhcosServerBaseImage := "registry.access.redhat.com/ubi9/nginx-122:latest"
+	if platform != nil && platform.Spec.Connected != nil && platform.Spec.Connected.RHCOSCollection != nil && platform.Spec.Connected.RHCOSCollection.Enabled {
+		rhcosEnabled = "true"
+		if platform.Spec.Connected.RHCOSCollection.ServerBaseImage != "" {
+			rhcosServerBaseImage = platform.Spec.Connected.RHCOSCollection.ServerBaseImage
+		}
+	}
+	params = append(params,
+		pipelinev1.Param{Name: "rhcos-download-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: rhcosEnabled}},
+		pipelinev1.Param{Name: "rhcos-server-base-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: rhcosServerBaseImage}},
+	)
+
 	// Define workspaces
 	workspaces := []pipelinev1.WorkspaceBinding{
 		{
@@ -958,6 +978,48 @@ func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context
 		return "", fmt.Errorf("failed to marshal enriched config: %w", err)
 	}
 
+	return string(enrichedYAML), nil
+}
+
+func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Context, configYAML string) (string, error) {
+	platform, err := r.findPlatform(ctx)
+	if err != nil || platform == nil {
+		return configYAML, nil
+	}
+	if platform.Spec.Connected == nil || platform.Spec.Connected.RHCOSCollection == nil || !platform.Spec.Connected.RHCOSCollection.Enabled {
+		return configYAML, nil
+	}
+
+	var config ImageSetConfiguration
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return "", fmt.Errorf("failed to parse ImageSetConfiguration: %w", err)
+	}
+
+	serverBaseImage := "registry.access.redhat.com/ubi9/nginx-122:latest"
+	if platform.Spec.Connected.RHCOSCollection.ServerBaseImage != "" {
+		serverBaseImage = platform.Spec.Connected.RHCOSCollection.ServerBaseImage
+	}
+	serverBaseImage = normalizeImageRef(serverBaseImage)
+
+	if config.Mirror.AdditionalImages == nil {
+		config.Mirror.AdditionalImages = []ImageConfig{}
+	}
+
+	found := false
+	for _, img := range config.Mirror.AdditionalImages {
+		if img.Name == serverBaseImage {
+			found = true
+			break
+		}
+	}
+	if !found {
+		config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: serverBaseImage})
+	}
+
+	enrichedYAML, err := yaml.Marshal(&config)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal config: %w", err)
+	}
 	return string(enrichedYAML), nil
 }
 

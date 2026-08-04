@@ -26,6 +26,17 @@ rules:
   - list
   - watch
 - apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - agentserviceconfigs
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -155,6 +166,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - hive.openshift.io
+  resources:
+  - clusterimagesets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - k8s.keycloak.org
   resources:
   - keycloakrealmimports
@@ -162,6 +185,17 @@ rules:
   verbs:
   - create
   - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - metal3.io
+  resources:
+  - provisionings
+  verbs:
+  - create
   - get
   - list
   - patch

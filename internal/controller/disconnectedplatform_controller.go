@@ -162,6 +162,9 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=multiclusterhubs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.open-cluster-management.io,resources=multiclusterhubs/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=metal3.io,resources=provisionings,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agentserviceconfigs,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=hive.openshift.io,resources=clusterimagesets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	platform := &mirrorv1.DisconnectedPlatform{}
@@ -7536,7 +7539,6 @@ func (r *DisconnectedPlatformReconciler) syncS3ConfigToSecret(ctx context.Contex
 	return nil
 }
 
-
 // mergeQuayCredentialsIntoPullSecret adds Quay robot credentials to the pull-secret
 func (r *DisconnectedPlatformReconciler) mergeQuayCredentialsIntoPullSecret(ctx context.Context, hostname, username, token string) error {
 	logger := log.FromContext(ctx)
@@ -7934,6 +7936,8 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
 		{"name": "sbom-parallel-jobs", "type": "string", "default": "8", "description": "Number of parallel syft SBOM scans"},
+		{"name": "rhcos-download-enabled", "type": "string", "default": "false", "description": "Download RHCOS boot images for ACM host inventory"},
+		{"name": "rhcos-server-base-image", "type": "string", "default": "registry.access.redhat.com/ubi9/nginx-122:latest", "description": "Base image for RHCOS server container"},
 	}
 
 	// Define workspaces
@@ -8610,6 +8614,20 @@ fi
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e
+
+# Preserve parent tars so oc-mirror doesn't overwrite them
+if [ -n "$(params.parent-pipeline)" ]; then
+  EXISTING_TARS=$(ls -1 /workspace/output/mirror_*.tar 2>/dev/null || true)
+  if [ -n "$EXISTING_TARS" ]; then
+    mkdir -p /workspace/output/parent-archives
+    echo "Moving parent tars to parent-archives/ before oc-mirror run:"
+    for f in /workspace/output/mirror_*.tar; do
+      echo "  $(basename $f)"
+      mv "$f" /workspace/output/parent-archives/
+    done
+  fi
+fi
+
 touch /workspace/output/.mirror-marker
 oc-mirror \
   --v2 \
@@ -8651,6 +8669,20 @@ oc-mirror \
 						"args": []string{`
 set -e
 echo "=== Mirroring FROM intermediate registry TO disk ==="
+
+# Preserve parent tars so oc-mirror doesn't overwrite them
+if [ -n "$(params.parent-pipeline)" ]; then
+  EXISTING_TARS=$(ls -1 /workspace/output/mirror_*.tar 2>/dev/null || true)
+  if [ -n "$EXISTING_TARS" ]; then
+    mkdir -p /workspace/output/parent-archives
+    echo "Moving parent tars to parent-archives/ before oc-mirror run:"
+    for f in /workspace/output/mirror_*.tar; do
+      echo "  $(basename $f)"
+      mv "$f" /workspace/output/parent-archives/
+    done
+  fi
+fi
+
 touch /workspace/output/.mirror-marker
 
 # Setup temp and cache directories on PVC (not ephemeral storage)
@@ -9749,6 +9781,147 @@ cat "$CLI_DIR/VERSIONS.txt"
 			},
 		},
 
+		// Task 10.6: download-rhcos-images (download RHCOS ISO and rootFS for ACM host inventory)
+		{
+			"name":     "download-rhcos-images",
+			"runAfter": []string{"download-cli-tools"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "download-rhcos",
+						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Downloading RHCOS boot images for ACM Host Inventory ==="
+
+OC_VERSION="$(params.oc-version)"
+# Extract major.minor (e.g., "4.18.3" -> "4.18", "stable-4.18" -> "4.18")
+RHCOS_VERSION=$(echo "$OC_VERSION" | grep -oP '\d+\.\d+')
+if [ -z "$RHCOS_VERSION" ]; then
+  echo "ERROR: Cannot extract major.minor version from $OC_VERSION"
+  exit 1
+fi
+
+RHCOS_DIR="/workspace/output/rhcos"
+mkdir -p "$RHCOS_DIR"
+
+RHCOS_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/latest"
+
+echo "Downloading RHCOS live ISO for version $RHCOS_VERSION..."
+if ! curl -L -f "${RHCOS_BASE}/rhcos-live.x86_64.iso" \
+  -o "$RHCOS_DIR/rhcos-live.x86_64.iso" 2>/dev/null; then
+  echo "Trying versioned filename..."
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}-live.x86_64.iso" \
+    -o "$RHCOS_DIR/rhcos-live.x86_64.iso"
+fi
+
+echo "Downloading RHCOS rootFS for version $RHCOS_VERSION..."
+if ! curl -L -f "${RHCOS_BASE}/rhcos-live-rootfs.x86_64.img" \
+  -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" 2>/dev/null; then
+  echo "Trying versioned filename..."
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}-live-rootfs.x86_64.img" \
+    -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img"
+fi
+
+echo "RHCOS downloads:"
+ls -lh "$RHCOS_DIR/"
+
+# Validate file sizes (ISO and rootFS should each be > 500MB)
+for file in "$RHCOS_DIR"/*; do
+  if [ -f "$file" ]; then
+    size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+    if [ "$size" -lt 500000000 ]; then
+      echo "ERROR: $(basename $file) is only $(($size / 1048576))MB - expected >500MB"
+      exit 1
+    fi
+  fi
+done
+
+# Write version metadata
+cat > "$RHCOS_DIR/RHCOS_VERSION.txt" <<EOFV
+rhcos_version=${RHCOS_VERSION}
+ocp_version=${OC_VERSION}
+EOFV
+
+echo "=== RHCOS download complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+
+		// Task 10.7: build-rhcos-server (build OCI image with nginx + RHCOS boot files)
+		{
+			"name":     "build-rhcos-server",
+			"runAfter": []string{"download-rhcos-images"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.rhcos-download-enabled)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "build-and-push",
+						"image":   "quay.io/buildah/stable:latest",
+						"command": []string{"/bin/bash", "-c"},
+						"securityContext": map[string]interface{}{
+							"privileged": true,
+						},
+						"args": []string{`
+set -ex
+echo "=== Building RHCOS server OCI image ==="
+
+RHCOS_DIR="/workspace/output/rhcos"
+BASE_IMAGE="$(params.rhcos-server-base-image)"
+INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+
+RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
+
+# Create container from nginx base
+CONTAINER=$(buildah from --authfile=/workspace/pull-secret/.dockerconfigjson "$BASE_IMAGE")
+
+# Copy RHCOS files into nginx serving directory
+buildah copy $CONTAINER "$RHCOS_DIR/rhcos-live.x86_64.iso" "/opt/app-root/src/rhcos-live.x86_64.iso"
+buildah copy $CONTAINER "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" "/opt/app-root/src/rhcos-live-rootfs.x86_64.img"
+buildah copy $CONTAINER "$RHCOS_DIR/RHCOS_VERSION.txt" "/opt/app-root/src/RHCOS_VERSION.txt"
+
+# Set labels
+buildah config --label "io.openshift.rhcos.version=${RHCOS_VERSION}" $CONTAINER
+buildah config --label "io.openshift.mirror-operator/component=rhcos-server" $CONTAINER
+
+IMAGE_TAG="rhcos-server:${RHCOS_VERSION}"
+
+# Commit the image
+buildah commit $CONTAINER "$IMAGE_TAG"
+
+# Push to intermediate registry if available
+if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+  FULL_IMAGE="${INTERMEDIATE_REGISTRY}/${IMAGE_TAG}"
+  buildah push --authfile=/workspace/pull-secret/.dockerconfigjson "$IMAGE_TAG" "docker://${FULL_IMAGE}"
+  echo "RHCOS server image pushed: $FULL_IMAGE"
+fi
+
+# Always save as docker-archive for bundle inclusion
+buildah push "$IMAGE_TAG" \
+  "docker-archive:/workspace/output/rhcos-server.tar.gz:${IMAGE_TAG}"
+
+echo "=== RHCOS server image build complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+				{"name": "pull-secret"},
+			},
+		},
+
 		// Task 11: copy-import-script (copy script from ConfigMap to output)
 		{
 			"name":     "copy-import-script",
@@ -9778,7 +9951,7 @@ ls -lh /workspace/output/import-airgap-architect.sh
 		// Task 12: repackage-bundle (combine oc-mirror output with architect artifacts)
 		{
 			"name":     "repackage-bundle",
-			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools"},
+			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools", "build-rhcos-server"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -9800,18 +9973,9 @@ fi
 COLLECTION_NAME="$(params.collection-name)"
 PARENT_PIPELINE="$(params.parent-pipeline)"
 
-# Collect mirror tar files
-if [ -n "$PARENT_PIPELINE" ] && [ -f ".mirror-marker" ]; then
-  # Update collection: only include NEW tars created during this run
-  MIRROR_TARS=$(find . -maxdepth 1 -name "mirror_*.tar" -newer .mirror-marker -type f -printf '%f\n' 2>/dev/null | sort)
-  if [ -z "$MIRROR_TARS" ]; then
-    # Fallback for systems without -printf
-    MIRROR_TARS=$(find . -maxdepth 1 -name "mirror_*.tar" -newer .mirror-marker -type f 2>/dev/null | sed 's|^\./||' | sort)
-  fi
-  echo "Found NEW mirror tars for update bundle: $MIRROR_TARS"
-else
-  MIRROR_TARS=$(ls -1 mirror_*.tar 2>/dev/null || echo "")
-fi
+# Collect mirror tar files — parent tars were moved to parent-archives/ before oc-mirror,
+# so only new delta tars remain in the output root for update collections
+MIRROR_TARS=$(ls -1 mirror_*.tar 2>/dev/null || echo "")
 
 if [ -z "$MIRROR_TARS" ]; then
   echo "WARNING: No oc-mirror .tar bundle found"
@@ -9867,6 +10031,11 @@ else
   if [ -d "cli-tools" ] && [ "$(params.cli-tools-enabled)" = "true" ]; then
     echo "Including CLI tools in bundle"
     SMALL_CONTENTS="$SMALL_CONTENTS cli-tools"
+  fi
+
+  if [ -f "rhcos-server.tar.gz" ] && [ "$(params.rhcos-download-enabled)" = "true" ]; then
+    echo "Including RHCOS server image in bundle"
+    SMALL_CONTENTS="$SMALL_CONTENTS rhcos-server.tar.gz"
   fi
 
   tar -b 2048 -cf "$FINAL_BUNDLE_NAME" $SMALL_CONTENTS
@@ -10034,7 +10203,6 @@ fi
 				{"name": "output"},
 			},
 		},
-
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,6 +40,42 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 			logger.Info("MultiClusterHub not yet running, deferring Quay and other components until ACM policies are applied")
 			needsRequeue = true
 			return needsRequeue, nil
+		}
+
+		if err := r.ensureProvisioningConfiguration(ctx); err != nil {
+			logger.Error(err, "failed to ensure Provisioning configuration")
+			needsRequeue = true
+		}
+
+		// Reconcile host inventory for assisted installer bare-metal provisioning
+		if platform.Spec.Airgapped.ACM.HostInventory != nil && platform.Spec.Airgapped.ACM.HostInventory.Enabled {
+			if err := r.ensureAssistedInstallerMirrorConfig(ctx, platform); err != nil {
+				logger.Error(err, "failed to ensure assisted-installer mirror config")
+				needsRequeue = true
+			}
+
+			if err := r.reconcileRHCOSServer(ctx, platform); err != nil {
+				logger.Error(err, "failed to reconcile RHCOS server")
+				needsRequeue = true
+			}
+
+			rhcosServerURL := fmt.Sprintf("http://rhcos-server.%s.svc:8080", architectNamespace)
+			if err := r.ensureAgentServiceConfig(ctx, platform, rhcosServerURL); err != nil {
+				logger.Error(err, "failed to ensure AgentServiceConfig")
+				needsRequeue = true
+			}
+
+			if err := r.ensureClusterImageSets(ctx, platform); err != nil {
+				logger.Error(err, "failed to ensure ClusterImageSets")
+				needsRequeue = true
+			}
+
+			platform.Status.Components = append(platform.Status.Components,
+				mirrorv1.ComponentStatus{
+					Name: "host-inventory", Status: "Configured",
+					Kind: "AgentServiceConfig", APIGroup: "agent-install.openshift.io",
+				},
+			)
 		}
 	}
 
@@ -801,6 +839,496 @@ func (r *DisconnectedPlatformReconciler) ensureMultiClusterHub(ctx context.Conte
 		},
 	)
 	return nil
+}
+
+// ensureProvisioningConfiguration creates or updates the metal3.io Provisioning CR
+// to disable the provisioning network and enable watching all namespaces.
+// This is required after ACM installs for bare-metal management to function.
+func (r *DisconnectedPlatformReconciler) ensureProvisioningConfiguration(ctx context.Context) error {
+	logger := log.FromContext(ctx)
+
+	provisioning := &unstructured.Unstructured{}
+	provisioning.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "metal3.io",
+		Version: "v1alpha1",
+		Kind:    "Provisioning",
+	})
+	provisioning.SetName("provisioning-configuration")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(provisioning.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provisioning), existing); err == nil {
+		needsUpdate := false
+		provNet, _, _ := unstructured.NestedString(existing.Object, "spec", "provisioningNetwork")
+		watchAll, _, _ := unstructured.NestedBool(existing.Object, "spec", "watchAllNamespaces")
+		if provNet != "Disabled" {
+			needsUpdate = true
+		}
+		if !watchAll {
+			needsUpdate = true
+		}
+		if needsUpdate {
+			if err := unstructured.SetNestedField(existing.Object, "Disabled", "spec", "provisioningNetwork"); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedField(existing.Object, true, "spec", "watchAllNamespaces"); err != nil {
+				return err
+			}
+			if err := r.Update(ctx, existing); err != nil {
+				return fmt.Errorf("failed to update Provisioning configuration: %w", err)
+			}
+			logger.Info("Updated Provisioning configuration")
+		}
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	spec := map[string]interface{}{
+		"provisioningNetwork": "Disabled",
+		"watchAllNamespaces":  true,
+	}
+	provisioning.Object["spec"] = spec
+
+	if err := r.Create(ctx, provisioning); err != nil {
+		return fmt.Errorf("failed to create Provisioning configuration: %w", err)
+	}
+	logger.Info("Created Provisioning configuration for bare-metal management")
+	return nil
+}
+
+// reconcileRHCOSServer deploys the RHCOS server image from the mirror registry as a Deployment + Service.
+func (r *DisconnectedPlatformReconciler) reconcileRHCOSServer(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	mirrorRegistry := platform.Spec.Airgapped.MirrorRegistry
+	if mirrorRegistry == "" {
+		logger.Info("Mirror registry not yet configured, skipping RHCOS server")
+		return nil
+	}
+
+	acmConfig := platform.Spec.Airgapped.ACM
+	if acmConfig == nil || acmConfig.HostInventory == nil || !acmConfig.HostInventory.Enabled {
+		return nil
+	}
+
+	// Determine OCP version for the RHCOS server image tag
+	rhcosVersion := ""
+	if len(acmConfig.HostInventory.Versions) > 0 {
+		rhcosVersion = acmConfig.HostInventory.Versions[0].OpenshiftVersion
+	}
+	if rhcosVersion == "" {
+		logger.Info("No OCP version configured for RHCOS server, skipping")
+		return nil
+	}
+
+	name := "rhcos-server"
+	namespace := architectNamespace
+	rhcosImage := fmt.Sprintf("%s/rhcos-server:%s", mirrorRegistry, rhcosVersion)
+
+	// Create or update Deployment
+	replicas := int32(1)
+	labels := map[string]string{"app": name}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "nginx",
+							Image: rhcosImage,
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(platform, deployment, r.Scheme); err != nil {
+		logger.Error(err, "failed to set owner reference on RHCOS server deployment")
+	}
+
+	existingDeploy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(deployment), existingDeploy); err == nil {
+		if existingDeploy.Spec.Template.Spec.Containers[0].Image != rhcosImage {
+			existingDeploy.Spec.Template.Spec.Containers[0].Image = rhcosImage
+			if err := r.Update(ctx, existingDeploy); err != nil {
+				return fmt.Errorf("failed to update RHCOS server deployment: %w", err)
+			}
+			logger.Info("Updated RHCOS server deployment image", "image", rhcosImage)
+		}
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, deployment); err != nil {
+			return fmt.Errorf("failed to create RHCOS server deployment: %w", err)
+		}
+		logger.Info("Created RHCOS server deployment", "image", rhcosImage)
+	} else {
+		return err
+	}
+
+	// Create or update Service
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(platform, service, r.Scheme); err != nil {
+		logger.Error(err, "failed to set owner reference on RHCOS server service")
+	}
+
+	existingSvc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(service), existingSvc); err == nil {
+		// Service exists
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, service); err != nil {
+			return fmt.Errorf("failed to create RHCOS server service: %w", err)
+		}
+		logger.Info("Created RHCOS server service")
+	} else {
+		return err
+	}
+
+	return nil
+}
+
+// ensureAssistedInstallerMirrorConfig creates the ConfigMap in multicluster-engine namespace
+// with mirror registry CA and registries.conf for the assisted installer.
+func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	mirrorRegistry := platform.Spec.Airgapped.MirrorRegistry
+	if mirrorRegistry == "" {
+		return nil
+	}
+
+	registryHost := mirrorRegistry
+	if idx := strings.Index(mirrorRegistry, "/"); idx > 0 {
+		registryHost = mirrorRegistry[:idx]
+	}
+
+	caBundlePEM := r.getMirrorRegistryCA(ctx, platform)
+
+	registriesConf := fmt.Sprintf(`unqualified-search-registries = ["registry.access.redhat.com", "docker.io"]
+
+[[registry]]
+  prefix = ""
+  location = "quay.io/openshift-release-dev/ocp-release"
+  mirror-by-digest-only = true
+
+  [[registry.mirror]]
+    location = "%s/openshift/release-images"
+
+[[registry]]
+  prefix = ""
+  location = "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
+  mirror-by-digest-only = true
+
+  [[registry.mirror]]
+    location = "%s/openshift/release"
+
+[[registry]]
+  prefix = ""
+  location = "registry.redhat.io/multicluster-engine"
+  mirror-by-digest-only = true
+
+  [[registry.mirror]]
+    location = "%s/multicluster-engine"
+
+[[registry]]
+  prefix = ""
+  location = "registry.redhat.io"
+  mirror-by-digest-only = true
+
+  [[registry.mirror]]
+    location = "%s"
+`, registryHost, registryHost, registryHost, registryHost)
+
+	if err := r.ensureNamespace(ctx, "multicluster-engine"); err != nil {
+		return fmt.Errorf("failed to ensure multicluster-engine namespace: %w", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "assisted-installer-mirror-config",
+			Namespace: "multicluster-engine",
+			Labels: map[string]string{
+				"app": "assisted-service",
+			},
+		},
+		Data: map[string]string{
+			"ca-bundle.crt":   caBundlePEM,
+			"registries.conf": registriesConf,
+		},
+	}
+
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+		needsUpdate := existing.Data["ca-bundle.crt"] != caBundlePEM ||
+			existing.Data["registries.conf"] != registriesConf
+		if needsUpdate {
+			existing.Data = cm.Data
+			existing.Labels = cm.Labels
+			if err := r.Update(ctx, existing); err != nil {
+				return fmt.Errorf("failed to update assisted-installer-mirror-config: %w", err)
+			}
+			logger.Info("Updated assisted-installer-mirror-config ConfigMap")
+		}
+		return nil
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, cm); err != nil {
+			return fmt.Errorf("failed to create assisted-installer-mirror-config: %w", err)
+		}
+		logger.Info("Created assisted-installer-mirror-config ConfigMap")
+		return nil
+	} else {
+		return err
+	}
+}
+
+// getMirrorRegistryCA extracts the CA certificate for the mirror registry.
+func (r *DisconnectedPlatformReconciler) getMirrorRegistryCA(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) string {
+	logger := log.FromContext(ctx)
+
+	// Try to get CA from the managed Quay TLS secret
+	if platform.Spec.Airgapped.Quay != nil && platform.Spec.Airgapped.Quay.Enabled {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      "mirror-operator-quay-config-bundle",
+			Namespace: architectNamespace,
+		}, secret); err == nil {
+			if ca, ok := secret.Data["ssl.cert"]; ok && len(ca) > 0 {
+				return string(ca)
+			}
+		}
+
+		// Try the Quay-generated TLS secret
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      "mirror-operator-quay-quay-ssl",
+			Namespace: architectNamespace,
+		}, secret); err == nil {
+			if ca, ok := secret.Data["tls.crt"]; ok && len(ca) > 0 {
+				return string(ca)
+			}
+		}
+	}
+
+	// Try the cluster's additional trust bundle
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      "user-ca-bundle",
+		Namespace: "openshift-config",
+	}, cm); err == nil {
+		if ca, ok := cm.Data["ca-bundle.crt"]; ok && ca != "" {
+			return ca
+		}
+	}
+
+	logger.Info("Could not find mirror registry CA certificate, using empty bundle")
+	return ""
+}
+
+// ensureAgentServiceConfig creates the AgentServiceConfig CR for the assisted installer.
+func (r *DisconnectedPlatformReconciler) ensureAgentServiceConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, rhcosServerURL string) error {
+	logger := log.FromContext(ctx)
+
+	hostInv := platform.Spec.Airgapped.ACM.HostInventory
+
+	asc := &unstructured.Unstructured{}
+	asc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "agent-install.openshift.io",
+		Version: "v1beta1",
+		Kind:    "AgentServiceConfig",
+	})
+	asc.SetName("agent")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(asc.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(asc), existing); err == nil {
+		logger.Info("AgentServiceConfig already exists")
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	dbSize := "200Gi"
+	if hostInv.DatabaseStorageSize != "" {
+		dbSize = hostInv.DatabaseStorageSize
+	}
+	fsSize := "200Gi"
+	if hostInv.FilesystemStorageSize != "" {
+		fsSize = hostInv.FilesystemStorageSize
+	}
+	imgSize := "100Gi"
+	if hostInv.ImageStorageSize != "" {
+		imgSize = hostInv.ImageStorageSize
+	}
+
+	osImages := []interface{}{}
+	for _, v := range hostInv.Versions {
+		arch := v.CpuArchitecture
+		if arch == "" {
+			arch = "x86_64"
+		}
+		osImages = append(osImages, map[string]interface{}{
+			"openshiftVersion": v.OpenshiftVersion,
+			"cpuArchitecture":  arch,
+			"rootFSUrl":        fmt.Sprintf("%s/rhcos-live-rootfs.%s.img", rhcosServerURL, arch),
+			"url":              fmt.Sprintf("%s/rhcos-live.%s.iso", rhcosServerURL, arch),
+			"version":          v.OpenshiftVersion,
+		})
+	}
+
+	buildStorage := func(size string) map[string]interface{} {
+		storage := map[string]interface{}{
+			"accessModes": []interface{}{"ReadWriteOnce"},
+			"resources":   map[string]interface{}{"requests": map[string]interface{}{"storage": size}},
+		}
+		if hostInv.StorageClass != "" {
+			storage["storageClassName"] = hostInv.StorageClass
+		}
+		return storage
+	}
+
+	spec := map[string]interface{}{
+		"databaseStorage":   buildStorage(dbSize),
+		"filesystemStorage": buildStorage(fsSize),
+		"imageStorage":      buildStorage(imgSize),
+		"mirrorRegistryRef": map[string]interface{}{
+			"name": "assisted-installer-mirror-config",
+		},
+		"osImages": osImages,
+	}
+
+	asc.Object["spec"] = spec
+
+	if err := r.Create(ctx, asc); err != nil {
+		return fmt.Errorf("failed to create AgentServiceConfig: %w", err)
+	}
+	logger.Info("Created AgentServiceConfig for host inventory")
+	return nil
+}
+
+// ensureClusterImageSets creates ClusterImageSet CRs for each configured OCP version.
+func (r *DisconnectedPlatformReconciler) ensureClusterImageSets(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	acmConfig := platform.Spec.Airgapped.ACM
+	if acmConfig == nil || acmConfig.HostInventory == nil || !acmConfig.HostInventory.Enabled {
+		return nil
+	}
+
+	mirrorRegistry := platform.Spec.Airgapped.MirrorRegistry
+	if mirrorRegistry == "" {
+		return nil
+	}
+
+	for _, v := range acmConfig.HostInventory.Versions {
+		cisName := fmt.Sprintf("openshift-%s", strings.ReplaceAll(v.OpenshiftVersion, ".", "-"))
+
+		cis := &unstructured.Unstructured{}
+		cis.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "hive.openshift.io", Version: "v1", Kind: "ClusterImageSet",
+		})
+		cis.SetName(cisName)
+
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(cis.GroupVersionKind())
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cis), existing); err == nil {
+			continue
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// Extract registry host for release images path
+		registryHost := mirrorRegistry
+		if idx := strings.Index(mirrorRegistry, "/"); idx > 0 {
+			registryHost = mirrorRegistry[:idx]
+		}
+
+		releaseImage := fmt.Sprintf("%s/openshift/release-images:%s-x86_64", registryHost, v.OpenshiftVersion)
+		cis.Object["spec"] = map[string]interface{}{
+			"releaseImage": releaseImage,
+		}
+
+		if err := r.Create(ctx, cis); err != nil {
+			return fmt.Errorf("failed to create ClusterImageSet %s: %w", cisName, err)
+		}
+		logger.Info("Created ClusterImageSet", "name", cisName, "releaseImage", releaseImage)
+	}
+
+	return nil
+}
+
+// deleteHostInventoryResources removes resources created for host inventory support.
+func (r *DisconnectedPlatformReconciler) deleteHostInventoryResources(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	// Delete AgentServiceConfig
+	asc := &unstructured.Unstructured{}
+	asc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentServiceConfig",
+	})
+	asc.SetName("agent")
+	if err := r.Delete(ctx, asc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete AgentServiceConfig")
+	}
+
+	// Delete RHCOS server deployment
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "rhcos-server", Namespace: architectNamespace},
+	}
+	if err := r.Delete(ctx, deploy); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHCOS server deployment")
+	}
+
+	// Delete RHCOS server service
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "rhcos-server", Namespace: architectNamespace},
+	}
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHCOS server service")
+	}
+
+	// Delete assisted installer mirror config
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "assisted-installer-mirror-config", Namespace: "multicluster-engine"},
+	}
+	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete assisted-installer-mirror-config")
+	}
 }
 
 // deleteAirgappedACM removes the MultiClusterHub CR and ACM subscription.

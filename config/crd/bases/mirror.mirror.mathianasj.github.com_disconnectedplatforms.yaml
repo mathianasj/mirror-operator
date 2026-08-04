@@ -54,6 +54,52 @@ spec:
                         description: Enable ACM operator installation and MultiClusterHub
                           creation
                         type: boolean
+                      hostInventory:
+                        description: Host inventory configuration for assisted installer
+                          bare-metal provisioning
+                        properties:
+                          databaseStorageSize:
+                            default: 200Gi
+                            description: Storage size for AgentServiceConfig databaseStorage
+                              PVC
+                            type: string
+                          enabled:
+                            description: Enable host inventory and assisted installer
+                              support
+                            type: boolean
+                          filesystemStorageSize:
+                            default: 200Gi
+                            description: Storage size for AgentServiceConfig filesystemStorage
+                              PVC
+                            type: string
+                          imageStorageSize:
+                            default: 100Gi
+                            description: Storage size for AgentServiceConfig imageStorage
+                              PVC
+                            type: string
+                          storageClass:
+                            description: Kubernetes StorageClass for AgentServiceConfig
+                              PVCs
+                            type: string
+                          versions:
+                            description: OCP versions to configure for host inventory
+                              (RHCOS boot images will be served for each)
+                            items:
+                              description: HostInventoryVersion represents an OCP
+                                version for which RHCOS boot images are served
+                              properties:
+                                cpuArchitecture:
+                                  default: x86_64
+                                  description: CPU architecture
+                                  type: string
+                                openshiftVersion:
+                                  description: OpenShift version (e.g., "4.18")
+                                  type: string
+                              required:
+                              - openshiftVersion
+                              type: object
+                            type: array
+                        type: object
                       multiClusterHub:
                         description: MultiClusterHub configuration
                         properties:
@@ -622,6 +668,20 @@ spec:
                             - type
                             type: object
                         type: object
+                    type: object
+                  rhcosCollection:
+                    description: RHCOS image collection for ACM host inventory in
+                      airgapped environments
+                    properties:
+                      enabled:
+                        description: Enable RHCOS image download and server image
+                          build in the collection pipeline
+                        type: boolean
+                      serverBaseImage:
+                        default: registry.access.redhat.com/ubi9/nginx-122:latest
+                        description: Base image for the RHCOS server container (nginx
+                          serving RHCOS files)
+                        type: string
                     type: object
                   rhtas:
                     description: Red Hat Trusted Artifact Signer configuration for

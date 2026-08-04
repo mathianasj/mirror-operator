@@ -58,6 +58,20 @@ type ConnectedConfig struct {
 	// cert-manager issuer reference for automatic TLS certificate provisioning (used by managed Keycloak)
 	// +optional
 	CertIssuer *CertIssuerReference `json:"certIssuer,omitempty"`
+	// RHCOS image collection for ACM host inventory in airgapped environments
+	// +optional
+	RHCOSCollection *RHCOSCollectionConfig `json:"rhcosCollection,omitempty"`
+}
+
+// RHCOSCollectionConfig controls downloading RHCOS boot images and packaging them into a server container image
+type RHCOSCollectionConfig struct {
+	// Enable RHCOS image download and server image build in the collection pipeline
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// Base image for the RHCOS server container (nginx serving RHCOS files)
+	// +kubebuilder:default="registry.access.redhat.com/ubi9/nginx-122:latest"
+	// +optional
+	ServerBaseImage string `json:"serverBaseImage,omitempty"`
 }
 
 type OLMSubscriptionConfig struct {
@@ -397,6 +411,44 @@ type AirgappedACMConfig struct {
 	// MultiClusterHub configuration
 	// +optional
 	MultiClusterHub *MultiClusterHubConfig `json:"multiClusterHub,omitempty"`
+	// Host inventory configuration for assisted installer bare-metal provisioning
+	// +optional
+	HostInventory *HostInventoryConfig `json:"hostInventory,omitempty"`
+}
+
+// HostInventoryConfig configures ACM's assisted installer for bare-metal provisioning in disconnected environments
+type HostInventoryConfig struct {
+	// Enable host inventory and assisted installer support
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// OCP versions to configure for host inventory (RHCOS boot images will be served for each)
+	// +optional
+	Versions []HostInventoryVersion `json:"versions,omitempty"`
+	// Storage size for AgentServiceConfig databaseStorage PVC
+	// +kubebuilder:default="200Gi"
+	// +optional
+	DatabaseStorageSize string `json:"databaseStorageSize,omitempty"`
+	// Storage size for AgentServiceConfig filesystemStorage PVC
+	// +kubebuilder:default="200Gi"
+	// +optional
+	FilesystemStorageSize string `json:"filesystemStorageSize,omitempty"`
+	// Storage size for AgentServiceConfig imageStorage PVC
+	// +kubebuilder:default="100Gi"
+	// +optional
+	ImageStorageSize string `json:"imageStorageSize,omitempty"`
+	// Kubernetes StorageClass for AgentServiceConfig PVCs
+	// +optional
+	StorageClass string `json:"storageClass,omitempty"`
+}
+
+// HostInventoryVersion represents an OCP version for which RHCOS boot images are served
+type HostInventoryVersion struct {
+	// OpenShift version (e.g., "4.18")
+	OpenshiftVersion string `json:"openshiftVersion"`
+	// CPU architecture
+	// +kubebuilder:default="x86_64"
+	// +optional
+	CpuArchitecture string `json:"cpuArchitecture,omitempty"`
 }
 
 type MultiClusterHubConfig struct {
