@@ -10,7 +10,12 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+ARG VERSION=0.0.1
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a \
+    -ldflags "-X main.version=${VERSION} -X main.gitCommit=${GIT_COMMIT} -X main.buildDate=${BUILD_DATE}" \
+    -o manager cmd/main.go
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 

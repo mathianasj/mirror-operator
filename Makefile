@@ -51,6 +51,10 @@ endif
 OPERATOR_SDK_VERSION ?= v1.39.2
 # Image URL to use all building/pushing image targets
 IMG ?= $(IMAGE_TAG_BASE):latest
+
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
+BUILD_DATE ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS ?= -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.31.0
 
@@ -131,7 +135,7 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/manager cmd/main.go
 
 .PHONY: kill
 kill: ## Kill any running operator instances
@@ -143,7 +147,7 @@ kill: ## Kill any running operator instances
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go || true
+	go run -ldflags "$(LDFLAGS)" ./cmd/main.go || true
 
 .PHONY: restart
 restart: kill run ## Kill existing instances and restart the operator
@@ -153,7 +157,7 @@ restart: kill run ## Kill existing instances and restart the operator
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
