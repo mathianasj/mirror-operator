@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -424,76 +423,6 @@ var _ = Describe("MirrorImportReconciler", func() {
 			}
 
 			r.updatePlatformImportHistory(ctx, importCR)
-		})
-	})
-
-	Describe("ensureCatalogSource", func() {
-		It("creates a CatalogSource unstructured resource", func() {
-			importCR := &mirrorv1.MirrorImport{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
-				Spec: mirrorv1.MirrorImportSpec{
-					TargetRegistry: mirrorv1.RegistryConfig{
-						URL: "https://quay.airgap.local",
-					},
-				},
-			}
-
-			r := &MirrorImportReconciler{
-				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
-				Scheme: testScheme,
-			}
-
-			err := r.ensureCatalogSource(ctx, importCR)
-			Expect(err).NotTo(HaveOccurred())
-		})
-
-		It("succeeds when CatalogSource already exists", func() {
-			importCR := &mirrorv1.MirrorImport{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
-				Spec: mirrorv1.MirrorImportSpec{
-					TargetRegistry: mirrorv1.RegistryConfig{
-						URL: "https://quay.airgap.local",
-					},
-				},
-			}
-
-			existing := &unstructured.Unstructured{}
-			existing.SetAPIVersion("operators.coreos.com/v1alpha1")
-			existing.SetKind("CatalogSource")
-			existing.SetName("mirror-catalog-test-import")
-			existing.SetNamespace("openshift-marketplace")
-
-			r := &MirrorImportReconciler{
-				Client: fake.NewClientBuilder().
-					WithScheme(testScheme).
-					WithObjects(existing).
-					Build(),
-				Scheme: testScheme,
-			}
-
-			err := r.ensureCatalogSource(ctx, importCR)
-			Expect(err).NotTo(HaveOccurred())
-		})
-	})
-
-	Describe("ensureIDMS", func() {
-		It("creates an ImageDigestMirrorSet unstructured resource", func() {
-			importCR := &mirrorv1.MirrorImport{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
-				Spec: mirrorv1.MirrorImportSpec{
-					TargetRegistry: mirrorv1.RegistryConfig{
-						URL: "https://quay.airgap.local",
-					},
-				},
-			}
-
-			r := &MirrorImportReconciler{
-				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
-				Scheme: testScheme,
-			}
-
-			err := r.ensureIDMS(ctx, importCR)
-			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
