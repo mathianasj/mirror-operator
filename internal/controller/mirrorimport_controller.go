@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,6 +36,8 @@ type MirrorImportReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=catalogsources,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=imagecontentsourcepolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagetagmirrorsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 
 func (r *MirrorImportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -150,18 +151,6 @@ func (r *MirrorImportReconciler) trackImportJob(ctx context.Context, importCR *m
 }
 
 func (r *MirrorImportReconciler) finalizeImport(ctx context.Context, importCR *mirrorv1.MirrorImport) (ctrl.Result, error) {
-	if importCR.Spec.Publish.CatalogSource {
-		if err := r.ensureCatalogSource(ctx, importCR); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure CatalogSource")
-			return ctrl.Result{}, err
-		}
-	}
-	if importCR.Spec.Publish.ImageContentSourcePolicy {
-		if err := r.ensureICSP(ctx, importCR); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure ImageContentSourcePolicy")
-			return ctrl.Result{}, err
-		}
-	}
 	importCR.Status.Phase = "Complete"
 
 	if err := r.Status().Update(ctx, importCR); err != nil {
@@ -237,7 +226,15 @@ func (r *MirrorImportReconciler) buildImportJob(ctx context.Context, importCR *m
 
 	importArgs := "tar -xvf /data/" + importCR.Spec.Bundle.Filename +
 		" -C /workspace && oc-mirror --config /config/" + configMapKey +
-		" --from file:///workspace docker://" + importCR.Spec.TargetRegistry.URL + " --v2"
+		" --from file:///workspace docker://" + importCR.Spec.TargetRegistry.URL + " --v2" +
+		` && echo "=== Applying cluster manifests ===" && ` +
+		`MANIFEST_DIR=$(find /workspace -path "*/cluster-resources" -type d 2>/dev/null | head -1) && ` +
+		`if [ -n "$MANIFEST_DIR" ]; then ` +
+		`  for f in "$MANIFEST_DIR"/idms-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied IDMS: $f"; done; ` +
+		`  for f in "$MANIFEST_DIR"/itms-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied ITMS: $f"; done; ` +
+		`  for f in "$MANIFEST_DIR"/cs-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied CatalogSource: $f"; done; ` +
+		`  echo "=== Cluster manifests applied ==="; ` +
+		`else echo "WARNING: No cluster-resources directory found, skipping manifest apply"; fi`
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: "bundle-data", MountPath: "/data"},
@@ -302,6 +299,7 @@ func (r *MirrorImportReconciler) buildImportJob(ctx context.Context, importCR *m
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
+					ServiceAccountName: "mirror-import-job",
 					Containers: []corev1.Container{
 						{
 							Name:         "import",
@@ -317,79 +315,6 @@ func (r *MirrorImportReconciler) buildImportJob(ctx context.Context, importCR *m
 			},
 		},
 	}, nil
-}
-
-func (r *MirrorImportReconciler) ensureCatalogSource(ctx context.Context, importCR *mirrorv1.MirrorImport) error {
-	logger := log.FromContext(ctx)
-
-	cs := &unstructured.Unstructured{}
-	cs.SetAPIVersion("operators.coreos.com/v1alpha1")
-	cs.SetKind("CatalogSource")
-	cs.SetName("mirror-catalog-" + importCR.Name)
-	cs.SetNamespace("openshift-marketplace")
-
-	if err := unstructured.SetNestedField(cs.Object, "grpc", "spec", "sourceType"); err != nil {
-		return err
-	}
-	if err := unstructured.SetNestedField(cs.Object, importCR.Spec.TargetRegistry.URL, "spec", "address"); err != nil {
-		return err
-	}
-	if err := unstructured.SetNestedField(cs.Object, "Mirrored Catalog - "+importCR.Name, "spec", "displayName"); err != nil {
-		return err
-	}
-	if err := unstructured.SetNestedField(cs.Object, "Mirror Operator", "spec", "publisher"); err != nil {
-		return err
-	}
-
-	if err := r.Client.Create(ctx, cs); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create CatalogSource")
-			return err
-		}
-		logger.Info("CatalogSource already exists, skipping")
-	}
-	return nil
-}
-
-func (r *MirrorImportReconciler) ensureICSP(ctx context.Context, importCR *mirrorv1.MirrorImport) error {
-	return r.ensureIDMS(ctx, importCR)
-}
-
-func (r *MirrorImportReconciler) ensureIDMS(ctx context.Context, importCR *mirrorv1.MirrorImport) error {
-	logger := log.FromContext(ctx)
-
-	idms := &unstructured.Unstructured{}
-	idms.SetAPIVersion("config.openshift.io/v1")
-	idms.SetKind("ImageDigestMirrorSet")
-	idms.SetName("mirror-" + importCR.Name)
-
-	mirrors := []interface{}{
-		map[string]interface{}{
-			"source": "registry.redhat.io",
-			"mirrors": []interface{}{
-				importCR.Spec.TargetRegistry.URL + "/registry.redhat.io",
-			},
-		},
-		map[string]interface{}{
-			"source": "registry.connect.redhat.com",
-			"mirrors": []interface{}{
-				importCR.Spec.TargetRegistry.URL + "/registry.connect.redhat.com",
-			},
-		},
-	}
-
-	if err := unstructured.SetNestedSlice(idms.Object, mirrors, "spec", "imageDigestMirrors"); err != nil {
-		return err
-	}
-
-	if err := r.Client.Create(ctx, idms); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			logger.Error(err, "failed to create ImageDigestMirrorSet")
-			return err
-		}
-		logger.Info("ImageDigestMirrorSet already exists, skipping")
-	}
-	return nil
 }
 
 func (r *MirrorImportReconciler) SetupWithManager(mgr ctrl.Manager) error {

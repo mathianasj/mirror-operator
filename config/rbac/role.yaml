@@ -87,6 +87,8 @@ rules:
   - config.openshift.io
   resources:
   - imagecontentsourcepolicies
+  - imagedigestmirrorsets
+  - imagetagmirrorsets
   verbs:
   - create
   - delete

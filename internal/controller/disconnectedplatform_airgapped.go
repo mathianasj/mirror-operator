@@ -325,6 +325,10 @@ func (r *DisconnectedPlatformReconciler) reconcileImportScanner(ctx context.Cont
 		return fmt.Errorf("failed to ensure import scanner RBAC: %w", err)
 	}
 
+	if err := r.ensureImportJobRBAC(ctx, platform); err != nil {
+		return fmt.Errorf("failed to ensure import job RBAC: %w", err)
+	}
+
 	if err := r.ensureImportScannerScript(ctx, platform); err != nil {
 		return fmt.Errorf("failed to ensure import scanner script: %w", err)
 	}
@@ -381,6 +385,8 @@ func (r *DisconnectedPlatformReconciler) reconcileImportScanner(ctx context.Cont
 										{Name: "IMPORT_PATH", Value: importPath},
 										{Name: "NAMESPACE", Value: architectNamespace},
 										{Name: "PLATFORM_NAME", Value: platform.Name},
+										{Name: "TARGET_REGISTRY", Value: platform.Spec.Airgapped.MirrorRegistry},
+										{Name: "IMPORT_PVC", Value: "import-data"},
 									},
 									VolumeMounts: []corev1.VolumeMount{
 										{
@@ -472,6 +478,14 @@ for bundle in "${bundles[@]}"; do
     continue
   fi
 
+  # Extract imageset-config.yaml from bundle for the import Job
+  imagesetconfig=""
+  tmpdir=$(mktemp -d)
+  if tar -xf "$bundle" -C "$tmpdir" imageset-config.yaml 2>/dev/null; then
+    imagesetconfig=$(cat "$tmpdir/imageset-config.yaml")
+  fi
+  rm -rf "$tmpdir"
+
   echo "Creating MirrorImport for $filename"
   cat <<EOFI | oc apply -f -
 apiVersion: mirror.mirror.mathianasj.github.com/v1
@@ -480,10 +494,16 @@ metadata:
   name: ${cr_name}
   namespace: ${NAMESPACE}
 spec:
+  imageSetConfig: |
+$(echo "$imagesetconfig" | sed 's/^/    /')
   bundle:
-    path: ${bundle}
-    type: file
-  targetRegistry: ""
+    pvc: ${IMPORT_PVC}
+    filename: ${filename}
+  targetRegistry:
+    url: ${TARGET_REGISTRY}
+  publish:
+    catalogSource: true
+    imageContentSourcePolicy: true
 EOFI
 done
 
@@ -582,6 +602,76 @@ func (r *DisconnectedPlatformReconciler) ensureImportScannerRBAC(ctx context.Con
 			log.FromContext(ctx).Error(err, "failed to set owner reference on scanner RoleBinding")
 		}
 		if err := r.Create(ctx, rb); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ensureImportJobRBAC creates the ServiceAccount, ClusterRole, and ClusterRoleBinding
+// for the import Job to apply IDMS/ITMS/CatalogSource manifests after oc-mirror completes.
+func (r *DisconnectedPlatformReconciler) ensureImportJobRBAC(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mirror-import-job",
+			Namespace: architectNamespace,
+		},
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sa), sa); apierrors.IsNotFound(err) {
+		if err := ctrl.SetControllerReference(platform, sa, r.Scheme); err != nil {
+			log.FromContext(ctx).Error(err, "failed to set owner reference on import job SA")
+		}
+		if err := r.Create(ctx, sa); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+	}
+
+	clusterRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "mirror-import-job",
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"config.openshift.io"},
+				Resources: []string{"imagedigestmirrorsets", "imagetagmirrorsets"},
+				Verbs:     []string{"get", "create", "update", "patch"},
+			},
+			{
+				APIGroups: []string{"operators.coreos.com"},
+				Resources: []string{"catalogsources"},
+				Verbs:     []string{"get", "create", "update", "patch"},
+			},
+		},
+	}
+
+	existingCR := &rbacv1.ClusterRole{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(clusterRole), existingCR); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, clusterRole); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+	} else if err == nil {
+		existingCR.Rules = clusterRole.Rules
+		if err := r.Update(ctx, existingCR); err != nil {
+			return err
+		}
+	}
+
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "mirror-import-job",
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "mirror-import-job", Namespace: architectNamespace},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "mirror-import-job",
+		},
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(crb), &rbacv1.ClusterRoleBinding{}); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, crb); err != nil && !apierrors.IsAlreadyExists(err) {
 			return err
 		}
 	}
