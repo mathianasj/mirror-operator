@@ -84,7 +84,76 @@ Each operator can be individually disabled or customized. See the [Architecture 
 - `oc` CLI installed and authenticated
 - OLM (Operator Lifecycle Manager) available on the cluster
 
-### Install the Operator
+### Install via OLM (Recommended)
+
+Create a CatalogSource to make the operator available in the OpenShift OperatorHub:
+
+```sh
+oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: mirror-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: quay.io/mathianasj/mirror-operator-catalog:v0.0.1
+  displayName: Mirror Operator
+  publisher: mathianasj
+  updateStrategy:
+    registryPoll:
+      interval: 10m
+EOF
+```
+
+Then install from the OpenShift console:
+
+1. Navigate to **Operators > OperatorHub**
+2. Search for **Mirror Operator**
+3. Click **Install** and follow the prompts
+
+Or install via CLI:
+
+```sh
+oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: mirror-operator
+  namespace: mirror-operator-system
+spec:
+  channel: alpha
+  name: mirror-operator
+  source: mirror-operator-catalog
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+```
+
+For airgapped clusters, mirror the catalog image to your local registry first:
+
+```sh
+oc image mirror quay.io/mathianasj/mirror-operator-catalog:v0.0.1 \
+  <your-registry>/mirror-operator-catalog:v0.0.1
+
+oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: mirror-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: <your-registry>/mirror-operator-catalog:v0.0.1
+  displayName: Mirror Operator
+  publisher: mathianasj
+  updateStrategy:
+    registryPoll:
+      interval: 10m
+EOF
+```
+
+### Install from Source (Development)
 
 ```sh
 # Install CRDs
