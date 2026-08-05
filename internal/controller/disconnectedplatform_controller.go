@@ -3818,11 +3818,8 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				platform.Spec.Connected.MirrorRegistry = newRegistry
 			}
 
-			// Ensure Quay route uses passthrough TLS — edge termination causes
-			// EOF errors on large blob uploads (e.g. RHCOS ISO ~1GB) because
-			// HAProxy buffers and resets the connection.
-			if err := r.ensureQuayRoutePassthrough(ctx, quayRegistry); err != nil {
-				logger.Error(err, "failed to ensure Quay route passthrough TLS")
+			if err := r.ensureQuayRouteAnnotations(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to ensure Quay route annotations")
 			}
 
 			// Configure Clair VEX if needed for existing QuayRegistry
@@ -4294,7 +4291,7 @@ func (r *DisconnectedPlatformReconciler) getQuayHostname(ctx context.Context, qu
 	return hostname, nil
 }
 
-func (r *DisconnectedPlatformReconciler) ensureQuayRoutePassthrough(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+func (r *DisconnectedPlatformReconciler) ensureQuayRouteAnnotations(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
 	logger := log.FromContext(ctx)
 
 	route := &unstructured.Unstructured{}
@@ -4310,16 +4307,30 @@ func (r *DisconnectedPlatformReconciler) ensureQuayRoutePassthrough(ctx context.
 		return err
 	}
 
-	termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
-	if termination == "passthrough" {
+	desired := map[string]string{
+		"haproxy.router.openshift.io/timeout":        "60m",
+		"haproxy.router.openshift.io/timeout-tunnel": "60m",
+	}
+
+	annotations := route.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	needsUpdate := false
+	for k, v := range desired {
+		if annotations[k] != v {
+			annotations[k] = v
+			needsUpdate = true
+		}
+	}
+
+	if !needsUpdate {
 		return nil
 	}
 
-	logger.Info("Patching Quay route from edge to passthrough TLS", "route", route.GetName())
-	unstructured.SetNestedField(route.Object, "passthrough", "spec", "tls", "termination")
-	unstructured.RemoveNestedField(route.Object, "spec", "tls", "certificate")
-	unstructured.RemoveNestedField(route.Object, "spec", "tls", "key")
-	unstructured.RemoveNestedField(route.Object, "spec", "tls", "caCertificate")
+	logger.Info("Updating Quay route annotations for large blob uploads", "route", route.GetName())
+	route.SetAnnotations(annotations)
 	return r.Update(ctx, route)
 }
 
