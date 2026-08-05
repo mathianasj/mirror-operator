@@ -9814,8 +9814,6 @@ if [ "$(params.rhcos-download-enabled)" != "true" ]; then
   exit 0
 fi
 
-echo "=== Downloading RHCOS boot images for ACM Host Inventory ==="
-
 OC_VERSION="$(params.oc-version)"
 # Extract major.minor (e.g., "4.18.3" -> "4.18", "stable-4.18" -> "4.18")
 RHCOS_VERSION=$(echo "$OC_VERSION" | grep -oP '\d+\.\d+')
@@ -9823,6 +9821,33 @@ if [ -z "$RHCOS_VERSION" ]; then
   echo "ERROR: Cannot extract major.minor version from $OC_VERSION"
   exit 1
 fi
+
+INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+if [ -n "$INTERMEDIATE_REGISTRY" ]; then
+  PULL_SECRET="/workspace/pull-secret/.dockerconfigjson"
+  REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
+  AUTH=$(python3 -c "
+import sys,json
+d=json.load(open('$PULL_SECRET'))
+auths=d.get('auths',{})
+a=auths.get('$REGISTRY_HOST',auths.get('${INTERMEDIATE_REGISTRY}',{}))
+print(a.get('auth',''))
+" 2>/dev/null || true)
+  AUTH_HEADER=""
+  if [ -n "$AUTH" ]; then
+    AUTH_HEADER="Authorization: Basic ${AUTH}"
+  fi
+  HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
+    ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+    "https://${INTERMEDIATE_REGISTRY}/v2/rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ]; then
+    echo "RHCOS server image already exists: ${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION} — skipping download"
+    exit 0
+  fi
+  echo "RHCOS server image not found (HTTP $HTTP_CODE), proceeding with download..."
+fi
+
+echo "=== Downloading RHCOS boot images for ACM Host Inventory ==="
 
 RHCOS_DIR="/workspace/output/rhcos"
 mkdir -p "$RHCOS_DIR"
@@ -9872,6 +9897,7 @@ echo "=== RHCOS download complete ==="
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "output"},
+				{"name": "pull-secret"},
 			},
 		},
 
@@ -9902,15 +9928,33 @@ if [ "$(params.rhcos-download-enabled)" != "true" ] || [ -z "$(params.intermedia
   exit 0
 fi
 
-echo "=== Building RHCOS server OCI image ==="
-
 RHCOS_DIR="/workspace/output/rhcos"
 BASE_IMAGE="$(params.rhcos-server-base-image)"
 INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
 
-RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
+# Get RHCOS version from metadata file, or derive from OCP version if download was skipped
+if [ -f "$RHCOS_DIR/RHCOS_VERSION.txt" ]; then
+  RHCOS_VERSION=$(cat "$RHCOS_DIR/RHCOS_VERSION.txt" | grep rhcos_version | cut -d= -f2)
+else
+  RHCOS_VERSION=$(echo "$(params.oc-version)" | grep -oP '\d+\.\d+')
+fi
 
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
+
+# Check if RHCOS server image already exists in intermediate registry
+if skopeo inspect --authfile=/workspace/pull-secret/.dockerconfigjson --tls-verify=false \
+  "docker://${FULL_IMAGE}" >/dev/null 2>&1; then
+  echo "RHCOS server image already exists: ${FULL_IMAGE} — skipping build"
+  exit 0
+fi
+
+# If download was skipped but image doesn't exist, we need the RHCOS files
+if [ ! -f "$RHCOS_DIR/rhcos-live.x86_64.iso" ]; then
+  echo "ERROR: RHCOS files not found and image not in registry. Re-run with download enabled."
+  exit 1
+fi
+
+echo "=== Building RHCOS server OCI image ==="
 
 cat > "$RHCOS_DIR/Containerfile" <<CEOF
 FROM ${BASE_IMAGE}
