@@ -8734,299 +8734,93 @@ df -h /workspace/output
 # This ensures we use the ACTUAL paths that oc-mirror created
 echo "=== Generating registries.conf from IDMS + ITMS ==="
 
-# IDMS file was saved by mirror-to-intermediate to persistent location
-# (oc-mirror deletes working-dir at startup, so we can't read it from there)
 IDMS_FILE="/workspace/output/idms-oc-mirror.yaml"
 
 if [ ! -f "$IDMS_FILE" ]; then
   echo "ERROR: IDMS file not found at $IDMS_FILE"
   echo "This file should have been saved by the mirror-to-intermediate step"
-  echo "Checking for IDMS files..."
   find /workspace/output -name "idms-*.yaml" -type f 2>/dev/null || echo "No IDMS files found"
   exit 1
 fi
 
 echo "Found IDMS file: $IDMS_FILE"
-
-# Output IDMS content to logs for debugging
 echo ""
-echo "=== IDMS File Content (for debugging parser) ==="
+echo "=== IDMS File Content ==="
 cat "$IDMS_FILE"
 echo "=== End IDMS Content ==="
 echo ""
 
-# Create registries.conf directory
 mkdir -p /workspace/output/tmp/containers
 
-# Parse IDMS YAML to extract source -> mirror mappings
-# IDMS format:
-#   spec:
-#     imageDigestMirrors:
-#     - mirrors:
-#       - <mirror-registry>/<path>
-#       source: <source-registry>
-cat > /workspace/output/tmp/containers/registries.conf <<'REGCONF_HEADER'
-# Generated from IDMS/ITMS files created by oc-mirror
-# This ensures registry paths match what mirror-to-intermediate actually created
-REGCONF_HEADER
+CONF_FILE="/workspace/output/tmp/containers/registries.conf"
+INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+INTERMEDIATE_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
 
-# Extract unique source registries and their mirror paths from IDMS
-# Use yq/jq if available, otherwise fall back to grep/awk
-if command -v yq >/dev/null 2>&1; then
-  # Use yq to parse YAML properly
-  yq eval '.spec.imageDigestMirrors[] | .source as $source | .mirrors[] | [$source, .] | @tsv' "$IDMS_FILE" | \
-  awk -F'\t' '
-    !seen[$1]++ {
-      sources[++src_count] = $1
-      mirrors[$1] = $2
-    }
-    END {
-      for (i = 1; i <= src_count; i++) {
-        source = sources[i]
-        mirror = mirrors[source]
-        # Use FULL mirror path (not just registry hostname)
+# Write header
+echo "# Generated from IDMS/ITMS files created by oc-mirror" > "$CONF_FILE"
 
-        print ""
-        print "[[registry]]"
-        print "location=\"" source "\""
-        print "blocked = true"
-        print "[[registry.mirror]]"
-        print "location=\"" mirror "\""
-      }
-    }
-  ' >> /workspace/output/tmp/containers/registries.conf
-else
-  # Fallback: Parse IDMS YAML without yq
-  # IDMS structure:
-  #   spec:
-  #     imageDigestMirrors:
-  #     - mirrors:
-  #       - mirror-registry/path/to/repo
-  #       source: source-registry/original/repo
+# parse_yaml_mirrors: extract source->mirror pairs from IDMS/ITMS YAML
+# Handles multi-document YAML and alternating mirror/source pairs
+parse_yaml_mirrors() {
+  local file="$1"
+  local current_mirror=""
+  while IFS= read -r line; do
+    case "$line" in
+      *"- mirrors:"*)
+        current_mirror=""
+        ;;
+      "    - "*)
+        current_mirror=$(echo "$line" | sed 's/^[[:space:]]*- //')
+        ;;
+      *"source: "*)
+        local source=$(echo "$line" | sed 's/^[[:space:]]*source:[[:space:]]*//')
+        if [ -n "$current_mirror" ] && [ -n "$source" ]; then
+          # Skip self-references to the intermediate registry
+          case "$source" in *"$INTERMEDIATE_HOST"*) current_mirror="" ; continue ;; esac
+          echo "$source	$current_mirror"
+        fi
+        current_mirror=""
+        ;;
+    esac
+  done < "$file"
+}
 
-  # Use awk to parse the YAML structure
-  awk '
-    # Track indentation to know which section we are in
-    /^[[:space:]]*imageDigestMirrors:/ { in_mirrors_section = 1; next }
+# Parse IDMS and generate registries.conf entries (deduplicated)
+parse_yaml_mirrors "$IDMS_FILE" | awk -F'\t' '!seen[$1]++' | while IFS='	' read -r source mirror; do
+  printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s"\n' "$source" "$mirror" >> "$CONF_FILE"
+done
 
-    # New mirror entry starts with "- mirrors:" or "  - mirrors:"
-    /^[[:space:]]*-[[:space:]]*mirrors:/ {
-      if (in_mirrors_section) {
-        current_source = ""
-        current_mirror = ""
-        reading_mirrors = 1
-      }
-      next
-    }
-
-    # Mirror URL (under mirrors list)
-    /^[[:space:]]*-[[:space:]]+[^[:space:]]/ {
-      if (reading_mirrors && current_mirror == "") {
-        # Extract the mirror URL (everything after "- ")
-        sub(/^[[:space:]]*-[[:space:]]+/, "")
-        current_mirror = $0
-      }
-      next
-    }
-
-    # Source registry
-    /^[[:space:]]*source:/ {
-      if (reading_mirrors) {
-        # Extract source (everything after "source: ")
-        sub(/^[[:space:]]*source:[[:space:]]*/, "")
-        current_source = $0
-
-        # We have both source and mirror, output them
-        if (current_source != "" && current_mirror != "") {
-          if (!seen[current_source]++) {
-            sources[++src_count] = current_source
-            mirrors[current_source] = current_mirror
-          }
-        }
-        reading_mirrors = 0
-      }
-      next
-    }
-
-    END {
-      for (i = 1; i <= src_count; i++) {
-        source = sources[i]
-        mirror = mirrors[source]
-        # Use FULL mirror path (not just registry hostname)
-
-        print ""
-        print "[[registry]]"
-        print "location=\"" source "\""
-        print "blocked = true"
-        print "[[registry.mirror]]"
-        print "location=\"" mirror "\""
-      }
-    }
-  ' "$IDMS_FILE" >> /workspace/output/tmp/containers/registries.conf
-fi
-
-# Parse ITMS (ImageTagMirrorSet) for tag-based mirrors
-# ITMS format is similar to IDMS but for tags instead of digests
+# Parse ITMS if present
 ITMS_FILE="/workspace/output/itms-oc-mirror.yaml"
-
 if [ -f "$ITMS_FILE" ]; then
   echo ""
-  echo "=== ITMS File Content (for debugging parser) ==="
+  echo "=== ITMS File Content ==="
   cat "$ITMS_FILE"
   echo "=== End ITMS Content ==="
   echo ""
 
-  # Extract source -> mirror mappings from ITMS
-  if command -v yq >/dev/null 2>&1; then
-    # Use yq to parse YAML properly
-    yq eval '.spec.imageTagMirrors[] | .source as $source | .mirrors[] | [$source, .] | @tsv' "$ITMS_FILE" | \
-    awk -F'\t' '
-      !seen[$1]++ {
-        sources[++src_count] = $1
-        mirrors[$1] = $2
-      }
-      END {
-        for (i = 1; i <= src_count; i++) {
-          source = sources[i]
-          mirror = mirrors[source]
-          # Use FULL mirror path (not just registry hostname)
-
-          print ""
-          print "[[registry]]"
-          print "location=\"" source "\""
-          print "blocked = true"
-          print "[[registry.mirror]]"
-          print "location=\"" mirror "\""
-        }
-      }
-    ' >> /workspace/output/tmp/containers/registries.conf
-  else
-    # Fallback: Parse ITMS YAML without yq
-    # ITMS structure is similar to IDMS but uses imageTagMirrors instead
-    awk '
-      # Track indentation to know which section we are in
-      /^[[:space:]]*imageTagMirrors:/ { in_mirrors_section = 1; next }
-
-      # New mirror entry starts with "- mirrors:" or "  - mirrors:"
-      /^[[:space:]]*-[[:space:]]*mirrors:/ {
-        if (in_mirrors_section) {
-          current_source = ""
-          current_mirror = ""
-          reading_mirrors = 1
-        }
-        next
-      }
-
-      # Mirror URL (under mirrors list)
-      /^[[:space:]]*-[[:space:]]+[^[:space:]]/ {
-        if (reading_mirrors && current_mirror == "") {
-          # Extract the mirror URL (everything after "- ")
-          sub(/^[[:space:]]*-[[:space:]]+/, "")
-          current_mirror = $0
-        }
-        next
-      }
-
-      # Source registry
-      /^[[:space:]]*source:/ {
-        if (reading_mirrors) {
-          # Extract source (everything after "source: ")
-          sub(/^[[:space:]]*source:[[:space:]]*/, "")
-          current_source = $0
-
-          # We have both source and mirror, output them
-          if (current_source != "" && current_mirror != "") {
-            if (!seen[current_source]++) {
-              sources[++src_count] = current_source
-              mirrors[current_source] = current_mirror
-            }
-          }
-          reading_mirrors = 0
-        }
-        next
-      }
-
-      END {
-        for (i = 1; i <= src_count; i++) {
-          source = sources[i]
-          mirror = mirrors[source]
-          # Use FULL mirror path (not just registry hostname)
-
-          print ""
-          print "[[registry]]"
-          print "location=\"" source "\""
-          print "blocked = true"
-          print "[[registry.mirror]]"
-          print "location=\"" mirror "\""
-        }
-      }
-    ' "$ITMS_FILE" >> /workspace/output/tmp/containers/registries.conf
-  fi
-
+  parse_yaml_mirrors "$ITMS_FILE" | awk -F'\t' '!seen[$1]++' | while IFS='	' read -r source mirror; do
+    printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s"\n' "$source" "$mirror" >> "$CONF_FILE"
+  done
   echo "Added ITMS-based tag mirrors to registries.conf"
 else
-  echo "No ITMS file found (tag-based mirrors may not work)"
+  echo "No ITMS file found"
 fi
 
 # Block CDN access that Quay might redirect to
-cat >> /workspace/output/tmp/containers/registries.conf <<'REGCONF_CDN'
+printf '\n# Block CDN access\n' >> "$CONF_FILE"
+for cdn in cdn01.quay.io cdn02.quay.io cdn03.quay.io; do
+  printf '\n[[registry]]\nlocation="%s"\nblocked = true\n' "$cdn" >> "$CONF_FILE"
+done
 
-# Block CDN access that Quay might redirect to
-[[registry]]
-location="cdn01.quay.io"
-blocked = true
-
-[[registry]]
-location="cdn02.quay.io"
-blocked = true
-
-[[registry]]
-location="cdn03.quay.io"
-blocked = true
-
-# Top-level fallback mirrors for upstream registries blocked in /etc/hosts.
-# Specific IDMS/ITMS entries above take priority (more-specific wins).
-# These catch any references NOT covered by IDMS/ITMS (e.g. catalog indexes
-# referenced by tag that only appear in ITMS, which may not be generated).
-[[registry]]
-location="registry.redhat.io"
-blocked = true
-[[registry.mirror]]
-location="$(params.intermediate-registry)"
-
-[[registry]]
-location="registry.access.redhat.com"
-blocked = true
-[[registry.mirror]]
-location="$(params.intermediate-registry)"
-
-[[registry]]
-location="quay.io"
-blocked = true
-[[registry.mirror]]
-location="$(params.intermediate-registry)"
-
-# Docker Hub images (e.g. amazon/aws-cli) resolve to docker.io - mirror them
-[[registry]]
-location="docker.io"
-blocked = true
-[[registry.mirror]]
-location="$(params.intermediate-registry)"
-
-[[registry]]
-location="registry-1.docker.io"
-blocked = true
-[[registry.mirror]]
-location="$(params.intermediate-registry)"
-
-[[registry]]
-location="gcr.io"
-blocked = true
-
-[[registry]]
-location="ghcr.io"
-blocked = true
-REGCONF_CDN
+# Top-level fallback mirrors for upstream registries blocked in /etc/hosts
+printf '\n# Top-level fallback mirrors\n' >> "$CONF_FILE"
+for upstream in registry.redhat.io registry.access.redhat.com quay.io docker.io registry-1.docker.io; do
+  printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s"\n' "$upstream" "$INTERMEDIATE_REGISTRY" >> "$CONF_FILE"
+done
+for blocked in gcr.io ghcr.io; do
+  printf '\n[[registry]]\nlocation="%s"\nblocked = true\n' "$blocked" >> "$CONF_FILE"
+done
 
 echo "=== Generated registries.conf from IDMS + ITMS ==="
 cat /workspace/output/tmp/containers/registries.conf
