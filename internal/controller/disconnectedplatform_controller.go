@@ -8701,6 +8701,11 @@ mkdir -p /workspace/output/.oc-mirror/.cache
 export TMPDIR=/workspace/output/tmp
 export HOME=/workspace/output
 
+# Clear stale registries config from previous steps (e.g. mirror-to-intermediate)
+rm -rf /workspace/output/.config/containers/registries.conf.d
+rm -f /workspace/output/.config/containers/registries.conf
+rm -rf /workspace/output/tmp/containers
+
 # Configure container storage to use workspace instead of /tmp or /var/tmp
 # This ensures the localhost:55000 internal registry uses the PVC
 mkdir -p /workspace/output/containers
