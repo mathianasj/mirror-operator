@@ -147,6 +147,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=console.openshift.io,resources=consoleplugins,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=consoles,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=operator.openshift.io,resources=ingresscontrollers,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=ingresses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=infrastructures,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
@@ -309,6 +310,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 					Kind: "QuayRegistry", APIGroup: "quay.redhat.com", Namespace: architectNamespace},
 			)
 		}
+		// Ensure AWS CLB idle timeout is sufficient for large blob uploads
+		if err := r.ensureAWSLoadBalancerTimeout(ctx); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure AWS load balancer timeout")
+		}
+
 		// Ensure Quay credentials are in pull-secret for managed Quay
 		if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
 			if err := r.ensureQuayCredentials(ctx, platform); err != nil {
@@ -4332,6 +4338,54 @@ func (r *DisconnectedPlatformReconciler) ensureQuayRouteAnnotations(ctx context.
 	logger.Info("Updating Quay route annotations for large blob uploads", "route", route.GetName())
 	route.SetAnnotations(annotations)
 	return r.Update(ctx, route)
+}
+
+// ensureAWSLoadBalancerTimeout detects AWS platform and increases the CLB idle
+// timeout on the default IngressController to prevent connection resets during
+// large blob uploads through the route.
+func (r *DisconnectedPlatformReconciler) ensureAWSLoadBalancerTimeout(ctx context.Context) error {
+	logger := log.FromContext(ctx)
+
+	infra := &unstructured.Unstructured{}
+	infra.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Infrastructure",
+	})
+	infra.SetName("cluster")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(infra), infra); err != nil {
+		return fmt.Errorf("failed to get Infrastructure: %w", err)
+	}
+
+	platformType, _, _ := unstructured.NestedString(infra.Object, "status", "platformStatus", "type")
+	if platformType != "AWS" {
+		return nil
+	}
+
+	ic := &unstructured.Unstructured{}
+	ic.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.openshift.io",
+		Version: "v1",
+		Kind:    "IngressController",
+	})
+	ic.SetName("default")
+	ic.SetNamespace("openshift-ingress-operator")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ic), ic); err != nil {
+		return fmt.Errorf("failed to get IngressController: %w", err)
+	}
+
+	currentTimeout, _, _ := unstructured.NestedString(ic.Object,
+		"spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "classicLoadBalancer", "connectionIdleTimeout")
+	if currentTimeout == "5m0s" {
+		return nil
+	}
+
+	logger.Info("Setting AWS CLB idle timeout to 5m for large blob uploads", "current", currentTimeout)
+	unstructured.SetNestedField(ic.Object, "5m0s",
+		"spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "classicLoadBalancer", "connectionIdleTimeout")
+	return r.Update(ctx, ic)
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
