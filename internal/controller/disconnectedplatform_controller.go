@@ -5124,6 +5124,21 @@ func (r *DisconnectedPlatformReconciler) ensureArchitectServiceAccount(ctx conte
 			"resources": []interface{}{"configmaps", "secrets"},
 			"verbs":     []interface{}{"get", "list", "watch"},
 		},
+		map[string]interface{}{
+			"apiGroups": []interface{}{""},
+			"resources": []interface{}{"persistentvolumeclaims"},
+			"verbs":     []interface{}{"get", "list", "create", "delete"},
+		},
+		map[string]interface{}{
+			"apiGroups": []interface{}{""},
+			"resources": []interface{}{"pods"},
+			"verbs":     []interface{}{"get", "list", "create", "delete"},
+		},
+		map[string]interface{}{
+			"apiGroups": []interface{}{""},
+			"resources": []interface{}{"services"},
+			"verbs":     []interface{}{"get", "create", "delete"},
+		},
 	}, "rules")
 
 	existingRole := &unstructured.Unstructured{}
