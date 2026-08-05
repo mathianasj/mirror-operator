@@ -932,7 +932,7 @@ func (r *CollectionPipelineReconciler) getArchitectBackendImage(ctx context.Cont
 
 func (r *CollectionPipelineReconciler) getArchitectConsolePluginImage(ctx context.Context) string {
 	platform, err := r.findPlatform(ctx)
-	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.ConsolePlugin.Image != "" {
+	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.ConsolePlugin != nil && platform.Spec.Architect.ConsolePlugin.Image != "" {
 		return platform.Spec.Architect.ConsolePlugin.Image
 	}
 	return "quay.io/mirror-operator/airgap-architect-console-plugin:latest"
