@@ -3818,6 +3818,13 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				platform.Spec.Connected.MirrorRegistry = newRegistry
 			}
 
+			// Ensure Quay route uses passthrough TLS — edge termination causes
+			// EOF errors on large blob uploads (e.g. RHCOS ISO ~1GB) because
+			// HAProxy buffers and resets the connection.
+			if err := r.ensureQuayRoutePassthrough(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to ensure Quay route passthrough TLS")
+			}
+
 			// Configure Clair VEX if needed for existing QuayRegistry
 			if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
 				if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
@@ -4285,6 +4292,35 @@ func (r *DisconnectedPlatformReconciler) getQuayHostname(ctx context.Context, qu
 	hostname = strings.TrimPrefix(hostname, "http://")
 
 	return hostname, nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayRoutePassthrough(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "route.openshift.io",
+		Version: "v1",
+		Kind:    "Route",
+	})
+	route.SetName(quayRegistry.GetName() + "-quay")
+	route.SetNamespace(quayRegistry.GetNamespace())
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(route), route); err != nil {
+		return err
+	}
+
+	termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+	if termination == "passthrough" {
+		return nil
+	}
+
+	logger.Info("Patching Quay route from edge to passthrough TLS", "route", route.GetName())
+	unstructured.SetNestedField(route.Object, "passthrough", "spec", "tls", "termination")
+	unstructured.RemoveNestedField(route.Object, "spec", "tls", "certificate")
+	unstructured.RemoveNestedField(route.Object, "spec", "tls", "key")
+	unstructured.RemoveNestedField(route.Object, "spec", "tls", "caCertificate")
+	return r.Update(ctx, route)
 }
 
 func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
