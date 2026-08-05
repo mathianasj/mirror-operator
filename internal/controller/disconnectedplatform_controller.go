@@ -3781,6 +3781,27 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		// Check if QuayRegistry already exists
 		err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry)
 		if err == nil {
+			// Ensure route component is unmanaged (we create it with passthrough)
+			components, _, _ := unstructured.NestedSlice(quayRegistry.Object, "spec", "components")
+			for i, c := range components {
+				comp, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if comp["kind"] == "route" {
+					managed, _ := comp["managed"].(bool)
+					if managed {
+						components[i].(map[string]interface{})["managed"] = false
+						unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components")
+						if err := r.Update(ctx, quayRegistry); err != nil {
+							return fmt.Errorf("failed to update QuayRegistry route to unmanaged: %w", err)
+						}
+						logger.Info("Set QuayRegistry route component to unmanaged")
+					}
+					break
+				}
+			}
+
 			// QuayRegistry exists — ensure config bundle secret has valid S3 creds
 			if useS3Storage {
 				creds, err := r.resolveQuayS3Credentials(ctx, platform, quayConfig.Managed.Storage)
@@ -3826,7 +3847,7 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				}
 			}
 
-			return nil
+			return r.ensureQuayRoute(ctx, quayRegistry)
 		} else if !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -3872,7 +3893,7 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			},
 			map[string]interface{}{
 				"kind":    "route",
-				"managed": true,
+				"managed": false,
 			},
 			map[string]interface{}{
 				"kind":    "mirror",
@@ -3916,7 +3937,87 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			}
 		}
 
+		return r.ensureQuayRoute(ctx, quayRegistry)
+	}
+
+	return nil
+}
+
+// ensureQuayRoute creates or updates the passthrough route for Quay registry.
+func (r *DisconnectedPlatformReconciler) ensureQuayRoute(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	routeName := quayRegistry.GetName() + "-quay"
+	routeNamespace := quayRegistry.GetNamespace()
+
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "route.openshift.io",
+		Version: "v1",
+		Kind:    "Route",
+	})
+
+	err := r.Get(ctx, types.NamespacedName{Name: routeName, Namespace: routeNamespace}, route)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get Quay route: %w", err)
+	}
+
+	if apierrors.IsNotFound(err) {
+		// Derive hostname from cluster ingress domain
+		ingress := &unstructured.Unstructured{}
+		ingress.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "config.openshift.io",
+			Version: "v1",
+			Kind:    "Ingress",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Name: "cluster"}, ingress); err != nil {
+			return fmt.Errorf("failed to get cluster ingress for route hostname: %w", err)
+		}
+		domain, _, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
+		hostname := fmt.Sprintf("%s-%s.%s", routeName, routeNamespace, domain)
+
+		newRoute := &unstructured.Unstructured{}
+		newRoute.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "route.openshift.io",
+			Version: "v1",
+			Kind:    "Route",
+		})
+		newRoute.SetName(routeName)
+		newRoute.SetNamespace(routeNamespace)
+		newRoute.SetAnnotations(map[string]string{
+			"haproxy.router.openshift.io/timeout": "30m",
+		})
+		newRoute.Object["spec"] = map[string]interface{}{
+			"host": hostname,
+			"port": map[string]interface{}{
+				"targetPort": "https",
+			},
+			"tls": map[string]interface{}{
+				"termination":                   "passthrough",
+				"insecureEdgeTerminationPolicy": "Redirect",
+			},
+			"to": map[string]interface{}{
+				"kind":   "Service",
+				"name":   quayRegistry.GetName() + "-quay-app",
+				"weight": int64(100),
+			},
+		}
+		if err := r.Create(ctx, newRoute); err != nil {
+			return fmt.Errorf("failed to create Quay route: %w", err)
+		}
+		logger.Info("Created Quay passthrough route", "name", routeName)
 		return nil
+	}
+
+	termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+	if termination != "passthrough" {
+		logger.Info("Updating Quay route to passthrough termination", "name", routeName)
+		unstructured.SetNestedField(route.Object, "passthrough", "spec", "tls", "termination")
+		unstructured.SetNestedField(route.Object, "Redirect", "spec", "tls", "insecureEdgeTerminationPolicy")
+		unstructured.SetNestedField(route.Object, "https", "spec", "port", "targetPort")
+		if err := r.Update(ctx, route); err != nil {
+			return fmt.Errorf("failed to update Quay route: %w", err)
+		}
 	}
 
 	return nil
