@@ -4382,7 +4382,20 @@ func (r *DisconnectedPlatformReconciler) ensureAWSLoadBalancerTimeout(ctx contex
 		return nil
 	}
 
+	// Read existing values for required fields so validation passes
+	scope, _, _ := unstructured.NestedString(ic.Object, "spec", "endpointPublishingStrategy", "loadBalancer", "scope")
+	if scope == "" {
+		scope = "External"
+	}
+	awsType, _, _ := unstructured.NestedString(ic.Object, "spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "type")
+	if awsType == "" {
+		awsType = "Classic"
+	}
+
 	logger.Info("Setting AWS CLB idle timeout to 5m for large blob uploads", "current", currentTimeout)
+	unstructured.SetNestedField(ic.Object, scope, "spec", "endpointPublishingStrategy", "loadBalancer", "scope")
+	unstructured.SetNestedField(ic.Object, "AWS", "spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "type")
+	unstructured.SetNestedField(ic.Object, awsType, "spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "type")
 	unstructured.SetNestedField(ic.Object, "5m0s",
 		"spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "classicLoadBalancer", "connectionIdleTimeout")
 	return r.Update(ctx, ic)
