@@ -9894,8 +9894,9 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   -f "$RHCOS_DIR/Containerfile" \
   "$RHCOS_DIR"
 
-buildah push --storage-driver=vfs --tls-verify=false --authfile=/workspace/pull-secret/.dockerconfigjson \
-  "$FULL_IMAGE" "docker://${FULL_IMAGE}"
+skopeo copy --src-tls-verify=false --dest-tls-verify=false \
+  --authfile=/workspace/pull-secret/.dockerconfigjson \
+  containers-storage:"$FULL_IMAGE" docker://"$FULL_IMAGE"
 
 echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
