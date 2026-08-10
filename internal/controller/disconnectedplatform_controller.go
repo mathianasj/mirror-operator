@@ -9952,7 +9952,7 @@ buildah bud --storage-driver=vfs --isolation=chroot \
 REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
 REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
-INTERNAL_HOST="mirror-operator-quay-quay.${NAMESPACE}.svc.cluster.local"
+INTERNAL_HOST="mirror-operator-quay-quay-app.${NAMESPACE}.svc.cluster.local"
 
 if [ -n "$REGISTRY_PATH" ]; then
   PUSH_IMAGE="${INTERNAL_HOST}/${REGISTRY_PATH}/rhcos-server:${RHCOS_VERSION}"
