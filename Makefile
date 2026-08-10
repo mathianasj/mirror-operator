@@ -347,3 +347,42 @@ catalog-push: ## Push a catalog image.
 .PHONY: catalog-clean
 catalog-clean: ## Clean generated catalog files.
 	rm -rf catalog/ catalog.Dockerfile
+
+##@ Release
+
+.PHONY: release
+release: ## Create a versioned release (usage: make release VERSION=x.y.z)
+	@if [ "$(VERSION)" = "0.0.1" ]; then \
+		echo "ERROR: specify VERSION, e.g.  make release VERSION=1.0.0"; exit 1; \
+	fi
+	@if ! echo "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "ERROR: VERSION must be semver (x.y.z), got '$(VERSION)'"; exit 1; \
+	fi
+	@if git rev-parse "v$(VERSION)" >/dev/null 2>&1; then \
+		echo "ERROR: tag v$(VERSION) already exists"; exit 1; \
+	fi
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "ERROR: working tree is dirty — commit or stash changes first"; exit 1; \
+	fi
+	@command -v gh >/dev/null 2>&1 || { echo "ERROR: gh CLI is required but not installed"; exit 1; }
+	$(eval OLD_VERSION := $(shell grep '^VERSION ?=' Makefile | sed 's/VERSION ?= //'))
+	@echo "Releasing v$(VERSION)  (previous: $(OLD_VERSION))"
+	@# Update VERSION in Makefile
+	sed -i '' 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile
+	@# Update catalog-templates/basic.yaml — channel entry name
+	sed -i '' 's/name: mirror-operator\.v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/name: mirror-operator.v$(VERSION)/' catalog-templates/basic.yaml
+	@# Update catalog-templates/basic.yaml — bundle image tag
+	sed -i '' 's|mirror-operator:[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|mirror-operator:$(VERSION)|' catalog-templates/basic.yaml
+	@# Add replaces field for upgrade path (skip if previous was 0.0.1 — never published)
+	@if [ "$(OLD_VERSION)" != "$(VERSION)" ] && [ "$(OLD_VERSION)" != "0.0.1" ]; then \
+		if grep -q 'replaces:' catalog-templates/basic.yaml; then \
+			sed -i '' 's/replaces: mirror-operator\.v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/replaces: mirror-operator.v$(OLD_VERSION)/' catalog-templates/basic.yaml; \
+		else \
+			sed -i '' '/name: mirror-operator\.v$(VERSION)/a\'$$'\n''        replaces: mirror-operator.v$(OLD_VERSION)' catalog-templates/basic.yaml; \
+		fi \
+	fi
+	git add Makefile catalog-templates/basic.yaml
+	git commit -m "Release v$(VERSION)"
+	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
+	git push origin HEAD "v$(VERSION)"
+	gh release create "v$(VERSION)" --title "v$(VERSION)" --generate-notes
