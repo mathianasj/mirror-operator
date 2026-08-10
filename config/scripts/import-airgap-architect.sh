@@ -519,6 +519,46 @@ check_podman() {
     fi
 }
 
+# Detect if IPv6 is disabled at the kernel level and configure podman accordingly.
+# When IPv6 is disabled, pasta (podman's rootless networking) fails to bind ports
+# with "Address family not supported by protocol". This configures pasta to use
+# IPv4 only via containers.conf.
+configure_podman_ipv6() {
+    if [ -d /proc/sys/net/ipv6 ]; then
+        return 0
+    fi
+
+    log "IPv6 is disabled at kernel level - configuring podman for IPv4-only networking..."
+
+    local containers_conf="${HOME}/.config/containers/containers.conf"
+    mkdir -p "$(dirname "${containers_conf}")"
+
+    if [ -f "${containers_conf}" ]; then
+        if grep -q 'pasta_options' "${containers_conf}"; then
+            log "  containers.conf already has pasta_options configured, skipping"
+            return 0
+        fi
+        # Append to existing file
+        if grep -q '\[network\]' "${containers_conf}"; then
+            sed -i.bak '/\[network\]/a pasta_options = ["-4"]' "${containers_conf}"
+            rm -f "${containers_conf}.bak"
+        else
+            cat >> "${containers_conf}" <<'EOF'
+
+[network]
+pasta_options = ["-4"]
+EOF
+        fi
+    else
+        cat > "${containers_conf}" <<'EOF'
+[network]
+pasta_options = ["-4"]
+EOF
+    fi
+
+    log "✓ Configured podman pasta for IPv4-only mode"
+}
+
 validate_network_route() {
     local registry_host="$1"
     # Strip port if present
@@ -1806,6 +1846,9 @@ start_containers() {
     elif [ -n "${EXISTING_REGISTRY_URL}" ]; then
         validate_network_route "${EXISTING_REGISTRY_URL}"
     fi
+
+    # Configure podman for IPv4-only if IPv6 is disabled at kernel level
+    configure_podman_ipv6
 
     # Either install mirror-registry or configure existing registry
     if [ "${MIRROR_REGISTRY_INSTALL}" = "true" ]; then

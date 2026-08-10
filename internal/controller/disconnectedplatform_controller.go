@@ -240,6 +240,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, platform)
 		}
 	}
+	// Track whether any operations failed due to missing CRDs so we can requeue
+	crdMissing := false
+
 	if signingImages {
 		if err := r.reconcileRHTASConfig(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to reconcile RHTAS config")
@@ -272,6 +275,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	// Reconcile RHTPA if configured (regardless of current status to ensure Keycloak clients exist)
 	if platform.Spec.Connected != nil && platform.Spec.Connected.RHTPA != nil {
 		if err := r.reconcileRHTPAConfig(ctx, platform); err != nil {
+			if isCRDNotFoundError(err) {
+				crdMissing = true
+			}
 			log.FromContext(ctx).Error(err, "failed to reconcile RHTPA config")
 		} else {
 			platform.Status.Components = append(platform.Status.Components,
@@ -303,6 +309,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	// Reconcile Quay for intermediate registry (only in connected mode)
 	if platform.Spec.Mode == mirrorv1.PlatformModeConnected && platform.Spec.Connected != nil {
 		if err := r.reconcileQuayConfig(ctx, platform); err != nil {
+			if isCRDNotFoundError(err) {
+				crdMissing = true
+			}
 			log.FromContext(ctx).Error(err, "failed to reconcile Quay config")
 		} else if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
 			platform.Status.Components = append(platform.Status.Components,
@@ -318,6 +327,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		// Ensure Quay credentials are in pull-secret for managed Quay
 		if platform.Spec.Connected.Quay != nil && platform.Spec.Connected.Quay.Managed != nil && platform.Spec.Connected.Quay.Managed.Enabled {
 			if err := r.ensureQuayCredentials(ctx, platform); err != nil {
+				if isCRDNotFoundError(err) {
+					crdMissing = true
+				}
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
@@ -349,6 +361,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
+			if isCRDNotFoundError(err) {
+				crdMissing = true
+			}
 			log.FromContext(ctx).Error(err, "failed to reconcile collection pipeline template")
 		} else {
 			platform.Status.Components = append(platform.Status.Components,
@@ -423,11 +438,20 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	if crdMissing {
+		log.FromContext(ctx).Info("Some operator CRDs not yet available, requeuing until they appear")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 
 func collectionVersionComplete(phase string) bool {
 	return phase == "Complete" || phase == "Succeeded"
+}
+
+func isCRDNotFoundError(err error) bool {
+	return strings.Contains(err.Error(), "no matches for kind")
 }
 
 func (r *DisconnectedPlatformReconciler) cleanup(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (ctrl.Result, error) {
@@ -4392,7 +4416,14 @@ func (r *DisconnectedPlatformReconciler) ensureAWSLoadBalancerTimeout(ctx contex
 		awsType = "Classic"
 	}
 
+	// Preserve the required endpointPublishingStrategy.type field
+	epsType, _, _ := unstructured.NestedString(ic.Object, "spec", "endpointPublishingStrategy", "type")
+	if epsType == "" {
+		epsType = "LoadBalancerService"
+	}
+
 	logger.Info("Setting AWS CLB idle timeout to 5m for large blob uploads", "current", currentTimeout)
+	unstructured.SetNestedField(ic.Object, epsType, "spec", "endpointPublishingStrategy", "type")
 	unstructured.SetNestedField(ic.Object, scope, "spec", "endpointPublishingStrategy", "loadBalancer", "scope")
 	unstructured.SetNestedField(ic.Object, "AWS", "spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "type")
 	unstructured.SetNestedField(ic.Object, awsType, "spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "type")
