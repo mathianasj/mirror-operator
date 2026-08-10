@@ -62,7 +62,7 @@ spec:
     # Console plugin (embedded in OpenShift Console)
     consolePlugin:
       enabled: true
-      image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
+      image: "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
     # Optional: custom route configuration
     # route:
     #   host: "airgap-architect.apps.example.com"

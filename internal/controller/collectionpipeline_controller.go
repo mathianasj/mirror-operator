@@ -935,7 +935,7 @@ func (r *CollectionPipelineReconciler) getArchitectConsolePluginImage(ctx contex
 	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.ConsolePlugin != nil && platform.Spec.Architect.ConsolePlugin.Image != "" {
 		return platform.Spec.Architect.ConsolePlugin.Image
 	}
-	return "quay.io/mirror-operator/airgap-architect-console-plugin:latest"
+	return "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
 }
 
 func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context, originalConfigYAML string) (string, error) {

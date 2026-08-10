@@ -21,7 +21,7 @@ spec:
     # Enable console plugin mode (replaces standalone frontend)
     consolePlugin:
       enabled: true
-      image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
+      image: "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
     # Optional: custom route configuration for backend API
     # route:
     #   host: "airgap-architect-api.apps.example.com"
