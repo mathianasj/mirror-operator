@@ -9948,9 +9948,37 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   -f "$RHCOS_DIR/Containerfile" \
   "$RHCOS_DIR"
 
+# Push via internal Quay service to bypass AWS CLB connection resets on large blobs
+REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
+REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
+NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
+INTERNAL_HOST="mirror-operator-quay-quay.${NAMESPACE}.svc.cluster.local"
+
+if [ -n "$REGISTRY_PATH" ]; then
+  PUSH_IMAGE="${INTERNAL_HOST}/${REGISTRY_PATH}/rhcos-server:${RHCOS_VERSION}"
+else
+  PUSH_IMAGE="${INTERNAL_HOST}/rhcos-server:${RHCOS_VERSION}"
+fi
+
+# Create auth file with internal hostname credentials copied from external
+cp /workspace/pull-secret/.dockerconfigjson /tmp/push-auth.json
+python3 -c "
+import json
+with open('/tmp/push-auth.json') as f:
+    d = json.load(f)
+for key in list(d.get('auths', {}).keys()):
+    host = key.replace('https://','').replace('http://','').rstrip('/')
+    if host == '${REGISTRY_HOST}' or host.startswith('${REGISTRY_HOST}/'):
+        d['auths']['${INTERNAL_HOST}'] = d['auths'][key]
+        break
+with open('/tmp/push-auth.json', 'w') as f:
+    json.dump(d, f)
+" 2>/dev/null || true
+
+echo "Pushing via internal service: ${PUSH_IMAGE}"
 buildah push --storage-driver=vfs --tls-verify=false \
-  --authfile=/workspace/pull-secret/.dockerconfigjson \
-  "$FULL_IMAGE" "docker://$FULL_IMAGE"
+  --authfile=/tmp/push-auth.json \
+  "$FULL_IMAGE" "docker://$PUSH_IMAGE"
 
 echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
