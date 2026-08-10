@@ -224,7 +224,7 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			log.FromContext(ctx).Error(err, "failed to reconcile managed Keycloak")
 			platform.Status.Phase = mirrorv1.PlatformPhaseError
 			r.setErrorCondition(platform, "ManagedKeycloakFailed", err.Error())
-			return ctrl.Result{}, r.Status().Update(ctx, platform)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, platform)
 		}
 		platform.Status.Components = append(platform.Status.Components,
 			mirrorv1.ComponentStatus{Name: "keycloak", Status: "Running",
@@ -2505,6 +2505,15 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 	} else {
 		if err := r.ensureKeycloakTLS(ctx, platform, hostname, tlsSecretName); err != nil {
 			return fmt.Errorf("failed to ensure Keycloak TLS: %w", err)
+		}
+		// Wait for cert-manager to issue the certificate and create the secret
+		// before creating the Keycloak CR that references it
+		tlsSecret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: tlsSecretName, Namespace: architectNamespace}, tlsSecret); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("waiting for cert-manager to issue certificate: secret %q not yet available", tlsSecretName)
+			}
+			return fmt.Errorf("failed to check TLS secret: %w", err)
 		}
 	}
 
@@ -9896,8 +9905,22 @@ fi
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
 
 # Check if RHCOS server image already exists in intermediate registry
-if skopeo inspect --authfile=/workspace/pull-secret/.dockerconfigjson --tls-verify=false \
-  "docker://${FULL_IMAGE}" >/dev/null 2>&1; then
+AUTH=$(cat /workspace/pull-secret/.dockerconfigjson | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for key in ['${INTERMEDIATE_REGISTRY}','https://${INTERMEDIATE_REGISTRY}','https://${INTERMEDIATE_REGISTRY}/v2']:
+  if key in d.get('auths',{}):
+    print(d['auths'][key].get('auth',''))
+    break
+" 2>/dev/null || true)
+AUTH_HEADER=""
+if [ -n "$AUTH" ]; then
+  AUTH_HEADER="Authorization: Basic ${AUTH}"
+fi
+HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
+  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+  "https://${INTERMEDIATE_REGISTRY}/v2/rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ]; then
   echo "RHCOS server image already exists: ${FULL_IMAGE} — skipping build"
   exit 0
 fi
@@ -9925,9 +9948,9 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   -f "$RHCOS_DIR/Containerfile" \
   "$RHCOS_DIR"
 
-skopeo copy --src-tls-verify=false --dest-tls-verify=false \
+buildah push --storage-driver=vfs --tls-verify=false \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
-  containers-storage:"$FULL_IMAGE" docker://"$FULL_IMAGE"
+  "$FULL_IMAGE" "docker://$FULL_IMAGE"
 
 echo "RHCOS server image pushed: $FULL_IMAGE"
 echo "=== RHCOS server image build complete ==="
