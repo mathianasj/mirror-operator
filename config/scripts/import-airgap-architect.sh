@@ -1635,12 +1635,16 @@ EOF
         # Copy custom certificate for reference to BOTH locations
         if [ -f "${MIRROR_REGISTRY_SSL_CERT}" ]; then
             cp "${MIRROR_REGISTRY_SSL_CERT}" "${DATA_DIR}/mirror-registry-cert.pem"
+            chmod 644 "${DATA_DIR}/mirror-registry-cert.pem"
             cp "${MIRROR_REGISTRY_SSL_CERT}" "${config_dir}/mirror-registry-cert.pem"
+            chmod 644 "${config_dir}/mirror-registry-cert.pem"
             ca_cert_path="${DATA_DIR}/mirror-registry-cert.pem"
         fi
     elif [ -f "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" ]; then
         cp "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" "${DATA_DIR}/mirror-registry-ca.pem"
+        chmod 644 "${DATA_DIR}/mirror-registry-ca.pem"
         cp "${MIRROR_REGISTRY_DATA_PATH}/quay-rootCA/rootCA.pem" "${config_dir}/mirror-registry-ca.pem"
+        chmod 644 "${config_dir}/mirror-registry-ca.pem"
         ca_cert_path="${DATA_DIR}/mirror-registry-ca.pem"
         log "CA certificate copied to ${DATA_DIR}/mirror-registry-ca.pem"
         log "CA certificate also saved to ${config_dir}/mirror-registry-ca.pem"
