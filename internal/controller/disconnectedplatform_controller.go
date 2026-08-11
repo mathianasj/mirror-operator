@@ -9297,14 +9297,16 @@ sign_file() {
   while [ $attempt -lt $max_retries ]; do
     attempt=$((attempt + 1))
     local token=$(fetch_oidc_token)
-    if cosign sign-blob \
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+      echo "  OIDC token fetch failed (attempt $attempt/$max_retries)"
+    elif cosign sign-blob \
       --fulcio-url=$(params.fulcio-url) \
       --rekor-url=$(params.rekor-url) \
       --oidc-issuer=$(params.oidc-issuer) \
       --identity-token="$token" \
       --yes \
       --bundle="${filepath}.bundle" \
-      "$filepath" > "${filepath}.sig" 2>&1; then
+      "$filepath" 2>&1 | tee "${filepath}.sig"; then
       echo "  ✓ Signed successfully"
       return 0
     fi
