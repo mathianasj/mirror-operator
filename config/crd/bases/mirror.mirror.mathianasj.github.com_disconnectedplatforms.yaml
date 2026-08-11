@@ -77,6 +77,11 @@ spec:
                             description: Storage size for AgentServiceConfig imageStorage
                               PVC
                             type: string
+                          rhcosImage:
+                            description: |-
+                              Override the full RHCOS server container image reference (e.g. "my-registry:8443/rhcos-server:4.21")
+                              When set, this is used instead of constructing the image from mirrorRegistry + version
+                            type: string
                           storageClass:
                             description: Kubernetes StorageClass for AgentServiceConfig
                               PVCs

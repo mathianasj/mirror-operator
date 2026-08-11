@@ -10087,9 +10087,11 @@ echo "=== Building RHCOS server OCI image ==="
 
 cat > "$RHCOS_DIR/Containerfile" <<CEOF
 FROM ${BASE_IMAGE}
-COPY rhcos-live.x86_64.iso /opt/app-root/src/rhcos-live.x86_64.iso
-COPY rhcos-live-rootfs.x86_64.img /opt/app-root/src/rhcos-live-rootfs.x86_64.img
-COPY RHCOS_VERSION.txt /opt/app-root/src/RHCOS_VERSION.txt
+ADD --chown=1001:0 rhcos-live.x86_64.iso /tmp/src/rhcos-live.x86_64.iso
+ADD --chown=1001:0 rhcos-live-rootfs.x86_64.img /tmp/src/rhcos-live-rootfs.x86_64.img
+ADD --chown=1001:0 RHCOS_VERSION.txt /tmp/src/RHCOS_VERSION.txt
+RUN /usr/libexec/s2i/assemble
+CMD /usr/libexec/s2i/run
 LABEL io.openshift.rhcos.version="${RHCOS_VERSION}"
 LABEL io.openshift.mirror-operator/component="rhcos-server"
 CEOF

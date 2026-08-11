@@ -1014,7 +1014,12 @@ func (r *DisconnectedPlatformReconciler) reconcileRHCOSServer(ctx context.Contex
 
 	name := "rhcos-server"
 	namespace := architectNamespace
-	rhcosImage := fmt.Sprintf("%s/rhcos-server:%s", mirrorRegistry, rhcosVersion)
+	rhcosImage := ""
+	if acmConfig.HostInventory.RHCOSImage != "" {
+		rhcosImage = acmConfig.HostInventory.RHCOSImage
+	} else {
+		rhcosImage = fmt.Sprintf("%s/rhcos-server:%s", mirrorRegistry, rhcosVersion)
+	}
 
 	// Create or update Deployment
 	replicas := int32(1)

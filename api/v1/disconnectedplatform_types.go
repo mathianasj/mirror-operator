@@ -422,6 +422,10 @@ type HostInventoryConfig struct {
 	// Enable host inventory and assisted installer support
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
+	// Override the full RHCOS server container image reference (e.g. "my-registry:8443/rhcos-server:4.21")
+	// When set, this is used instead of constructing the image from mirrorRegistry + version
+	// +optional
+	RHCOSImage string `json:"rhcosImage,omitempty"`
 	// OCP versions to configure for host inventory (RHCOS boot images will be served for each)
 	// +optional
 	Versions []HostInventoryVersion `json:"versions,omitempty"`
