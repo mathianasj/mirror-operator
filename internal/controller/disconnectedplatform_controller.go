@@ -5159,7 +5159,7 @@ func (r *DisconnectedPlatformReconciler) ensureUpdateService(ctx context.Context
 	us.SetNamespace("openshift-update-service")
 
 	desired := map[string]interface{}{
-		"graphDataImage": "registry.redhat.io/openshift-update-service/graph-data:latest",
+		"graphDataImage": quayHostname + "/" + orgName + "/openshift/graph-image:latest",
 		"releases":       quayHostname + "/" + orgName + "/openshift/release-images",
 		"replicas":       int64(2),
 	}
