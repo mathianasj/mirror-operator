@@ -9305,6 +9305,7 @@ sign_file() {
       --oidc-issuer=$(params.oidc-issuer) \
       --identity-token="$token" \
       --yes \
+      --timeout=600s \
       --bundle="${filepath}.bundle" \
       "$filepath" 2>&1 | tee "${filepath}.sig"; then
       echo "  ✓ Signed successfully"
