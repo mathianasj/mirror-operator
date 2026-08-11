@@ -343,6 +343,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		if err := r.ensureUpdateService(ctx, platform); err != nil {
 			log.FromContext(ctx).Error(err, "failed to ensure UpdateService CR")
 		}
+		// Grant pipeline SA read access to UpdateService for OSUS discovery
+		if err := r.ensurePipelineOSUSAccess(ctx); err != nil {
+			log.FromContext(ctx).Error(err, "failed to ensure pipeline OSUS RBAC")
+		}
 
 		// Reconcile ObjectBucketClaim for artifacts storage
 		if err := r.reconcileArtifactsBucket(ctx, platform); err != nil {
@@ -5196,6 +5200,65 @@ func (r *DisconnectedPlatformReconciler) ensureUpdateService(ctx context.Context
 		return fmt.Errorf("failed to create UpdateService: %w", err)
 	}
 	logger.Info("Created UpdateService CR", "releases", desired["releases"])
+	return nil
+}
+
+// ensurePipelineOSUSAccess grants the pipeline SA read access to UpdateService
+// resources so the mirror-from-intermediate task can discover the OSUS policy engine URI.
+func (r *DisconnectedPlatformReconciler) ensurePipelineOSUSAccess(ctx context.Context) error {
+	crName := "mirror-operator-pipeline-osus-reader"
+
+	cr := &unstructured.Unstructured{}
+	cr.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole",
+	})
+	cr.SetName(crName)
+	unstructured.SetNestedSlice(cr.Object, []interface{}{
+		map[string]interface{}{
+			"apiGroups": []interface{}{"updateservice.operator.openshift.io"},
+			"resources": []interface{}{"updateservices"},
+			"verbs":     []interface{}{"get", "list", "watch"},
+		},
+	}, "rules")
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(cr.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cr), existing); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, cr); err != nil {
+			return fmt.Errorf("failed to create ClusterRole %s: %w", crName, err)
+		}
+	} else if err != nil {
+		return err
+	}
+
+	crb := &unstructured.Unstructured{}
+	crb.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding",
+	})
+	crb.SetName(crName)
+	unstructured.SetNestedSlice(crb.Object, []interface{}{
+		map[string]interface{}{
+			"kind":      "ServiceAccount",
+			"name":      "pipeline",
+			"namespace": architectNamespace,
+		},
+	}, "subjects")
+	unstructured.SetNestedMap(crb.Object, map[string]interface{}{
+		"kind":     "ClusterRole",
+		"name":     crName,
+		"apiGroup": "rbac.authorization.k8s.io",
+	}, "roleRef")
+
+	existingCRB := &unstructured.Unstructured{}
+	existingCRB.SetGroupVersionKind(crb.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(crb), existingCRB); apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, crb); err != nil {
+			return fmt.Errorf("failed to create ClusterRoleBinding %s: %w", crName, err)
+		}
+	} else if err != nil {
+		return err
+	}
+
 	return nil
 }
 
