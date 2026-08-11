@@ -10305,6 +10305,10 @@ echo "=== Bundle creation complete ==="
 set -ex
 echo "Uploading artifacts to S3..."
 
+# Tune S3 multipart upload for higher throughput
+aws configure set default.s3.multipart_chunksize 64MB
+aws configure set default.s3.max_concurrent_requests 20
+
 # Collection name from working-pvc-name (format: collection-storage-<name>)
 COLLECTION_NAME="$(params.collection-name)"
 
