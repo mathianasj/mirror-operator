@@ -153,6 +153,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=objectbucket.io,resources=objectbucketclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelines,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tekton.dev,resources=taskruns,verbs=get;list;watch
+// +kubebuilder:rbac:groups=tekton.dev,resources=taskruns/status,verbs=get
 // +kubebuilder:rbac:groups=quay.redhat.com,resources=quayregistries,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -6874,6 +6876,90 @@ func (h *collectionPipelineEventHandler) triggerPlatformReconcile(ctx context.Co
 	}
 }
 
+// taskRunEventHandler watches Tekton TaskRuns for mirror-to-intermediate completion
+// and restarts OSUS pods so they pick up the freshly mirrored graph-data image
+// before the mirror-from-intermediate task begins.
+type taskRunEventHandler struct {
+	client client.Client
+}
+
+func (h *taskRunEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *taskRunEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	h.handleTaskRun(ctx, e.ObjectOld, e.ObjectNew)
+}
+
+func (h *taskRunEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *taskRunEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *taskRunEventHandler) handleTaskRun(ctx context.Context, oldObj, newObj client.Object) {
+	logger := log.FromContext(ctx)
+
+	newU, ok := newObj.(*unstructured.Unstructured)
+	if !ok {
+		return
+	}
+
+	// Only react to TaskRuns whose pipeline task name is mirror-to-intermediate
+	pipelineTaskName, _, _ := unstructured.NestedString(newU.Object, "metadata", "labels", "tekton.dev/pipelineTask")
+	if pipelineTaskName != "mirror-to-intermediate" {
+		return
+	}
+
+	// Check if the TaskRun just completed successfully
+	oldU, ok := oldObj.(*unstructured.Unstructured)
+	if !ok {
+		return
+	}
+
+	oldSucceeded := taskRunSucceeded(oldU)
+	newSucceeded := taskRunSucceeded(newU)
+	if oldSucceeded || !newSucceeded {
+		return
+	}
+
+	logger.Info("mirror-to-intermediate TaskRun completed, restarting OSUS pods")
+
+	// Delete OSUS pods to restart them with the fresh graph-data image
+	podList := &corev1.PodList{}
+	if err := h.client.List(ctx, podList,
+		client.InNamespace("openshift-update-service"),
+		client.MatchingLabels{"app": "update-service-oc-mirror"},
+	); err != nil {
+		logger.Error(err, "failed to list OSUS pods")
+		return
+	}
+
+	for i := range podList.Items {
+		if err := h.client.Delete(ctx, &podList.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete OSUS pod", "pod", podList.Items[i].Name)
+		} else {
+			logger.Info("Deleted OSUS pod for restart", "pod", podList.Items[i].Name)
+		}
+	}
+}
+
+func taskRunSucceeded(u *unstructured.Unstructured) bool {
+	conditions, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if !found {
+		return false
+	}
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if cond["type"] == "Succeeded" && cond["status"] == "True" {
+			return true
+		}
+	}
+	return false
+}
+
 // RHTAS Health Check and Self-Healing Functions
 
 func (r *DisconnectedPlatformReconciler) updateStatusFromSecuresignHealth(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
@@ -10548,6 +10634,12 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 			"apiVersion": "tekton.dev/v1",
 			"kind":       "Pipeline",
 		}})
+
+		taskRunGVK := &unstructured.Unstructured{}
+		taskRunGVK.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "tekton.dev", Version: "v1", Kind: "TaskRun",
+		})
+		b = b.Watches(taskRunGVK, &taskRunEventHandler{client: r.Client})
 	}
 
 	return b.
