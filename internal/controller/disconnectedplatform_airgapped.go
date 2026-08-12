@@ -1635,7 +1635,7 @@ set -ex
 echo "=== Mirroring content to $(params.target-registry) ==="
 oc-mirror \
   --config /workspace/config/imageset-config.yaml \
-  --from file:///workspace/workspace \
+  --from file:///workspace/workspace/archives \
   docker://$(params.target-registry) \
   --v2
 echo "=== Mirror complete ==="
