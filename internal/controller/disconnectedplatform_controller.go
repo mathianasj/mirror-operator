@@ -707,6 +707,15 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx con
 				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
 			},
 		)
+
+		if compStatus == "Succeeded" {
+			if op.name == "openshift-pipelines" {
+				if err := r.enableConsolePluginInOperator(ctx, "pipelines-console-plugin"); err != nil {
+					logger.Error(err, "failed to enable pipelines console plugin")
+				}
+			}
+		}
+
 		logger.Info("Ensured airgapped operator subscription", "operator", op.name, "catalog", catalog, "csvStatus", compStatus)
 	}
 

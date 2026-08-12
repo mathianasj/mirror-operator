@@ -39,8 +39,9 @@ type MirrorImportSpec struct {
 }
 
 type MirrorImportStatus struct {
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	Phase      string             `json:"phase,omitempty"`
+	Conditions     []metav1.Condition `json:"conditions,omitempty"`
+	Phase          string             `json:"phase,omitempty"`
+	PipelineRunRef string             `json:"pipelineRunRef,omitempty"`
 }
 
 // +kubebuilder:object:root=true

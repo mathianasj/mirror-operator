@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -99,6 +100,13 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 	if err := r.ensureAirgappedUpdateService(ctx, platform); err != nil {
 		logger.Error(err, "failed to ensure airgapped UpdateService")
 		needsRequeue = true
+	}
+
+	if r.TektonAvailable {
+		if err := r.reconcileImportPipelineTemplate(ctx, platform); err != nil {
+			logger.Error(err, "failed to reconcile import pipeline template")
+			needsRequeue = true
+		}
 	}
 
 	return needsRequeue, nil
@@ -1444,5 +1452,273 @@ func (r *DisconnectedPlatformReconciler) deleteAirgappedACM(ctx context.Context)
 	sub.SetNamespace("open-cluster-management")
 	if err := r.Delete(ctx, sub); err != nil && !apierrors.IsNotFound(err) {
 		log.FromContext(ctx).Error(err, "failed to delete ACM subscription")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	if platform.Spec.Mode != mirrorv1.PlatformModeAirgapped {
+		return nil
+	}
+
+	namespace := architectNamespace
+	pipelineName := "import-pipeline-template"
+
+	pipeline := &unstructured.Unstructured{}
+	pipeline.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "tekton.dev",
+		Version: "v1",
+		Kind:    "Pipeline",
+	})
+	pipeline.SetName(pipelineName)
+	pipeline.SetNamespace(namespace)
+
+	params := []map[string]interface{}{
+		{"name": "bundle-filename", "type": "string", "description": "Tar filename on the bundle PVC"},
+		{"name": "target-registry", "type": "string", "description": "Destination mirror registry URL"},
+		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2", "description": "oc-mirror container image"},
+		{"name": "verify-enabled", "type": "string", "default": "false", "description": "Enable cosign signature verification"},
+		{"name": "cosign-pub-secret", "type": "string", "default": "", "description": "Secret name containing cosign public key"},
+	}
+
+	workspaces := []map[string]interface{}{
+		{"name": "bundle-data", "description": "PVC containing the bundle tar file"},
+		{"name": "config", "description": "ConfigMap with imageset-config.yaml"},
+		{"name": "workspace", "description": "Working directory for extraction"},
+		{"name": "cosign-pub", "description": "Cosign public key secret for verification", "optional": true},
+	}
+
+	tasks := r.buildImportPipelineTasks()
+
+	pipelineSpec := map[string]interface{}{
+		"params":     params,
+		"workspaces": workspaces,
+		"tasks":      tasks,
+	}
+
+	specJSON, err := json.Marshal(pipelineSpec)
+	if err != nil {
+		return fmt.Errorf("failed to marshal import pipeline spec: %w", err)
+	}
+
+	var specMap map[string]interface{}
+	if err := json.Unmarshal(specJSON, &specMap); err != nil {
+		return fmt.Errorf("failed to unmarshal import pipeline spec: %w", err)
+	}
+
+	pipeline.Object["spec"] = specMap
+
+	if err := ctrl.SetControllerReference(platform, pipeline, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on import pipeline: %w", err)
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(pipeline.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pipeline), existing); err == nil {
+		pipeline.SetResourceVersion(existing.GetResourceVersion())
+		if err := r.Update(ctx, pipeline); err != nil {
+			return fmt.Errorf("failed to update import pipeline template: %w", err)
+		}
+		logger.Info("Updated import pipeline template")
+	} else if apierrors.IsNotFound(err) {
+		if err := r.Create(ctx, pipeline); err != nil {
+			return fmt.Errorf("failed to create import pipeline template: %w", err)
+		}
+		logger.Info("Created import pipeline template")
+	} else {
+		return err
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) buildImportPipelineTasks() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"name": "verify-bundle",
+			"when": []map[string]interface{}{
+				{"input": "$(params.verify-enabled)", "operator": "in", "values": []string{"true"}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "verify",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+BUNDLE_FILE="$(params.bundle-filename)"
+bn=$(basename "$BUNDLE_FILE" .tar)
+
+echo "=== Verifying bundle signature ==="
+cosign verify-blob \
+  --key /workspace/cosign-pub/cosign.pub \
+  --signature "/workspace/bundle-data/${bn}.sig" \
+  "/workspace/bundle-data/${BUNDLE_FILE}"
+
+echo "=== Verifying attestation signature ==="
+cosign verify-blob \
+  --key /workspace/cosign-pub/cosign.pub \
+  --signature /workspace/bundle-data/attestation.json.sig \
+  /workspace/bundle-data/attestation.json
+
+echo "=== Verifying attestation hashes ==="
+abh=$(jq -r '.bundle.sha256' /workspace/bundle-data/attestation.json)
+ash=$(jq -r '.sbom.sha256' /workspace/bundle-data/attestation.json)
+cbh=$(sha256sum "/workspace/bundle-data/${BUNDLE_FILE}" | cut -d" " -f1)
+
+if [ "$cbh" != "$abh" ]; then
+  echo "ERROR: Bundle hash mismatch: expected $abh, got $cbh"
+  exit 1
+fi
+echo "Bundle hash verified: $cbh"
+
+if [ -f /workspace/bundle-data/sbom.cyclonedx.json ]; then
+  csh=$(sha256sum /workspace/bundle-data/sbom.cyclonedx.json | cut -d" " -f1)
+  if [ "$csh" != "$ash" ]; then
+    echo "ERROR: SBOM hash mismatch: expected $ash, got $csh"
+    exit 1
+  fi
+  echo "SBOM hash verified: $csh"
+fi
+
+echo "=== All verifications passed ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "bundle-data"},
+				{"name": "cosign-pub"},
+			},
+		},
+
+		{
+			"name":     "extract-bundle",
+			"runAfter": []string{"verify-bundle"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "extract",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+BUNDLE_FILE="$(params.bundle-filename)"
+echo "=== Extracting bundle: ${BUNDLE_FILE} ==="
+tar -xvf "/workspace/bundle-data/${BUNDLE_FILE}" -C /workspace/workspace
+echo "=== Extraction complete ==="
+echo "Contents:"
+ls -lh /workspace/workspace/
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "bundle-data"},
+				{"name": "workspace"},
+			},
+		},
+
+		{
+			"name":     "mirror-content",
+			"runAfter": []string{"extract-bundle"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "oc-mirror",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Mirroring content to $(params.target-registry) ==="
+oc-mirror \
+  --config /workspace/config/imageset-config.yaml \
+  --from file:///workspace/workspace \
+  docker://$(params.target-registry) \
+  --v2
+echo "=== Mirror complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "config"},
+				{"name": "workspace"},
+			},
+		},
+
+		{
+			"name":     "apply-manifests",
+			"runAfter": []string{"mirror-content"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "apply",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Applying cluster manifests ==="
+MANIFEST_DIR=$(find /workspace/workspace -path "*/cluster-resources" -type d 2>/dev/null | head -1)
+
+if [ -z "$MANIFEST_DIR" ]; then
+  echo "WARNING: No cluster-resources directory found, skipping manifest apply"
+  exit 0
+fi
+
+echo "Found manifests in: $MANIFEST_DIR"
+
+for f in "$MANIFEST_DIR"/idms-*.yaml; do
+  if [ -f "$f" ]; then
+    oc apply -f "$f" && echo "Applied IDMS: $(basename $f)"
+  fi
+done
+
+for f in "$MANIFEST_DIR"/itms-*.yaml; do
+  if [ -f "$f" ]; then
+    oc apply -f "$f" && echo "Applied ITMS: $(basename $f)"
+  fi
+done
+
+for f in "$MANIFEST_DIR"/cs-*.yaml; do
+  if [ -f "$f" ]; then
+    oc apply -f "$f" && echo "Applied CatalogSource: $(basename $f)"
+  fi
+done
+
+echo "=== Cluster manifests applied ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "workspace"},
+			},
+		},
+
+		{
+			"name":     "cleanup-workspace",
+			"runAfter": []string{"apply-manifests"},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "cleanup",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -ex
+echo "=== Cleaning up extracted content ==="
+rm -rf /workspace/workspace/*
+echo "Workspace cleaned"
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "workspace"},
+			},
+		},
 	}
 }

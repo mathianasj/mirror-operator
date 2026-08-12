@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -10,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
-	batchv1 "k8s.io/api/batch/v1"
+	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,7 +33,8 @@ type MirrorImportReconciler struct {
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=mirrorimports/finalizers,verbs=update
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns/status,verbs=get
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=catalogsources,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=imagecontentsourcepolicies,verbs=get;list;watch;create;update;patch;delete
@@ -72,7 +74,7 @@ func (r *MirrorImportReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.startImport(ctx, importCR)
 
 	case "Importing":
-		return r.trackImportJob(ctx, importCR, req)
+		return r.trackImportPipelineRun(ctx, importCR, req)
 
 	case "Publishing":
 		return r.finalizeImport(ctx, importCR)
@@ -89,10 +91,6 @@ func (r *MirrorImportReconciler) startImport(ctx context.Context, importCR *mirr
 			return ctrl.Result{}, err
 		}
 		if platform != nil {
-			// Validate that all prior versions in the chain exist.
-			// If collectionVersion is set, check it's not already imported,
-			// and verify at least one import exists (for incremental chains)
-			// or start fresh (for the first import).
 			if versionExists(platform.Status.ImportHistory, importCR.Spec.CollectionVersion) {
 				importCR.Status.Phase = "Failed"
 				importCR.Status.Conditions = append(importCR.Status.Conditions, metav1.Condition{
@@ -110,44 +108,150 @@ func (r *MirrorImportReconciler) startImport(ctx context.Context, importCR *mirr
 	return ctrl.Result{}, r.Status().Update(ctx, importCR)
 }
 
-func (r *MirrorImportReconciler) trackImportJob(ctx context.Context, importCR *mirrorv1.MirrorImport, req ctrl.Request) (ctrl.Result, error) {
+func (r *MirrorImportReconciler) trackImportPipelineRun(ctx context.Context, importCR *mirrorv1.MirrorImport, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
 	configName := fmt.Sprintf("mirror-import-config-%s", importCR.Name)
 	if _, err := r.ensureImportConfigMap(ctx, importCR, configName); err != nil {
-		log.FromContext(ctx).Error(err, "failed to ensure import ConfigMap")
+		logger.Error(err, "failed to ensure import ConfigMap")
 		return ctrl.Result{}, err
 	}
 
-	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: req.Namespace,
-		Name:      "mirror-import-" + importCR.Name,
-	}, job)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			job, err := r.buildImportJob(ctx, importCR, configName)
-			if err != nil {
-				log.FromContext(ctx).Error(err, "failed to build import job")
-				return ctrl.Result{}, err
+	if importCR.Status.PipelineRunRef != "" {
+		pr := &pipelinev1.PipelineRun{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: importCR.Status.PipelineRunRef}, pr)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				importCR.Status.PipelineRunRef = ""
+				return ctrl.Result{}, r.Status().Update(ctx, importCR)
 			}
-			if err := r.Create(ctx, job); err != nil {
-				log.FromContext(ctx).Error(err, "failed to create import job")
-				return ctrl.Result{}, err
-			}
+			return ctrl.Result{}, err
+		}
+
+		phase := importPipelineRunPhase(pr)
+		switch phase {
+		case "Complete":
+			importCR.Status.Phase = "Publishing"
+			return ctrl.Result{}, r.Status().Update(ctx, importCR)
+		case "Failed":
+			importCR.Status.Phase = "Failed"
+			return ctrl.Result{}, r.Status().Update(ctx, importCR)
 		}
 		return ctrl.Result{}, nil
 	}
 
-	for _, cond := range job.Status.Conditions {
-		if cond.Type == batchv1.JobComplete {
-			importCR.Status.Phase = "Publishing"
-			return ctrl.Result{}, r.Status().Update(ctx, importCR)
-		}
-		if cond.Type == batchv1.JobFailed {
-			importCR.Status.Phase = "Failed"
-			return ctrl.Result{}, r.Status().Update(ctx, importCR)
-		}
+	pr, err := r.buildImportPipelineRun(ctx, importCR, configName)
+	if err != nil {
+		logger.Error(err, "failed to build import PipelineRun")
+		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, nil
+	if err := r.Create(ctx, pr); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		logger.Error(err, "failed to create import PipelineRun")
+		return ctrl.Result{}, err
+	}
+
+	importCR.Status.PipelineRunRef = pr.Name
+	return ctrl.Result{}, r.Status().Update(ctx, importCR)
+}
+
+func importPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
+	if pr.Status.CompletionTime != nil {
+		for _, c := range pr.Status.Conditions {
+			if c.Type == "Succeeded" && c.Status == "True" {
+				return "Complete"
+			}
+		}
+		return "Failed"
+	}
+	if pr.Status.StartTime != nil {
+		return "Running"
+	}
+	return "Pending"
+}
+
+func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, importCR *mirrorv1.MirrorImport, configName string) (*pipelinev1.PipelineRun, error) {
+	mirrorImage := r.MirrorImage
+	if mirrorImage == "" {
+		mirrorImage = defaultMirrorImage
+	}
+
+	verifyEnabled := "false"
+	cosignPubSecret := ""
+	if importCR.Spec.Verify != nil && importCR.Spec.Verify.PublicKeySecretRef != nil {
+		verifyEnabled = "true"
+		cosignPubSecret = importCR.Spec.Verify.PublicKeySecretRef.Name
+	}
+
+	params := []pipelinev1.Param{
+		{Name: "bundle-filename", Value: pipelinev1.ParamValue{Type: "string", StringVal: importCR.Spec.Bundle.Filename}},
+		{Name: "target-registry", Value: pipelinev1.ParamValue{Type: "string", StringVal: importCR.Spec.TargetRegistry.URL}},
+		{Name: "mirror-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorImage}},
+		{Name: "verify-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: verifyEnabled}},
+		{Name: "cosign-pub-secret", Value: pipelinev1.ParamValue{Type: "string", StringVal: cosignPubSecret}},
+	}
+
+	workspaces := []pipelinev1.WorkspaceBinding{
+		{
+			Name: "bundle-data",
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: importCR.Spec.Bundle.PVC,
+			},
+		},
+		{
+			Name: "config",
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: configName},
+			},
+		},
+		{
+			Name:     "workspace",
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	}
+
+	if verifyEnabled == "true" {
+		workspaces = append(workspaces, pipelinev1.WorkspaceBinding{
+			Name: "cosign-pub",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: cosignPubSecret,
+			},
+		})
+	} else {
+		workspaces = append(workspaces, pipelinev1.WorkspaceBinding{
+			Name:     "cosign-pub",
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		})
+	}
+
+	pr := &pipelinev1.PipelineRun{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("import-%s-", importCR.Name),
+			Namespace:    importCR.Namespace,
+			Annotations: map[string]string{
+				"results.tekton.dev/log":    "false",
+				"results.tekton.dev/result": "false",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(importCR, mirrorv1.GroupVersion.WithKind("MirrorImport")),
+			},
+		},
+		Spec: pipelinev1.PipelineRunSpec{
+			PipelineRef: &pipelinev1.PipelineRef{
+				Name: "import-pipeline-template",
+			},
+			Params:     params,
+			Workspaces: workspaces,
+			Timeouts: &pipelinev1.TimeoutFields{
+				Pipeline: &metav1.Duration{Duration: 6 * time.Hour},
+				Tasks:    &metav1.Duration{Duration: 4 * time.Hour},
+			},
+		},
+	}
+
+	return pr, nil
 }
 
 func (r *MirrorImportReconciler) finalizeImport(ctx context.Context, importCR *mirrorv1.MirrorImport) (ctrl.Result, error) {
@@ -218,108 +322,9 @@ func (r *MirrorImportReconciler) ensureImportConfigMap(ctx context.Context, impo
 	return cm, r.Create(ctx, cm)
 }
 
-func (r *MirrorImportReconciler) buildImportJob(ctx context.Context, importCR *mirrorv1.MirrorImport, configName string) (*batchv1.Job, error) {
-	mirrorImage := r.MirrorImage
-	if mirrorImage == "" {
-		mirrorImage = defaultMirrorImage
-	}
-
-	importArgs := "tar -xvf /data/" + importCR.Spec.Bundle.Filename +
-		" -C /workspace && oc-mirror --config /config/" + configMapKey +
-		" --from file:///workspace docker://" + importCR.Spec.TargetRegistry.URL + " --v2" +
-		` && echo "=== Applying cluster manifests ===" && ` +
-		`MANIFEST_DIR=$(find /workspace -path "*/cluster-resources" -type d 2>/dev/null | head -1) && ` +
-		`if [ -n "$MANIFEST_DIR" ]; then ` +
-		`  for f in "$MANIFEST_DIR"/idms-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied IDMS: $f"; done; ` +
-		`  for f in "$MANIFEST_DIR"/itms-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied ITMS: $f"; done; ` +
-		`  for f in "$MANIFEST_DIR"/cs-*.yaml; do [ -f "$f" ] && oc apply -f "$f" && echo "Applied CatalogSource: $f"; done; ` +
-		`  echo "=== Cluster manifests applied ==="; ` +
-		`else echo "WARNING: No cluster-resources directory found, skipping manifest apply"; fi`
-
-	volumeMounts := []corev1.VolumeMount{
-		{Name: "bundle-data", MountPath: "/data"},
-		{Name: "config", MountPath: "/config"},
-	}
-	volumes := []corev1.Volume{
-		{
-			Name: "bundle-data",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: importCR.Spec.Bundle.PVC,
-				},
-			},
-		},
-		{
-			Name: "config",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: configName},
-				},
-			},
-		},
-	}
-
-	if importCR.Spec.Verify != nil && importCR.Spec.Verify.PublicKeySecretRef != nil {
-		pubKeyName := importCR.Spec.Verify.PublicKeySecretRef.Name
-		bundleFile := importCR.Spec.Bundle.Filename
-		verifyCmd := fmt.Sprintf(
-			`cosign verify-blob --key /workspace/cosign-pub/cosign.pub --signature /data/${bn}.sig /data/%[1]s && `+
-				`cosign verify-blob --key /workspace/cosign-pub/cosign.pub --signature /data/attestation.json.sig /data/attestation.json && `+
-				`abh=$(jq -r '.bundle.sha256' /data/attestation.json) && `+
-				`ash=$(jq -r '.sbom.sha256' /data/attestation.json) && `+
-				`cbh=$(sha256sum /data/%[1]s | cut -d" " -f1) && `+
-				`csh=$(sha256sum /data/sbom.cyclonedx.json | cut -d" " -f1) && `+
-				`[ "$cbh" = "$abh" ] && [ "$csh" = "$ash" ] && `,
-			bundleFile,
-		)
-		bnCmd := fmt.Sprintf("bn=$(basename /data/%s .tar) && ", bundleFile)
-		importArgs = bnCmd + verifyCmd + importArgs
-
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name: "cosign-pub", MountPath: "/workspace/cosign-pub",
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: "cosign-pub",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: pubKeyName,
-				},
-			},
-		})
-	}
-
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mirror-import-" + importCR.Name,
-			Namespace: importCR.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(importCR, mirrorv1.GroupVersion.WithKind("MirrorImport")),
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "mirror-import-job",
-					Containers: []corev1.Container{
-						{
-							Name:         "import",
-							Image:        mirrorImage,
-							Command:      []string{"/bin/sh", "-c"},
-							Args:         []string{importArgs},
-							VolumeMounts: volumeMounts,
-						},
-					},
-					Volumes:       volumes,
-					RestartPolicy: corev1.RestartPolicyNever,
-				},
-			},
-		},
-	}, nil
-}
-
 func (r *MirrorImportReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mirrorv1.MirrorImport{}).
-		Owns(&batchv1.Job{}).
+		Owns(&pipelinev1.PipelineRun{}).
 		Complete(r)
 }

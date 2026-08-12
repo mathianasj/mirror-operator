@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
-	batchv1 "k8s.io/api/batch/v1"
+	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 )
 
 var _ = Describe("MirrorImportReconciler", func() {
@@ -30,7 +30,7 @@ var _ = Describe("MirrorImportReconciler", func() {
 		testScheme = runtime.NewScheme()
 		Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
 		Expect(mirrorv1.AddToScheme(testScheme)).To(Succeed())
-		Expect(batchv1.AddToScheme(testScheme)).To(Succeed())
+		Expect(pipelinev1.AddToScheme(testScheme)).To(Succeed())
 	})
 
 	Describe("Reconcile", func() {
@@ -136,44 +136,6 @@ var _ = Describe("MirrorImportReconciler", func() {
 			err = r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(updated.Status.Phase).To(Equal("Importing"))
-			Expect(result).To(Equal(reconcile.Result{}))
-		})
-
-		It("creates a Job when in Importing phase", func() {
-			importCR := &mirrorv1.MirrorImport{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:       "test-import",
-					Namespace:  "default",
-					Finalizers: []string{importFinalizer},
-				},
-				Spec: mirrorv1.MirrorImportSpec{
-					ImageSetConfig: "kind: ImageSetConfiguration",
-					Bundle: mirrorv1.BundleSource{
-						PVC:      "import-pvc",
-						Filename: "bundle.tar",
-					},
-					TargetRegistry: mirrorv1.RegistryConfig{
-						URL: "https://quay.airgap.local",
-					},
-				},
-				Status: mirrorv1.MirrorImportStatus{
-					Phase: "Importing",
-				},
-			}
-
-			r := &MirrorImportReconciler{
-				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(importCR).Build(),
-				Scheme: testScheme,
-			}
-
-			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
-			result, err := r.Reconcile(ctx, req)
-			Expect(err).NotTo(HaveOccurred())
-
-			job := &batchv1.Job{}
-			err = r.Get(ctx, types.NamespacedName{Name: "mirror-import-test-import", Namespace: "default"}, job)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal(defaultMirrorImage))
 			Expect(result).To(Equal(reconcile.Result{}))
 		})
 	})
@@ -426,7 +388,7 @@ var _ = Describe("MirrorImportReconciler", func() {
 		})
 	})
 
-	Describe("buildImportJob", func() {
+	Describe("buildImportPipelineRun", func() {
 		It("uses custom mirror image when set", func() {
 			importCR := &mirrorv1.MirrorImport{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
@@ -435,6 +397,9 @@ var _ = Describe("MirrorImportReconciler", func() {
 					Bundle: mirrorv1.BundleSource{
 						PVC:      "import-pvc",
 						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
 					},
 				},
 			}
@@ -445,12 +410,17 @@ var _ = Describe("MirrorImportReconciler", func() {
 				MirrorImage: "custom-mirror:latest",
 			}
 
-			job, err := r.buildImportJob(ctx, importCR, "import-config")
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal("custom-mirror:latest"))
+			Expect(pr.Spec.PipelineRef.Name).To(Equal("import-pipeline-template"))
+			for _, p := range pr.Spec.Params {
+				if p.Name == "mirror-image" {
+					Expect(p.Value.StringVal).To(Equal("custom-mirror:latest"))
+				}
+			}
 		})
 
-		It("includes cosign verify when public key secret is configured", func() {
+		It("includes cosign verify params when public key secret is configured", func() {
 			importCR := &mirrorv1.MirrorImport{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
 				Spec: mirrorv1.MirrorImportSpec{
@@ -473,27 +443,28 @@ var _ = Describe("MirrorImportReconciler", func() {
 				Scheme: testScheme,
 			}
 
-			job, err := r.buildImportJob(ctx, importCR, "import-config")
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
 			Expect(err).NotTo(HaveOccurred())
-			args := job.Spec.Template.Spec.Containers[0].Args[0]
-			Expect(args).To(ContainSubstring("cosign verify-blob"))
-			Expect(args).To(ContainSubstring("--key /workspace/cosign-pub/cosign.pub"))
-			Expect(args).To(ContainSubstring("release-v4.17.tar"))
-			Expect(args).To(ContainSubstring("attestation.json"))
-			Expect(args).To(ContainSubstring("jq -r '.bundle.sha256'"))
-			Expect(args).To(ContainSubstring("jq -r '.sbom.sha256'"))
-			Expect(args).To(ContainSubstring("sha256sum /data/sbom.cyclonedx.json"))
-			Expect(job.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
-				Name: "cosign-pub",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: "cosign-pub-secret",
-					},
-				},
-			}))
+
+			paramMap := map[string]string{}
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["verify-enabled"]).To(Equal("true"))
+			Expect(paramMap["cosign-pub-secret"]).To(Equal("cosign-pub-secret"))
+			Expect(paramMap["bundle-filename"]).To(Equal("release-v4.17.tar"))
+
+			hasSecretWorkspace := false
+			for _, ws := range pr.Spec.Workspaces {
+				if ws.Name == "cosign-pub" && ws.Secret != nil {
+					Expect(ws.Secret.SecretName).To(Equal("cosign-pub-secret"))
+					hasSecretWorkspace = true
+				}
+			}
+			Expect(hasSecretWorkspace).To(BeTrue())
 		})
 
-		It("includes the bundle filename and target registry in command args", func() {
+		It("passes bundle filename and target registry as params", func() {
 			importCR := &mirrorv1.MirrorImport{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
 				Spec: mirrorv1.MirrorImportSpec{
@@ -513,13 +484,43 @@ var _ = Describe("MirrorImportReconciler", func() {
 				Scheme: testScheme,
 			}
 
-			job, err := r.buildImportJob(ctx, importCR, "import-config")
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("release-v4.17.tar"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("quay.airgap.local"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("oc-mirror"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--from file:///workspace"))
-			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("--v2"))
+
+			paramMap := map[string]string{}
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["bundle-filename"]).To(Equal("release-v4.17.tar"))
+			Expect(paramMap["target-registry"]).To(Equal("https://quay.airgap.local"))
+			Expect(pr.Spec.PipelineRef.Name).To(Equal("import-pipeline-template"))
+		})
+
+		It("sets owner reference to MirrorImport CR", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pr.OwnerReferences).To(HaveLen(1))
+			Expect(pr.OwnerReferences[0].Kind).To(Equal("MirrorImport"))
+			Expect(pr.OwnerReferences[0].Name).To(Equal("test-import"))
 		})
 	})
 })
