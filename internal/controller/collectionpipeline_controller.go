@@ -45,9 +45,10 @@ type CollectionPipelineReconciler struct {
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns/status,verbs=get
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;delete;get;list;watch
 
 func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -443,11 +444,145 @@ func (r *CollectionPipelineReconciler) updatePlatformCollectionHistory(ctx conte
 }
 
 func (r *CollectionPipelineReconciler) cleanup(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	hasChildren, err := r.hasChildPipelines(ctx, pipeline)
+	if err != nil {
+		logger.Error(err, "failed to check for child pipelines")
+	}
+
+	if pipeline.Spec.ParentPipeline == "" && !hasChildren {
+		r.deleteWorkingPVC(ctx, pipeline)
+	} else if hasChildren {
+		logger.Info("Skipping PVC deletion — child pipelines still reference this pipeline", "pipeline", pipeline.Name)
+	}
+
+	r.deleteS3Objects(ctx, pipeline)
+
 	if containsString(pipeline.GetFinalizers(), pipelineFinalizer) {
 		pipeline.SetFinalizers(removeString(pipeline.GetFinalizers(), pipelineFinalizer))
 		return ctrl.Result{}, r.Update(ctx, pipeline)
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *CollectionPipelineReconciler) hasChildPipelines(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) (bool, error) {
+	list := &mirrorv1.CollectionPipelineList{}
+	if err := r.List(ctx, list, client.InNamespace(pipeline.Namespace)); err != nil {
+		return false, fmt.Errorf("failed to list CollectionPipelines: %w", err)
+	}
+	for _, cp := range list.Items {
+		if cp.Spec.ParentPipeline == pipeline.Name && cp.Name != pipeline.Name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *CollectionPipelineReconciler) deleteWorkingPVC(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) {
+	logger := log.FromContext(ctx)
+	pvcName := pipeline.Status.WorkingPVCName
+	if pvcName == "" {
+		pvcName = fmt.Sprintf("collection-storage-%s", pipeline.Name)
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pipeline.Namespace}, pvc); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to get working PVC for deletion", "pvc", pvcName)
+		}
+		return
+	}
+	if err := r.Delete(ctx, pvc); err != nil {
+		logger.Error(err, "failed to delete working PVC", "pvc", pvcName)
+	} else {
+		logger.Info("Deleted working PVC", "pvc", pvcName)
+	}
+}
+
+func (r *CollectionPipelineReconciler) deleteS3Objects(ctx context.Context, pipeline *mirrorv1.CollectionPipeline) {
+	logger := log.FromContext(ctx)
+
+	obcConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "collection-artifacts", Namespace: pipeline.Namespace}, obcConfigMap); err != nil {
+		logger.Info("No S3 configuration found, skipping S3 cleanup")
+		return
+	}
+
+	bucket := obcConfigMap.Data["BUCKET_NAME"]
+	endpoint := obcConfigMap.Data["BUCKET_HOST"]
+	if bucket == "" || endpoint == "" {
+		logger.Info("S3 bucket or endpoint not configured, skipping S3 cleanup")
+		return
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+
+	jobName := fmt.Sprintf("s3-cleanup-%s", pipeline.Name)
+	if len(jobName) > 63 {
+		jobName = jobName[:63]
+	}
+
+	ttl := int32(120)
+	backoff := int32(2)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: pipeline.Namespace,
+		},
+		Spec: batchv1.JobSpec{
+			TTLSecondsAfterFinished: &ttl,
+			BackoffLimit:            &backoff,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "s3-cleanup",
+							Image:   "amazon/aws-cli:latest",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{fmt.Sprintf(
+								`aws --endpoint-url %s s3 rm s3://%s/%s/ --recursive && echo "S3 cleanup complete for %s"`,
+								endpoint, bucket, pipeline.Name, pipeline.Name,
+							)},
+							Env: []corev1.EnvVar{
+								{
+									Name: "AWS_ACCESS_KEY_ID",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
+											Key:                  "AWS_ACCESS_KEY_ID",
+										},
+									},
+								},
+								{
+									Name: "AWS_SECRET_ACCESS_KEY",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
+											Key:                  "AWS_SECRET_ACCESS_KEY",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	existing := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(job), existing); err == nil {
+		logger.Info("S3 cleanup job already exists", "job", jobName)
+		return
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		logger.Error(err, "failed to create S3 cleanup job", "job", jobName)
+	} else {
+		logger.Info("Created S3 cleanup job", "job", jobName, "bucket", bucket, "prefix", pipeline.Name)
+	}
 }
 
 func (r *CollectionPipelineReconciler) findPlatform(ctx context.Context) (*mirrorv1.DisconnectedPlatform, error) {
