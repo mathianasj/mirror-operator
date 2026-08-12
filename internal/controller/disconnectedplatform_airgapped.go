@@ -1601,7 +1601,7 @@ echo "=== All verifications passed ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "extract",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
