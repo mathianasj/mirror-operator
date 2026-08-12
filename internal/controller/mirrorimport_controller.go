@@ -146,15 +146,28 @@ func (r *MirrorImportReconciler) trackImportPipelineRun(ctx context.Context, imp
 		return ctrl.Result{}, err
 	}
 	if err := r.Create(ctx, pr); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
 		}
 		logger.Error(err, "failed to create import PipelineRun")
 		return ctrl.Result{}, err
 	}
 
-	importCR.Status.PipelineRunRef = pr.Name
-	return ctrl.Result{}, r.Status().Update(ctx, importCR)
+	latest := &mirrorv1.MirrorImport{}
+	if err := r.Get(ctx, types.NamespacedName{Name: importCR.Name, Namespace: importCR.Namespace}, latest); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if latest.Status.PipelineRunRef != "" && latest.Status.PipelineRunRef != pr.Name {
+		logger.Info("Another reconcile already created PipelineRun, cleaning up duplicate", "ours", pr.Name, "theirs", latest.Status.PipelineRunRef)
+		if err := r.Delete(ctx, pr); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete duplicate PipelineRun")
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	latest.Status.PipelineRunRef = pr.Name
+	return ctrl.Result{}, r.Status().Update(ctx, latest)
 }
 
 func importPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
