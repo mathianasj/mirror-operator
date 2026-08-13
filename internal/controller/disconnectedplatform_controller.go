@@ -8966,6 +8966,15 @@ if [ -n "$(params.parent-pipeline)" ]; then
 fi
 
 touch /workspace/output/.mirror-marker
+
+# Force graph-image re-inclusion in every bundle
+# Clear cached graph-image so oc-mirror treats it as new content
+echo "=== Clearing graph-image from cache to force inclusion in bundle ==="
+find /workspace/output -path "*graph-image*" \
+  -not -path "*/mirror_*.tar" \
+  -not -path "*/parent-archives/*" \
+  -exec rm -rf {} + 2>/dev/null || true
+
 oc-mirror \
   --v2 \
   --config=/workspace/config/imageset-config.yaml \
@@ -9027,6 +9036,14 @@ mkdir -p /workspace/output/tmp
 mkdir -p /workspace/output/.oc-mirror/.cache
 export TMPDIR=/workspace/output/tmp
 export HOME=/workspace/output
+
+# Force graph-image re-inclusion in every bundle
+# Clear cached graph-image so oc-mirror treats it as new content
+echo "=== Clearing graph-image from cache to force inclusion in bundle ==="
+find /workspace/output -path "*graph-image*" \
+  -not -path "*/mirror_*.tar" \
+  -not -path "*/parent-archives/*" \
+  -exec rm -rf {} + 2>/dev/null || true
 
 # Clear stale registries config from previous steps (e.g. mirror-to-intermediate)
 rm -rf /workspace/output/.config/containers/registries.conf.d
