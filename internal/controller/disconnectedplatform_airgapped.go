@@ -1485,6 +1485,7 @@ func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx con
 	workspaces := []map[string]interface{}{
 		{"name": "bundle-data", "description": "PVC containing the bundle tar file"},
 		{"name": "config", "description": "ConfigMap with imageset-config.yaml"},
+		{"name": "pull-secret", "description": "Registry pull secret for authentication"},
 		{"name": "cosign-pub", "description": "Cosign public key secret for verification", "optional": true},
 	}
 
@@ -1630,6 +1631,7 @@ ls -lh /workspace/bundle-data/
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
 set -ex
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
 echo "=== Mirroring content to $(params.target-registry) ==="
 oc-mirror \
   --config /workspace/config/imageset-config.yaml \
@@ -1644,6 +1646,7 @@ echo "=== Mirror complete ==="
 			"workspaces": []map[string]interface{}{
 				{"name": "config"},
 				{"name": "bundle-data"},
+				{"name": "pull-secret"},
 			},
 		},
 

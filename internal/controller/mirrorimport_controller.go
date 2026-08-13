@@ -219,6 +219,12 @@ func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, imp
 				LocalObjectReference: corev1.LocalObjectReference{Name: configName},
 			},
 		},
+		{
+			Name: "pull-secret",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "pull-secret",
+			},
+		},
 	}
 
 	if verifyEnabled == "true" {
