@@ -1485,7 +1485,6 @@ func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx con
 	workspaces := []map[string]interface{}{
 		{"name": "bundle-data", "description": "PVC containing the bundle tar file"},
 		{"name": "config", "description": "ConfigMap with imageset-config.yaml"},
-		{"name": "workspace", "description": "Working directory for extraction"},
 		{"name": "cosign-pub", "description": "Cosign public key secret for verification", "optional": true},
 	}
 
@@ -1607,17 +1606,16 @@ echo "=== All verifications passed ==="
 set -ex
 BUNDLE_FILE="$(params.bundle-filename)"
 echo "=== Extracting bundle: ${BUNDLE_FILE} ==="
-tar -xvf "/workspace/bundle-data/${BUNDLE_FILE}" -C /workspace/workspace
+tar -xvf "/workspace/bundle-data/${BUNDLE_FILE}" -C /workspace/bundle-data
 echo "=== Extraction complete ==="
 echo "Contents:"
-ls -lh /workspace/workspace/
+ls -lh /workspace/bundle-data/
 `},
 					},
 				},
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "bundle-data"},
-				{"name": "workspace"},
 			},
 		},
 
@@ -1635,7 +1633,7 @@ set -ex
 echo "=== Mirroring content to $(params.target-registry) ==="
 oc-mirror \
   --config /workspace/config/imageset-config.yaml \
-  --from file:///workspace/workspace/archives \
+  --from file:///workspace/bundle-data/archives \
   docker://$(params.target-registry) \
   --v2
 echo "=== Mirror complete ==="
@@ -1645,7 +1643,7 @@ echo "=== Mirror complete ==="
 			},
 			"workspaces": []map[string]interface{}{
 				{"name": "config"},
-				{"name": "workspace"},
+				{"name": "bundle-data"},
 			},
 		},
 
@@ -1661,7 +1659,7 @@ echo "=== Mirror complete ==="
 						"args": []string{`
 set -ex
 echo "=== Applying cluster manifests ==="
-MANIFEST_DIR=$(find /workspace/workspace -path "*/cluster-resources" -type d 2>/dev/null | head -1)
+MANIFEST_DIR=$(find /workspace/bundle-data -path "*/cluster-resources" -type d 2>/dev/null | head -1)
 
 if [ -z "$MANIFEST_DIR" ]; then
   echo "WARNING: No cluster-resources directory found, skipping manifest apply"
@@ -1694,7 +1692,7 @@ echo "=== Cluster manifests applied ==="
 				},
 			},
 			"workspaces": []map[string]interface{}{
-				{"name": "workspace"},
+				{"name": "bundle-data"},
 			},
 		},
 
@@ -1710,14 +1708,14 @@ echo "=== Cluster manifests applied ==="
 						"args": []string{`
 set -ex
 echo "=== Cleaning up extracted content ==="
-rm -rf /workspace/workspace/*
+rm -rf /workspace/bundle-data/archives /workspace/bundle-data/imageset-config.yaml /workspace/bundle-data/idms-oc-mirror.yaml /workspace/bundle-data/itms-oc-mirror.yaml
 echo "Workspace cleaned"
 `},
 					},
 				},
 			},
 			"workspaces": []map[string]interface{}{
-				{"name": "workspace"},
+				{"name": "bundle-data"},
 			},
 		},
 	}

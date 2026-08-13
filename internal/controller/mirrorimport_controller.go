@@ -219,10 +219,6 @@ func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, imp
 				LocalObjectReference: corev1.LocalObjectReference{Name: configName},
 			},
 		},
-		{
-			Name:     "workspace",
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
-		},
 	}
 
 	if verifyEnabled == "true" {
