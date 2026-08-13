@@ -8314,6 +8314,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		"workspaces": workspaces,
 		"results":    results,
 		"tasks":      tasks,
+		"finally":    r.buildPipelineFinallyTasks(),
 	}
 
 	// Marshal to JSON and back to convert []map[string]interface{} into a format unstructured can handle
@@ -8967,6 +8968,18 @@ fi
 
 touch /workspace/output/.mirror-marker
 
+# Snapshot cache for rollback on failure
+echo "=== Creating cache snapshot for rollback ==="
+rm -rf /workspace/output/.cache-snapshot
+mkdir -p /workspace/output/.cache-snapshot
+if [ -d /workspace/output/.oc-mirror ]; then
+  cp -al /workspace/output/.oc-mirror /workspace/output/.cache-snapshot/.oc-mirror
+fi
+if [ -d /workspace/output/.cache ]; then
+  cp -al /workspace/output/.cache /workspace/output/.cache-snapshot/.cache
+fi
+echo "Cache snapshot created (hardlinks, minimal extra space)"
+
 # Force graph-image re-inclusion in every bundle
 # Clear cached graph-image so oc-mirror treats it as new content
 echo "=== Clearing graph-image from cache to force inclusion in bundle ==="
@@ -9036,6 +9049,18 @@ mkdir -p /workspace/output/tmp
 mkdir -p /workspace/output/.oc-mirror/.cache
 export TMPDIR=/workspace/output/tmp
 export HOME=/workspace/output
+
+# Snapshot cache for rollback on failure
+echo "=== Creating cache snapshot for rollback ==="
+rm -rf /workspace/output/.cache-snapshot
+mkdir -p /workspace/output/.cache-snapshot
+if [ -d /workspace/output/.oc-mirror ]; then
+  cp -al /workspace/output/.oc-mirror /workspace/output/.cache-snapshot/.oc-mirror
+fi
+if [ -d /workspace/output/.cache ]; then
+  cp -al /workspace/output/.cache /workspace/output/.cache-snapshot/.cache
+fi
+echo "Cache snapshot created (hardlinks, minimal extra space)"
 
 # Force graph-image re-inclusion in every bundle
 # Clear cached graph-image so oc-mirror treats it as new content
@@ -10297,6 +10322,10 @@ echo "..."
 
 echo "Final bundle created: $FINAL_BUNDLE_NAME"
 ls -lh "$FINAL_BUNDLE_NAME"
+
+# Clean up parent archives after repackaging
+rm -rf /workspace/output/parent-archives
+
 echo "=== Bundle creation complete ==="
 `},
 					},
@@ -10445,6 +10474,63 @@ fi
 								},
 							},
 						},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "output"},
+			},
+		},
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) buildPipelineFinallyTasks() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"name": "cleanup-workspace",
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "cleanup",
+						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"command": []string{"/bin/sh", "-c"},
+						"args": []string{`
+set -x
+echo "=== Pipeline finally cleanup ==="
+echo "Pipeline status: $(tasks.status)"
+df -h /workspace/output
+
+echo "=== Cleaning up old bundle tars ==="
+rm -f /workspace/output/collection-*.tar
+rm -f /workspace/output/collection-*.tar.sig
+rm -f /workspace/output/collection-*.tar.bundle
+
+echo "=== Removing intermediate working artifacts ==="
+rm -rf /workspace/output/working-dir
+rm -rf /workspace/output/tmp
+rm -rf /workspace/output/containers
+rm -rf /workspace/output/sboms
+rm -rf /workspace/output/sbom-cache
+rm -rf /workspace/output/syft-cache
+
+if [ "$(tasks.status)" != "Succeeded" ]; then
+  echo "=== Pipeline failed — restoring cache snapshot ==="
+  if [ -d /workspace/output/.cache-snapshot ]; then
+    rm -rf /workspace/output/.oc-mirror
+    rm -rf /workspace/output/.cache
+    mv /workspace/output/.cache-snapshot/.oc-mirror /workspace/output/.oc-mirror 2>/dev/null || true
+    mv /workspace/output/.cache-snapshot/.cache /workspace/output/.cache 2>/dev/null || true
+    rm -rf /workspace/output/.cache-snapshot
+    echo "Cache restored from snapshot"
+  fi
+else
+  echo "=== Pipeline succeeded — removing cache snapshot ==="
+  rm -rf /workspace/output/.cache-snapshot
+fi
+
+echo "=== Cleanup complete ==="
+df -h /workspace/output
+`},
 					},
 				},
 			},
