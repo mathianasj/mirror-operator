@@ -143,21 +143,36 @@ func main() {
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
-	taskRunObj := &pipelinev1.TaskRun{}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// Check for optional API groups before creating the manager,
+	// so we can conditionally configure the cache.
+	restConfig := ctrl.GetConfigOrDie()
+	clientSet, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create clientset")
+		os.Exit(1)
+	}
+
+	tektonAvailable := isAPIGroupAvailable(clientSet, "tekton.dev/v1")
+	securesignAvailable := isAPIGroupAvailable(clientSet, "rhtas.redhat.com/v1alpha1")
+
+	cacheOpts := cache.Options{}
+	if tektonAvailable {
+		taskRunObj := &pipelinev1.TaskRun{}
+		cacheOpts.ByObject = map[client.Object]cache.ByObject{
+			taskRunObj: {Namespaces: map[string]cache.Config{
+				"mirror-operator-system": {},
+			}},
+		}
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "5ac9daef.mirror.mathianasj.github.com",
-		Cache: cache.Options{
-			ByObject: map[client.Object]cache.ByObject{
-				taskRunObj: {Namespaces: map[string]cache.Config{
-					"mirror-operator-system": {},
-				}},
-			},
-		},
+		Cache:                  cacheOpts,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -174,16 +189,6 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-
-	// Create clientset for both controllers
-	clientSet, err := kubernetes.NewForConfig(mgr.GetConfig())
-	if err != nil {
-		setupLog.Error(err, "unable to create clientset")
-		os.Exit(1)
-	}
-
-	tektonAvailable := isAPIGroupAvailable(clientSet, "tekton.dev/v1")
-	securesignAvailable := isAPIGroupAvailable(clientSet, "rhtas.redhat.com/v1alpha1")
 
 	if err = (&controller.DisconnectedPlatformReconciler{
 		Client:                      mgr.GetClient(),
