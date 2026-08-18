@@ -71,6 +71,11 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 				needsRequeue = true
 			}
 
+			if err := r.ensureInfraEnv(ctx, platform); err != nil {
+				logger.Error(err, "failed to ensure InfraEnv")
+				needsRequeue = true
+			}
+
 			platform.Status.Components = append(platform.Status.Components,
 				mirrorv1.ComponentStatus{
 					Name: "host-inventory", Status: "Configured",
@@ -1381,9 +1386,147 @@ func (r *DisconnectedPlatformReconciler) ensureClusterImageSets(ctx context.Cont
 	return nil
 }
 
+// ensureInfraEnv creates an InfraEnv resource for assisted installer discovery, injecting cluster-level settings.
+func (r *DisconnectedPlatformReconciler) ensureInfraEnv(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	hostInv := platform.Spec.Airgapped.ACM.HostInventory
+	if hostInv.InfraEnv == nil || !hostInv.InfraEnv.Enabled {
+		return nil
+	}
+
+	infraEnvCfg := hostInv.InfraEnv
+	ns := infraEnvCfg.Namespace
+	if ns == "" {
+		ns = architectNamespace
+	}
+
+	infraEnv := &unstructured.Unstructured{}
+	infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "agent-install.openshift.io",
+		Version: "v1beta1",
+		Kind:    "InfraEnv",
+	})
+	infraEnv.SetName("mirror-operator-infraenv")
+	infraEnv.SetNamespace(ns)
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(infraEnv.GroupVersionKind())
+	if err := r.Get(ctx, client.ObjectKeyFromObject(infraEnv), existing); err == nil {
+		logger.Info("InfraEnv already exists")
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	spec := map[string]interface{}{
+		"pullSecretRef": map[string]interface{}{
+			"name": "pull-secret",
+		},
+	}
+
+	// Inject cluster version
+	if version := r.getClusterVersion(ctx); version != "" {
+		spec["osImageVersion"] = version
+	}
+
+	// CPU architecture
+	arch := infraEnvCfg.CpuArchitecture
+	if arch == "" {
+		arch = "x86_64"
+	}
+	spec["cpuArchitecture"] = arch
+
+	// Image type
+	imageType := infraEnvCfg.ImageType
+	if imageType == "" {
+		imageType = "full-iso"
+	}
+	spec["imageType"] = imageType
+
+	// SSH key: explicit CRD value, then cluster MachineConfig fallback
+	sshKey := infraEnvCfg.SSHAuthorizedKey
+	if sshKey == "" {
+		sshKey = r.getClusterSSHKey(ctx)
+	}
+	if sshKey != "" {
+		spec["sshAuthorizedKey"] = sshKey
+	}
+
+	// Proxy settings from cluster Proxy CR
+	httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+	if httpProxy != "" || httpsProxy != "" || noProxy != "" {
+		proxySpec := map[string]interface{}{}
+		if httpProxy != "" {
+			proxySpec["httpProxy"] = httpProxy
+		}
+		if httpsProxy != "" {
+			proxySpec["httpsProxy"] = httpsProxy
+		}
+		if noProxy != "" {
+			proxySpec["noProxy"] = noProxy
+		}
+		spec["proxy"] = proxySpec
+	}
+
+	// NTP sources from CRD
+	if len(infraEnvCfg.AdditionalNTPSources) > 0 {
+		ntpSources := make([]interface{}, len(infraEnvCfg.AdditionalNTPSources))
+		for i, s := range infraEnvCfg.AdditionalNTPSources {
+			ntpSources[i] = s
+		}
+		spec["additionalNTPSources"] = ntpSources
+	}
+
+	// CA trust bundle
+	if caBundle := r.getMirrorRegistryCA(ctx, platform); caBundle != "" {
+		spec["additionalTrustBundle"] = caBundle
+	}
+
+	// Mirror registry ref (created by ensureAssistedInstallerMirrorConfig)
+	spec["mirrorRegistryRef"] = map[string]interface{}{
+		"name":      "assisted-installer-mirror-config",
+		"namespace": "multicluster-engine",
+	}
+
+	// Static networking label selector
+	if infraEnvCfg.NetworkType == "static" && len(infraEnvCfg.NMStateConfigLabels) > 0 {
+		spec["nmStateConfigLabelSelector"] = map[string]interface{}{
+			"matchLabels": toStringInterfaceMap(infraEnvCfg.NMStateConfigLabels),
+		}
+	}
+
+	infraEnv.Object["spec"] = spec
+
+	if err := r.Create(ctx, infraEnv); err != nil {
+		return fmt.Errorf("failed to create InfraEnv: %w", err)
+	}
+	logger.Info("Created InfraEnv for host inventory discovery", "namespace", ns)
+	return nil
+}
+
+func toStringInterfaceMap(m map[string]string) map[string]interface{} {
+	result := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
 // deleteHostInventoryResources removes resources created for host inventory support.
 func (r *DisconnectedPlatformReconciler) deleteHostInventoryResources(ctx context.Context) {
 	logger := log.FromContext(ctx)
+
+	// Delete InfraEnv
+	infraEnv := &unstructured.Unstructured{}
+	infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+	})
+	infraEnv.SetName("mirror-operator-infraenv")
+	infraEnv.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, infraEnv); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete InfraEnv")
+	}
 
 	// Delete AgentServiceConfig
 	asc := &unstructured.Unstructured{}

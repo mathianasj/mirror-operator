@@ -77,6 +77,53 @@ spec:
                             description: Storage size for AgentServiceConfig imageStorage
                               PVC
                             type: string
+                          infraEnv:
+                            description: InfraEnv configuration for discovery ISO
+                              generation
+                            properties:
+                              additionalNTPSources:
+                                description: Additional NTP sources for cluster hosts
+                                items:
+                                  type: string
+                                type: array
+                              cpuArchitecture:
+                                default: x86_64
+                                description: CPU architecture for discovery image
+                                type: string
+                              enabled:
+                                default: true
+                                description: Enable InfraEnv creation
+                                type: boolean
+                              imageType:
+                                default: full-iso
+                                description: Discovery image type
+                                enum:
+                                - full-iso
+                                - minimal-iso
+                                type: string
+                              namespace:
+                                default: mirror-operator-system
+                                description: Namespace where the InfraEnv will be
+                                  created
+                                type: string
+                              networkType:
+                                default: dhcp
+                                description: Network configuration type
+                                enum:
+                                - dhcp
+                                - static
+                                type: string
+                              nmStateConfigLabels:
+                                additionalProperties:
+                                  type: string
+                                description: NMStateConfig label selector for static
+                                  networking (only used when networkType=static)
+                                type: object
+                              sshAuthorizedKey:
+                                description: SSH public key for agent debugging (if
+                                  empty, reads from cluster MachineConfig)
+                                type: string
+                            type: object
                           rhcosImage:
                             description: |-
                               Override the full RHCOS server container image reference (e.g. "my-registry:8443/rhcos-server:4.21")

@@ -454,6 +454,44 @@ type HostInventoryConfig struct {
 	// Kubernetes StorageClass for AgentServiceConfig PVCs
 	// +optional
 	StorageClass string `json:"storageClass,omitempty"`
+	// InfraEnv configuration for discovery ISO generation
+	// +optional
+	InfraEnv *InfraEnvConfig `json:"infraEnv,omitempty"`
+}
+
+// InfraEnvConfig configures the InfraEnv resource for assisted installer discovery
+type InfraEnvConfig struct {
+	// Enable InfraEnv creation
+	// +optional
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled,omitempty"`
+	// Namespace where the InfraEnv will be created
+	// +kubebuilder:default="mirror-operator-system"
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+	// Network configuration type
+	// +kubebuilder:validation:Enum=dhcp;static
+	// +kubebuilder:default="dhcp"
+	// +optional
+	NetworkType string `json:"networkType,omitempty"`
+	// NMStateConfig label selector for static networking (only used when networkType=static)
+	// +optional
+	NMStateConfigLabels map[string]string `json:"nmStateConfigLabels,omitempty"`
+	// SSH public key for agent debugging (if empty, reads from cluster MachineConfig)
+	// +optional
+	SSHAuthorizedKey string `json:"sshAuthorizedKey,omitempty"`
+	// Additional NTP sources for cluster hosts
+	// +optional
+	AdditionalNTPSources []string `json:"additionalNTPSources,omitempty"`
+	// CPU architecture for discovery image
+	// +kubebuilder:default="x86_64"
+	// +optional
+	CpuArchitecture string `json:"cpuArchitecture,omitempty"`
+	// Discovery image type
+	// +kubebuilder:validation:Enum=full-iso;minimal-iso
+	// +kubebuilder:default="full-iso"
+	// +optional
+	ImageType string `json:"imageType,omitempty"`
 }
 
 // HostInventoryVersion represents an OCP version for which RHCOS boot images are served

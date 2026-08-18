@@ -69,6 +69,79 @@ func buildQuayComponents(replicaOverride *int32, objectStorageManaged bool) []in
 	}
 }
 
+func (r *DisconnectedPlatformReconciler) getClusterVersion(ctx context.Context) string {
+	logger := log.FromContext(ctx)
+
+	cv := &unstructured.Unstructured{}
+	cv.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ClusterVersion",
+	})
+	cv.SetName("version")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cv), cv); err != nil {
+		logger.V(1).Info("Could not read ClusterVersion", "error", err)
+		return ""
+	}
+
+	version, _, _ := unstructured.NestedString(cv.Object, "status", "desired", "version")
+	return version
+}
+
+func (r *DisconnectedPlatformReconciler) getClusterProxy(ctx context.Context) (httpProxy, httpsProxy, noProxy string) {
+	logger := log.FromContext(ctx)
+
+	proxy := &unstructured.Unstructured{}
+	proxy.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Proxy",
+	})
+	proxy.SetName("cluster")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(proxy), proxy); err != nil {
+		logger.V(1).Info("Could not read Proxy CR", "error", err)
+		return "", "", ""
+	}
+
+	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpProxy")
+	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpsProxy")
+	noProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "noProxy")
+	return
+}
+
+func (r *DisconnectedPlatformReconciler) getClusterSSHKey(ctx context.Context) string {
+	logger := log.FromContext(ctx)
+
+	mc := &unstructured.Unstructured{}
+	mc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "machineconfiguration.openshift.io",
+		Version: "v1",
+		Kind:    "MachineConfig",
+	})
+	mc.SetName("99-master-ssh")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mc), mc); err != nil {
+		logger.V(1).Info("No 99-master-ssh MachineConfig found, skipping SSH key injection", "error", err)
+		return ""
+	}
+
+	users, found, _ := unstructured.NestedSlice(mc.Object, "spec", "config", "passwd", "users")
+	if !found || len(users) == 0 {
+		return ""
+	}
+	user, ok := users[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	keys, found, _ := unstructured.NestedStringSlice(user, "sshAuthorizedKeys")
+	if !found || len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
 func containsString(slice []string, s string) bool {
 	for _, item := range slice {
 		if item == s {
