@@ -208,11 +208,6 @@ func (r *DisconnectedPlatformReconciler) createAirgappedQuayConfigSecret(ctx con
 		return err
 	}
 
-	storageSize := "500Gi"
-	if platform.Spec.Airgapped.Quay.Storage != nil && platform.Spec.Airgapped.Quay.Storage.Size != "" {
-		storageSize = platform.Spec.Airgapped.Quay.Storage.Size
-	}
-
 	quayConfig := map[string]interface{}{
 		"DISTRIBUTED_STORAGE_CONFIG": map[string]interface{}{
 			"default": []interface{}{
@@ -225,7 +220,7 @@ func (r *DisconnectedPlatformReconciler) createAirgappedQuayConfigSecret(ctx con
 		"DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS": []interface{}{},
 		"DISTRIBUTED_STORAGE_PREFERENCE":        []interface{}{"default"},
 		"FEATURE_STORAGE_REPLICATION":           false,
-		"MAXIMUM_LAYER_SIZE":                    storageSize,
+		"MAXIMUM_LAYER_SIZE":                    "20G",
 	}
 
 	configYAML, err := yaml.Marshal(quayConfig)
