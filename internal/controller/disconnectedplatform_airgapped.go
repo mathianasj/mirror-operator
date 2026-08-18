@@ -179,17 +179,8 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedQuay(ctx context.Cont
 		return fmt.Errorf("failed to create airgapped Quay config secret: %w", err)
 	}
 
-	components := []interface{}{
-		map[string]interface{}{"kind": "clair", "managed": true},
-		map[string]interface{}{"kind": "postgres", "managed": true},
-		map[string]interface{}{"kind": "objectstorage", "managed": false},
-		map[string]interface{}{"kind": "redis", "managed": true},
-		map[string]interface{}{"kind": "horizontalpodautoscaler", "managed": true},
-		map[string]interface{}{"kind": "route", "managed": true},
-		map[string]interface{}{"kind": "mirror", "managed": true},
-		map[string]interface{}{"kind": "tls", "managed": true},
-		map[string]interface{}{"kind": "quay", "managed": true},
-	}
+	replicaOverride := r.resolveQuayReplicaOverride(ctx, quayConfig.Replicas)
+	components := buildQuayComponents(replicaOverride, false)
 
 	if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
 		return fmt.Errorf("failed to set QuayRegistry components: %w", err)

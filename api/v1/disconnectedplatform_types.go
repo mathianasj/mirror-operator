@@ -262,6 +262,11 @@ type ManagedQuayConfig struct {
 	// Clair vulnerability scanner configuration
 	// +optional
 	Clair *ClairConfig `json:"clair,omitempty"`
+	// Number of replicas for Quay, Clair, and Mirror components.
+	// If unset, auto-detects Single Node OpenShift and defaults to 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 type ClairConfig struct {
@@ -390,6 +395,11 @@ type AirgappedQuayConfig struct {
 	// Clair vulnerability scanner configuration
 	// +optional
 	Clair *ClairConfig `json:"clair,omitempty"`
+	// Number of replicas for Quay, Clair, and Mirror components.
+	// If unset, auto-detects Single Node OpenShift and defaults to 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 type AirgappedQuayStorageConfig struct {

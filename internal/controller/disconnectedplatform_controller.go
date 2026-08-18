@@ -3906,45 +3906,8 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		}
 
 		objectStorageManaged := !useS3Storage
-
-		components := []interface{}{
-			map[string]interface{}{
-				"kind":    "clair",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "postgres",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "objectstorage",
-				"managed": objectStorageManaged,
-			},
-			map[string]interface{}{
-				"kind":    "redis",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "horizontalpodautoscaler",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "route",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "mirror",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "tls",
-				"managed": true,
-			},
-			map[string]interface{}{
-				"kind":    "quay",
-				"managed": true,
-			},
-		}
+		replicaOverride := r.resolveQuayReplicaOverride(ctx, quayConfig.Managed.Replicas)
+		components := buildQuayComponents(replicaOverride, objectStorageManaged)
 
 		if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
 			return fmt.Errorf("failed to set QuayRegistry components: %w", err)

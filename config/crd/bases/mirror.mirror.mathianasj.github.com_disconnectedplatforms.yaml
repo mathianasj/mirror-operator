@@ -224,6 +224,13 @@ spec:
                         default: mirror
                         description: Quay organization name for mirrored content
                         type: string
+                      replicas:
+                        description: |-
+                          Number of replicas for Quay, Clair, and Mirror components.
+                          If unset, auto-detects Single Node OpenShift and defaults to 1.
+                        format: int32
+                        minimum: 1
+                        type: integer
                       storage:
                         description: Storage configuration for airgapped Quay (filesystem-backed)
                         properties:
@@ -635,6 +642,13 @@ spec:
                             default: mirror
                             description: Quay organization name for mirrored content
                             type: string
+                          replicas:
+                            description: |-
+                              Number of replicas for Quay, Clair, and Mirror components.
+                              If unset, auto-detects Single Node OpenShift and defaults to 1.
+                            format: int32
+                            minimum: 1
+                            type: integer
                           storage:
                             description: Storage configuration for Quay registry
                             properties:
