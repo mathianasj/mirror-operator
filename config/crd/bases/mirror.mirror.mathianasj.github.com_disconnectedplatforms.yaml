@@ -74,7 +74,7 @@ spec:
                                 description: Name of the credential Secret
                                 type: string
                               namespace:
-                                default: open-cluster-management
+                                default: multicluster-engine
                                 description: Namespace where the credential Secret
                                   will be created
                                 type: string

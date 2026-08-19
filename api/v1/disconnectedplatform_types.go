@@ -508,7 +508,7 @@ type CredentialConfig struct {
 	// +optional
 	Name string `json:"name,omitempty"`
 	// Namespace where the credential Secret will be created
-	// +kubebuilder:default="open-cluster-management"
+	// +kubebuilder:default="multicluster-engine"
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 	// Base domain for cluster deployments

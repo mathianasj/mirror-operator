@@ -1617,7 +1617,7 @@ func (r *DisconnectedPlatformReconciler) ensureACMCredential(ctx context.Context
 	}
 	ns := credCfg.Namespace
 	if ns == "" {
-		ns = "open-cluster-management"
+		ns = "multicluster-engine"
 	}
 
 	existing := &corev1.Secret{}
@@ -1646,16 +1646,15 @@ func (r *DisconnectedPlatformReconciler) ensureACMCredential(ctx context.Context
 			Name:      name,
 			Namespace: ns,
 			Labels: map[string]string{
-				"cluster.open-cluster-management.io/type":        "host",
+				"cluster.open-cluster-management.io/type":        "hostinventory",
 				"cluster.open-cluster-management.io/credentials": "",
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
-			"pullSecret":     pullSecretJSON,
-			"ssh-publickey":  sshPublicKey,
-			"ssh-privatekey": "",
-			"baseDomain":     credCfg.BaseDomain,
+			"pullSecret":    pullSecretJSON,
+			"ssh-publickey": sshPublicKey,
+			"baseDomain":    credCfg.BaseDomain,
 		},
 	}
 
@@ -1925,7 +1924,7 @@ func (r *DisconnectedPlatformReconciler) deleteHostInventoryResources(ctx contex
 
 	// Delete ACM infrastructure provider credential
 	credSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-credential", Namespace: "open-cluster-management"},
+		ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-credential", Namespace: "multicluster-engine"},
 	}
 	if err := r.Delete(ctx, credSecret); err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "failed to delete ACM credential")
