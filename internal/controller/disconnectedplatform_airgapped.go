@@ -1120,6 +1120,8 @@ func (r *DisconnectedPlatformReconciler) reconcileRHCOSServer(ctx context.Contex
 
 // ensureAssistedInstallerMirrorConfig creates the ConfigMap in multicluster-engine namespace
 // with mirror registry CA and registries.conf for the assisted installer.
+// It reads ImageDigestMirrorSets and ImageTagMirrorSets from the cluster and adds
+// the managed Quay registry as an additional mirror for each source.
 func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
 
@@ -1135,40 +1137,124 @@ func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx
 
 	caBundlePEM := r.getMirrorRegistryCA(ctx, platform)
 
-	registriesConf := fmt.Sprintf(`unqualified-search-registries = ["registry.access.redhat.com", "docker.io"]
+	type mirrorEntry struct {
+		source        string
+		mirrors       []string
+		digestOnly    bool
+	}
 
-[[registry]]
-  prefix = ""
-  location = "quay.io/openshift-release-dev/ocp-release"
-  mirror-by-digest-only = true
+	seen := map[string]*mirrorEntry{}
+	var orderedSources []string
 
-  [[registry.mirror]]
-    location = "%s/openshift/release-images"
+	addEntry := func(source string, mirrors []string, digestOnly bool) {
+		if e, ok := seen[source]; ok {
+			for _, m := range mirrors {
+				found := false
+				for _, existing := range e.mirrors {
+					if existing == m {
+						found = true
+						break
+					}
+				}
+				if !found {
+					e.mirrors = append(e.mirrors, m)
+				}
+			}
+		} else {
+			seen[source] = &mirrorEntry{source: source, mirrors: mirrors, digestOnly: digestOnly}
+			orderedSources = append(orderedSources, source)
+		}
+	}
 
-[[registry]]
-  prefix = ""
-  location = "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
-  mirror-by-digest-only = true
+	idmsList := &unstructured.UnstructuredList{}
+	idmsList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ImageDigestMirrorSet",
+	})
+	if err := r.List(ctx, idmsList); err == nil {
+		for _, idms := range idmsList.Items {
+			entries, _, _ := unstructured.NestedSlice(idms.Object, "spec", "imageDigestMirrors")
+			for _, entry := range entries {
+				e, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				source, _, _ := unstructured.NestedString(e, "source")
+				if source == "" {
+					continue
+				}
+				mirrorsRaw, _, _ := unstructured.NestedStringSlice(e, "mirrors")
+				addEntry(source, mirrorsRaw, true)
+			}
+		}
+	} else {
+		logger.V(1).Info("Could not list ImageDigestMirrorSets", "error", err)
+	}
 
-  [[registry.mirror]]
-    location = "%s/openshift/release"
+	itmsList := &unstructured.UnstructuredList{}
+	itmsList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ImageTagMirrorSet",
+	})
+	if err := r.List(ctx, itmsList); err == nil {
+		for _, itms := range itmsList.Items {
+			entries, _, _ := unstructured.NestedSlice(itms.Object, "spec", "imageTagMirrors")
+			for _, entry := range entries {
+				e, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				source, _, _ := unstructured.NestedString(e, "source")
+				if source == "" {
+					continue
+				}
+				mirrorsRaw, _, _ := unstructured.NestedStringSlice(e, "mirrors")
+				addEntry(source, mirrorsRaw, false)
+			}
+		}
+	} else {
+		logger.V(1).Info("Could not list ImageTagMirrorSets", "error", err)
+	}
 
-[[registry]]
-  prefix = ""
-  location = "registry.redhat.io/multicluster-engine"
-  mirror-by-digest-only = true
+	// Add Quay as an additional mirror for each source
+	for _, source := range orderedSources {
+		e := seen[source]
+		quayMirror := registryHost
+		// Preserve the path suffix from the source for namespaced images
+		parts := strings.SplitN(source, "/", 2)
+		if len(parts) == 2 {
+			quayMirror = registryHost + "/" + parts[1]
+		}
+		found := false
+		for _, m := range e.mirrors {
+			if m == quayMirror {
+				found = true
+				break
+			}
+		}
+		if !found {
+			e.mirrors = append(e.mirrors, quayMirror)
+		}
+	}
 
-  [[registry.mirror]]
-    location = "%s/multicluster-engine"
+	var sb strings.Builder
+	sb.WriteString("unqualified-search-registries = [\"registry.access.redhat.com\", \"docker.io\"]\n")
 
-[[registry]]
-  prefix = ""
-  location = "registry.redhat.io"
-  mirror-by-digest-only = true
+	for _, source := range orderedSources {
+		e := seen[source]
+		sb.WriteString("\n[[registry]]\n")
+		sb.WriteString("  prefix = \"\"\n")
+		sb.WriteString(fmt.Sprintf("  location = \"%s\"\n", e.source))
+		sb.WriteString(fmt.Sprintf("  mirror-by-digest-only = %t\n", e.digestOnly))
+		for _, m := range e.mirrors {
+			sb.WriteString("\n  [[registry.mirror]]\n")
+			sb.WriteString(fmt.Sprintf("    location = \"%s\"\n", m))
+		}
+	}
 
-  [[registry.mirror]]
-    location = "%s"
-`, registryHost, registryHost, registryHost, registryHost)
+	registriesConf := sb.String()
 
 	if err := r.ensureNamespace(ctx, "multicluster-engine"); err != nil {
 		return fmt.Errorf("failed to ensure multicluster-engine namespace: %w", err)

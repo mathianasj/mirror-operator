@@ -172,6 +172,8 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=config.openshift.io,resources=proxies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagetagmirrorsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=hive.openshift.io,resources=clusterimagesets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
