@@ -518,7 +518,7 @@ type CredentialConfig struct {
 
 // HostInventoryVersion represents an OCP version for which RHCOS boot images are served
 type HostInventoryVersion struct {
-	// OpenShift version (e.g., "4.18")
+	// OpenShift version (e.g., "4.18.12")
 	OpenshiftVersion string `json:"openshiftVersion"`
 	// CPU architecture
 	// +kubebuilder:default="x86_64"

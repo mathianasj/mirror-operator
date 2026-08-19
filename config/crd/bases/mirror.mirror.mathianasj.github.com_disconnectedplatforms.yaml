@@ -166,7 +166,7 @@ spec:
                                   description: CPU architecture
                                   type: string
                                 openshiftVersion:
-                                  description: OpenShift version (e.g., "4.18")
+                                  description: OpenShift version (e.g., "4.18.12")
                                   type: string
                               required:
                               - openshiftVersion

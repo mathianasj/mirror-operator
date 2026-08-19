@@ -1449,6 +1449,7 @@ func (r *DisconnectedPlatformReconciler) ensureClusterImageSets(ctx context.Cont
 			Group: "hive.openshift.io", Version: "v1", Kind: "ClusterImageSet",
 		})
 		cis.SetName(cisName)
+		cis.SetLabels(map[string]string{"visible": "true"})
 
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(cis.GroupVersionKind())
@@ -1464,7 +1465,11 @@ func (r *DisconnectedPlatformReconciler) ensureClusterImageSets(ctx context.Cont
 			registryHost = mirrorRegistry[:idx]
 		}
 
-		releaseImage := fmt.Sprintf("%s/openshift/release-images:%s-x86_64", registryHost, v.OpenshiftVersion)
+		arch := v.CpuArchitecture
+		if arch == "" {
+			arch = "x86_64"
+		}
+		releaseImage := fmt.Sprintf("%s/openshift/release-images:%s-%s", registryHost, v.OpenshiftVersion, arch)
 		cis.Object["spec"] = map[string]interface{}{
 			"releaseImage": releaseImage,
 		}
