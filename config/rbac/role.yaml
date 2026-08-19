@@ -107,6 +107,7 @@ rules:
 - apiGroups:
   - config.openshift.io
   resources:
+  - clusterimagepolicies
   - clusterversions
   - infrastructures
   - ingresses

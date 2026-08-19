@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -1582,6 +1583,11 @@ func (r *DisconnectedPlatformReconciler) ensureInfraEnv(ctx context.Context, pla
 		}
 	}
 
+	// Sigstore signature verification: inject policy.json and registries.d config
+	if ignitionOverride := r.buildIgnitionConfigOverride(ctx); ignitionOverride != "" {
+		spec["ignitionConfigOverride"] = ignitionOverride
+	}
+
 	infraEnv.Object["spec"] = spec
 
 	if err := r.Create(ctx, infraEnv); err != nil {
@@ -1589,6 +1595,206 @@ func (r *DisconnectedPlatformReconciler) ensureInfraEnv(ctx context.Context, pla
 	}
 	logger.Info("Created InfraEnv for host inventory discovery", "namespace", ns)
 	return nil
+}
+
+// buildIgnitionConfigOverride builds an ignition config that injects the proper
+// sigstore signature verification policy and registries.d config onto the discovery ISO.
+// It reads ClusterImagePolicy resources to get the public keys and IDMS entries to
+// build remapIdentity mappings so the discovery node can verify cosign signatures
+// from the mirror registry.
+func (r *DisconnectedPlatformReconciler) buildIgnitionConfigOverride(ctx context.Context) string {
+	logger := log.FromContext(ctx)
+
+	// Read ClusterImagePolicy resources to get public keys and scopes
+	cipList := &unstructured.UnstructuredList{}
+	cipList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ClusterImagePolicy",
+	})
+
+	type policyEntry struct {
+		keyData string
+		scopes  []string
+	}
+	var policies []policyEntry
+
+	if err := r.List(ctx, cipList); err == nil {
+		for _, cip := range cipList.Items {
+			keyData, _, _ := unstructured.NestedString(cip.Object, "spec", "policy", "rootOfTrust", "publicKey", "keyData")
+			if keyData == "" {
+				continue
+			}
+			scopesRaw, _, _ := unstructured.NestedStringSlice(cip.Object, "spec", "scopes")
+			if len(scopesRaw) == 0 {
+				continue
+			}
+			policies = append(policies, policyEntry{keyData: keyData, scopes: scopesRaw})
+		}
+	} else {
+		logger.V(1).Info("Could not list ClusterImagePolicy resources", "error", err)
+	}
+
+	if len(policies) == 0 {
+		return ""
+	}
+
+	// Read IDMS to find mirror→source mappings
+	type mirrorMapping struct {
+		mirror string
+		source string
+	}
+	var mappings []mirrorMapping
+
+	idmsList := &unstructured.UnstructuredList{}
+	idmsList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ImageDigestMirrorSet",
+	})
+	if err := r.List(ctx, idmsList); err == nil {
+		for _, idms := range idmsList.Items {
+			entries, _, _ := unstructured.NestedSlice(idms.Object, "spec", "imageDigestMirrors")
+			for _, entry := range entries {
+				e, ok := entry.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				source, _, _ := unstructured.NestedString(e, "source")
+				mirrors, _, _ := unstructured.NestedStringSlice(e, "mirrors")
+				for _, m := range mirrors {
+					mappings = append(mappings, mirrorMapping{mirror: m, source: source})
+				}
+			}
+		}
+	}
+
+	// Build policy.json
+	// Default: insecureAcceptAnything (same as hub nodes)
+	// For each ClusterImagePolicy scope + its mirror paths: sigstoreSigned with remapIdentity
+	dockerTransport := map[string]interface{}{}
+
+	for _, pol := range policies {
+		for _, scope := range pol.scopes {
+			// Add entry for the source scope itself
+			dockerTransport[scope] = []interface{}{
+				map[string]interface{}{
+					"type":    "sigstoreSigned",
+					"keyData": pol.keyData,
+					"signedIdentity": map[string]interface{}{
+						"type": "matchRepoDigestOrExact",
+					},
+				},
+			}
+
+			// Add entries for each mirror of this scope
+			for _, mm := range mappings {
+				if mm.source == scope {
+					dockerTransport[mm.mirror] = []interface{}{
+						map[string]interface{}{
+							"type":    "sigstoreSigned",
+							"keyData": pol.keyData,
+							"signedIdentity": map[string]interface{}{
+								"type": "remapIdentity",
+								"prefix": mm.mirror,
+								"signedPrefix": scope,
+							},
+						},
+					}
+				}
+			}
+		}
+	}
+
+	dockerTransport[""] = []interface{}{
+		map[string]interface{}{"type": "insecureAcceptAnything"},
+	}
+
+	policyJSON := map[string]interface{}{
+		"default": []interface{}{
+			map[string]interface{}{"type": "insecureAcceptAnything"},
+		},
+		"transports": map[string]interface{}{
+			"atomic": dockerTransport,
+			"docker": dockerTransport,
+			"docker-daemon": map[string]interface{}{
+				"": []interface{}{
+					map[string]interface{}{"type": "insecureAcceptAnything"},
+				},
+			},
+		},
+	}
+
+	policyBytes, err := json.Marshal(policyJSON)
+	if err != nil {
+		logger.Error(err, "Failed to marshal policy.json")
+		return ""
+	}
+
+	// Build registries.d/sigstore-registries.yaml
+	// Enable use-sigstore-attachments for all mirror registries and source scopes
+	registriesD := map[string]interface{}{}
+	dockerEntries := map[string]interface{}{}
+
+	for _, pol := range policies {
+		for _, scope := range pol.scopes {
+			dockerEntries[scope] = map[string]interface{}{
+				"use-sigstore-attachments": true,
+			}
+			for _, mm := range mappings {
+				if mm.source == scope {
+					dockerEntries[mm.mirror] = map[string]interface{}{
+						"use-sigstore-attachments": true,
+					}
+				}
+			}
+		}
+	}
+	registriesD["docker"] = dockerEntries
+
+	registriesDBytes, err := yaml.Marshal(registriesD)
+	if err != nil {
+		logger.Error(err, "Failed to marshal sigstore-registries.yaml")
+		return ""
+	}
+
+	// Build ignition config with both files
+	policyB64 := base64.StdEncoding.EncodeToString(policyBytes)
+	registriesDB64 := base64.StdEncoding.EncodeToString(registriesDBytes)
+
+	ignitionConfig := map[string]interface{}{
+		"ignition": map[string]interface{}{
+			"version": "3.2.0",
+		},
+		"storage": map[string]interface{}{
+			"files": []interface{}{
+				map[string]interface{}{
+					"path":      "/etc/containers/policy.json",
+					"mode":      420,
+					"overwrite": true,
+					"contents": map[string]interface{}{
+						"source": "data:text/plain;charset=utf-8;base64," + policyB64,
+					},
+				},
+				map[string]interface{}{
+					"path":      "/etc/containers/registries.d/sigstore-registries.yaml",
+					"mode":      420,
+					"overwrite": true,
+					"contents": map[string]interface{}{
+						"source": "data:text/plain;charset=utf-8;base64," + registriesDB64,
+					},
+				},
+			},
+		},
+	}
+
+	ignitionBytes, err := json.Marshal(ignitionConfig)
+	if err != nil {
+		logger.Error(err, "Failed to marshal ignition config")
+		return ""
+	}
+
+	return string(ignitionBytes)
 }
 
 func toStringInterfaceMap(m map[string]string) map[string]interface{} {
