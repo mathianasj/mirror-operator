@@ -58,6 +58,27 @@ spec:
                         description: Host inventory configuration for assisted installer
                           bare-metal provisioning
                         properties:
+                          credential:
+                            description: ACM infrastructure provider credential configuration
+                            properties:
+                              baseDomain:
+                                description: Base domain for cluster deployments
+                                type: string
+                              enabled:
+                                default: true
+                                description: Enable creation of the ACM infrastructure
+                                  provider credential
+                                type: boolean
+                              name:
+                                default: mirror-operator-credential
+                                description: Name of the credential Secret
+                                type: string
+                              namespace:
+                                default: open-cluster-management
+                                description: Namespace where the credential Secret
+                                  will be created
+                                type: string
+                            type: object
                           databaseStorageSize:
                             default: 200Gi
                             description: Storage size for AgentServiceConfig databaseStorage

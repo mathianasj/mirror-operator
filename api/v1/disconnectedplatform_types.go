@@ -457,6 +457,9 @@ type HostInventoryConfig struct {
 	// InfraEnv configuration for discovery ISO generation
 	// +optional
 	InfraEnv *InfraEnvConfig `json:"infraEnv,omitempty"`
+	// ACM infrastructure provider credential configuration
+	// +optional
+	Credential *CredentialConfig `json:"credential,omitempty"`
 }
 
 // InfraEnvConfig configures the InfraEnv resource for assisted installer discovery
@@ -492,6 +495,25 @@ type InfraEnvConfig struct {
 	// +kubebuilder:default="full-iso"
 	// +optional
 	ImageType string `json:"imageType,omitempty"`
+}
+
+// CredentialConfig configures the ACM infrastructure provider credential for host inventory
+type CredentialConfig struct {
+	// Enable creation of the ACM infrastructure provider credential
+	// +optional
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled,omitempty"`
+	// Name of the credential Secret
+	// +kubebuilder:default="mirror-operator-credential"
+	// +optional
+	Name string `json:"name,omitempty"`
+	// Namespace where the credential Secret will be created
+	// +kubebuilder:default="open-cluster-management"
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+	// Base domain for cluster deployments
+	// +optional
+	BaseDomain string `json:"baseDomain,omitempty"`
 }
 
 // HostInventoryVersion represents an OCP version for which RHCOS boot images are served

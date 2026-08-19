@@ -77,6 +77,11 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 				needsRequeue = true
 			}
 
+			if err := r.ensureACMCredential(ctx, platform); err != nil {
+				logger.Error(err, "failed to ensure ACM credential")
+				needsRequeue = true
+			}
+
 			platform.Status.Components = append(platform.Status.Components,
 				mirrorv1.ComponentStatus{
 					Name: "host-inventory", Status: "Configured",
@@ -1139,9 +1144,9 @@ func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx
 	caBundlePEM := r.getMirrorRegistryCA(ctx, platform)
 
 	type mirrorEntry struct {
-		source        string
-		mirrors       []string
-		digestOnly    bool
+		source     string
+		mirrors    []string
+		digestOnly bool
 	}
 
 	seen := map[string]*mirrorEntry{}
@@ -1597,6 +1602,70 @@ func (r *DisconnectedPlatformReconciler) ensureInfraEnv(ctx context.Context, pla
 	return nil
 }
 
+func (r *DisconnectedPlatformReconciler) ensureACMCredential(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	logger := log.FromContext(ctx)
+
+	hostInv := platform.Spec.Airgapped.ACM.HostInventory
+	if hostInv.Credential == nil || !hostInv.Credential.Enabled {
+		return nil
+	}
+
+	credCfg := hostInv.Credential
+	name := credCfg.Name
+	if name == "" {
+		name = "mirror-operator-credential"
+	}
+	ns := credCfg.Namespace
+	if ns == "" {
+		ns = "open-cluster-management"
+	}
+
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	sourceSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: architectNamespace}, sourceSecret); err != nil {
+		return fmt.Errorf("failed to get pull-secret for ACM credential: %w", err)
+	}
+	pullSecretJSON := string(sourceSecret.Data[".dockerconfigjson"])
+
+	sshPublicKey := ""
+	if hostInv.InfraEnv != nil && hostInv.InfraEnv.SSHAuthorizedKey != "" {
+		sshPublicKey = hostInv.InfraEnv.SSHAuthorizedKey
+	}
+	if sshPublicKey == "" {
+		sshPublicKey = r.getClusterSSHKey(ctx)
+	}
+
+	credential := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels: map[string]string{
+				"cluster.open-cluster-management.io/type":        "ans",
+				"cluster.open-cluster-management.io/credentials": "",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		StringData: map[string]string{
+			"pullSecret":     pullSecretJSON,
+			"ssh-publickey":  sshPublicKey,
+			"ssh-privatekey": "",
+			"baseDomain":     credCfg.BaseDomain,
+		},
+	}
+
+	if err := r.Create(ctx, credential); err != nil {
+		return fmt.Errorf("failed to create ACM credential: %w", err)
+	}
+	logger.Info("Created ACM infrastructure provider credential", "name", name, "namespace", ns)
+	return nil
+}
+
 // buildIgnitionConfigOverride builds an ignition config that injects the proper
 // sigstore signature verification policy and registries.d config onto the discovery ISO.
 // It reads ClusterImagePolicy resources to get the public keys and IDMS entries to
@@ -1695,8 +1764,8 @@ func (r *DisconnectedPlatformReconciler) buildIgnitionConfigOverride(ctx context
 							"type":    "sigstoreSigned",
 							"keyData": pol.keyData,
 							"signedIdentity": map[string]interface{}{
-								"type": "remapIdentity",
-								"prefix": mm.mirror,
+								"type":         "remapIdentity",
+								"prefix":       mm.mirror,
 								"signedPrefix": scope,
 							},
 						},
@@ -1852,6 +1921,14 @@ func (r *DisconnectedPlatformReconciler) deleteHostInventoryResources(ctx contex
 	}
 	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "failed to delete assisted-installer-mirror-config")
+	}
+
+	// Delete ACM infrastructure provider credential
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-credential", Namespace: "open-cluster-management"},
+	}
+	if err := r.Delete(ctx, credSecret); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete ACM credential")
 	}
 }
 
