@@ -1646,7 +1646,7 @@ func (r *DisconnectedPlatformReconciler) ensureACMCredential(ctx context.Context
 			Name:      name,
 			Namespace: ns,
 			Labels: map[string]string{
-				"cluster.open-cluster-management.io/type":        "ans",
+				"cluster.open-cluster-management.io/type":        "host",
 				"cluster.open-cluster-management.io/credentials": "",
 			},
 		},
