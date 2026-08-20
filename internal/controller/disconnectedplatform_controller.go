@@ -10174,10 +10174,23 @@ if [ -n "$AUTH_B64" ]; then
   CRED_USER=$(echo "$CREDS" | cut -d: -f1)
   CRED_PASS=$(echo "$CREDS" | cut -d: -f2-)
   skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
+  skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$REGISTRY_HOST"
 fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
-skopeo copy --dest-tls-verify=false \
+
+# Quay redirects blob uploads to its SERVER_HOSTNAME (external route) via
+# Location headers. When the client follows the redirect, it goes through
+# the AWS CLB which resets connections on large blobs (~1GB RHCOS images).
+# Fix: map the external hostname to the internal ClusterIP in /etc/hosts
+# so redirects stay cluster-internal, bypassing the CLB entirely.
+INTERNAL_IP=$(getent hosts "$INTERNAL_HOST" | awk '{print $1}' | head -1)
+if [ -n "$INTERNAL_IP" ]; then
+  echo "$INTERNAL_IP $REGISTRY_HOST" >> /etc/hosts
+  echo "Mapped $REGISTRY_HOST -> $INTERNAL_IP to bypass CLB redirects"
+fi
+
+skopeo copy --dest-tls-verify=false --retry-times 3 \
   "oci:${OCI_DIR}:${RHCOS_VERSION}" \
   "docker://${PUSH_IMAGE}"
 
