@@ -3883,6 +3883,10 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				logger.Error(err, "failed to ensure Quay route annotations")
 			}
 
+			if err := r.ensureQuayGunicornTimeout(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to ensure Quay gunicorn timeout")
+			}
+
 			// Configure Clair VEX if needed for existing QuayRegistry
 			if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
 				if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
@@ -4356,6 +4360,68 @@ func (r *DisconnectedPlatformReconciler) ensureQuayRouteAnnotations(ctx context.
 	logger.Info("Updating Quay route annotations for large blob uploads", "route", route.GetName())
 	route.SetAnnotations(annotations)
 	return r.Update(ctx, route)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayGunicornTimeout(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	components, found, err := unstructured.NestedSlice(quayRegistry.Object, "spec", "components")
+	if err != nil || !found {
+		return err
+	}
+
+	desiredEnv := map[string]interface{}{
+		"name":  "GUNICORN_CMD_ARGS",
+		"value": "--timeout 300",
+	}
+
+	needsUpdate := false
+	for i, comp := range components {
+		c, ok := comp.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		kind, _, _ := unstructured.NestedString(c, "kind")
+		if kind != "quay" {
+			continue
+		}
+
+		envList, _, _ := unstructured.NestedSlice(c, "overrides", "env")
+		hasTimeout := false
+		for _, e := range envList {
+			entry, ok := e.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if entry["name"] == "GUNICORN_CMD_ARGS" {
+				hasTimeout = true
+				break
+			}
+		}
+		if hasTimeout {
+			return nil
+		}
+
+		envList = append(envList, desiredEnv)
+		if c["overrides"] == nil {
+			c["overrides"] = map[string]interface{}{}
+		}
+		overrides := c["overrides"].(map[string]interface{})
+		overrides["env"] = envList
+		components[i] = c
+		needsUpdate = true
+		break
+	}
+
+	if !needsUpdate {
+		return nil
+	}
+
+	logger.Info("Setting GUNICORN_CMD_ARGS on QuayRegistry for large blob upload support")
+	if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
+		return err
+	}
+	return r.Update(ctx, quayRegistry)
 }
 
 // ensureAWSLoadBalancerTimeout detects AWS platform and increases the CLB idle
@@ -10165,7 +10231,7 @@ else
   PUSH_IMAGE="${INTERNAL_HOST}/rhcos-server:${RHCOS_VERSION}"
 fi
 
-# Extract credentials from pull secret and login to internal service
+# Extract credentials from pull secret and login
 AUTH_B64=$(cat /workspace/pull-secret/.dockerconfigjson | \
   grep -o "\"${REGISTRY_HOST}[^\"]*\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1 | \
   grep -o '"auth":"[^"]*"' | cut -d'"' -f4)
@@ -10174,22 +10240,9 @@ if [ -n "$AUTH_B64" ]; then
   CRED_USER=$(echo "$CREDS" | cut -d: -f1)
   CRED_PASS=$(echo "$CREDS" | cut -d: -f2-)
   skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
-  skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$REGISTRY_HOST"
 fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
-
-# Quay redirects blob uploads to its SERVER_HOSTNAME (external route) via
-# Location headers. When the client follows the redirect, it goes through
-# the AWS CLB which resets connections on large blobs (~1GB RHCOS images).
-# Fix: map the external hostname to the internal ClusterIP in /etc/hosts
-# so redirects stay cluster-internal, bypassing the CLB entirely.
-INTERNAL_IP=$(getent hosts "$INTERNAL_HOST" | awk '{print $1}' | head -1)
-if [ -n "$INTERNAL_IP" ]; then
-  echo "$INTERNAL_IP $REGISTRY_HOST" >> /etc/hosts
-  echo "Mapped $REGISTRY_HOST -> $INTERNAL_IP to bypass CLB redirects"
-fi
-
 skopeo copy --dest-tls-verify=false --retry-times 3 \
   "oci:${OCI_DIR}:${RHCOS_VERSION}" \
   "docker://${PUSH_IMAGE}"

@@ -176,6 +176,10 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedQuay(ctx context.Cont
 			}
 		}
 
+		if err := r.ensureQuayGunicornTimeout(ctx, quayRegistry); err != nil {
+			logger.Error(err, "failed to ensure Quay gunicorn timeout for airgapped Quay")
+		}
+
 		platform.Status.Components = append(platform.Status.Components,
 			mirrorv1.ComponentStatus{Name: "quay-registry", Status: "Running",
 				Kind: "QuayRegistry", APIGroup: "quay.redhat.com", Namespace: architectNamespace},

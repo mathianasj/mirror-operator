@@ -48,10 +48,20 @@ func buildQuayComponents(replicaOverride *int32, objectStorageManaged bool) []in
 
 	makeComponent := func(kind string, managed bool) map[string]interface{} {
 		c := map[string]interface{}{"kind": kind, "managed": managed}
+		overrides := map[string]interface{}{}
 		if replicaOverride != nil && (kind == "quay" || kind == "clair" || kind == "mirror") {
-			c["overrides"] = map[string]interface{}{
-				"replicas": int64(*replicaOverride),
+			overrides["replicas"] = int64(*replicaOverride)
+		}
+		if kind == "quay" {
+			overrides["env"] = []interface{}{
+				map[string]interface{}{
+					"name":  "GUNICORN_CMD_ARGS",
+					"value": "--timeout 300",
+				},
 			}
+		}
+		if len(overrides) > 0 {
+			c["overrides"] = overrides
 		}
 		return c
 	}
