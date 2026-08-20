@@ -10123,7 +10123,37 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   -f "$RHCOS_DIR/Containerfile" \
   "$RHCOS_DIR"
 
-# Push via internal Quay service to bypass AWS CLB connection resets on large blobs
+echo "Saving image to OCI directory for push step..."
+buildah push --storage-driver=vfs "$FULL_IMAGE" "oci:/workspace/output/rhcos-server-oci:${RHCOS_VERSION}"
+
+echo "=== RHCOS server image build complete ==="
+`},
+					},
+					{
+						"name":    "push-image",
+						"image":   "quay.io/skopeo/stable:latest",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+
+INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+if [ -z "$INTERMEDIATE_REGISTRY" ]; then
+  echo "No intermediate registry, skipping push"
+  exit 0
+fi
+
+if [ -f "/workspace/output/rhcos/RHCOS_VERSION.txt" ]; then
+  RHCOS_VERSION=$(cat /workspace/output/rhcos/RHCOS_VERSION.txt | grep rhcos_version | cut -d= -f2)
+else
+  RHCOS_VERSION=$(echo "$(params.oc-version)" | grep -oP '\d+\.\d+')
+fi
+
+OCI_DIR="/workspace/output/rhcos-server-oci"
+if [ ! -d "$OCI_DIR" ]; then
+  echo "No OCI directory found, build step likely skipped"
+  exit 0
+fi
+
 REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
 REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
@@ -10135,7 +10165,6 @@ else
   PUSH_IMAGE="${INTERNAL_HOST}/rhcos-server:${RHCOS_VERSION}"
 fi
 
-# Create auth file with internal hostname credentials copied from external
 cp /workspace/pull-secret/.dockerconfigjson /tmp/push-auth.json
 python3 -c "
 import json
@@ -10151,12 +10180,13 @@ with open('/tmp/push-auth.json', 'w') as f:
 " 2>/dev/null || true
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
-buildah push --storage-driver=vfs --tls-verify=false \
+skopeo copy --dest-tls-verify=false \
   --authfile=/tmp/push-auth.json \
-  "$FULL_IMAGE" "docker://$PUSH_IMAGE"
+  "oci:${OCI_DIR}:${RHCOS_VERSION}" \
+  "docker://${PUSH_IMAGE}"
 
-echo "RHCOS server image pushed: $FULL_IMAGE"
-echo "=== RHCOS server image build complete ==="
+rm -rf "$OCI_DIR"
+echo "RHCOS server image pushed: ${PUSH_IMAGE}"
 `},
 					},
 				},
