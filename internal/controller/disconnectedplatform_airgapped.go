@@ -1152,6 +1152,23 @@ func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx
 	seen := map[string]*mirrorEntry{}
 	var orderedSources []string
 
+	// openshift-install rejects imageDigestSources entries where the source
+	// is a shallow Docker Hub namespace (e.g. "docker.io/amazon"). These
+	// entries are valid ITMS/IDMS on running clusters but not usable during
+	// assisted-installer cluster provisioning.
+	isInstallSafe := func(source string) bool {
+		parts := strings.SplitN(source, "/", 2)
+		if len(parts) < 2 || parts[1] == "" {
+			return false
+		}
+		host := parts[0]
+		path := parts[1]
+		if (host == "docker.io" || host == "index.docker.io") && !strings.Contains(path, "/") {
+			return false
+		}
+		return true
+	}
+
 	addEntry := func(source string, mirrors []string, digestOnly bool) {
 		if e, ok := seen[source]; ok {
 			for _, m := range mirrors {
@@ -1187,7 +1204,7 @@ func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx
 					continue
 				}
 				source, _, _ := unstructured.NestedString(e, "source")
-				if source == "" {
+				if source == "" || !isInstallSafe(source) {
 					continue
 				}
 				mirrorsRaw, _, _ := unstructured.NestedStringSlice(e, "mirrors")
@@ -1213,7 +1230,7 @@ func (r *DisconnectedPlatformReconciler) ensureAssistedInstallerMirrorConfig(ctx
 					continue
 				}
 				source, _, _ := unstructured.NestedString(e, "source")
-				if source == "" {
+				if source == "" || !isInstallSafe(source) {
 					continue
 				}
 				mirrorsRaw, _, _ := unstructured.NestedStringSlice(e, "mirrors")
