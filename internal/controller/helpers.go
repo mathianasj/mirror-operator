@@ -40,7 +40,7 @@ func (r *DisconnectedPlatformReconciler) resolveQuayReplicaOverride(ctx context.
 	return nil
 }
 
-func buildQuayComponents(replicaOverride *int32, objectStorageManaged bool) []interface{} {
+func buildQuayComponents(replicaOverride *int32, objectStorageManaged bool, routeManaged bool, tlsManaged bool) []interface{} {
 	hpaManaged := true
 	if replicaOverride != nil {
 		hpaManaged = false
@@ -72,9 +72,9 @@ func buildQuayComponents(replicaOverride *int32, objectStorageManaged bool) []in
 		makeComponent("objectstorage", objectStorageManaged),
 		makeComponent("redis", true),
 		map[string]interface{}{"kind": "horizontalpodautoscaler", "managed": hpaManaged},
-		makeComponent("route", true),
+		makeComponent("route", routeManaged),
 		makeComponent("mirror", true),
-		makeComponent("tls", true),
+		makeComponent("tls", tlsManaged),
 		makeComponent("quay", true),
 	}
 }

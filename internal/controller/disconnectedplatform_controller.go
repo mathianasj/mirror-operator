@@ -3879,8 +3879,23 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 				platform.Spec.Connected.MirrorRegistry = newRegistry
 			}
 
-			if err := r.ensureQuayRouteAnnotations(ctx, quayRegistry); err != nil {
-				logger.Error(err, "failed to ensure Quay route annotations")
+			// Ensure TLS passthrough: cert-manager Certificate, passthrough Route, and unmanaged components
+			passthroughHostname := hostname
+			if passthroughHostname == "" {
+				if domain, err := r.getClusterIngressDomain(ctx); err == nil {
+					passthroughHostname = quayRegistry.GetName() + "-quay-" + quayRegistry.GetNamespace() + "." + domain
+				}
+			}
+			if passthroughHostname != "" {
+				if err := r.ensureQuayTLSCertificate(ctx, platform, passthroughHostname); err != nil {
+					logger.Error(err, "failed to ensure Quay TLS certificate")
+				}
+			}
+			if err := r.ensureQuayPassthroughRoute(ctx, platform, quayRegistry); err != nil {
+				logger.Error(err, "failed to ensure Quay passthrough route")
+			}
+			if err := r.ensureQuayComponentsUnmanaged(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to update QuayRegistry components to unmanaged route/tls")
 			}
 
 			if err := r.ensureQuayGunicornTimeout(ctx, quayRegistry); err != nil {
@@ -3918,15 +3933,22 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 
 		objectStorageManaged := !useS3Storage
 		replicaOverride := r.resolveQuayReplicaOverride(ctx, quayConfig.Managed.Replicas)
-		components := buildQuayComponents(replicaOverride, objectStorageManaged)
+		components := buildQuayComponents(replicaOverride, objectStorageManaged, false, false)
 
 		if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
 			return fmt.Errorf("failed to set QuayRegistry components: %w", err)
 		}
 
-		if useS3Storage {
-			if err := unstructured.SetNestedField(quayRegistry.Object, quayRegistry.GetName()+"-config-bundle", "spec", "configBundleSecret"); err != nil {
-				return fmt.Errorf("failed to set configBundleSecret: %w", err)
+		// Always set config bundle (needed for TLS cert/key even without S3)
+		if err := unstructured.SetNestedField(quayRegistry.Object, quayRegistry.GetName()+"-config-bundle", "spec", "configBundleSecret"); err != nil {
+			return fmt.Errorf("failed to set configBundleSecret: %w", err)
+		}
+
+		// Ensure cert-manager Certificate and passthrough route before creating QuayRegistry
+		if domain, err := r.getClusterIngressDomain(ctx); err == nil {
+			hostname := quayRegistry.GetName() + "-quay-" + quayRegistry.GetNamespace() + "." + domain
+			if err := r.ensureQuayTLSCertificate(ctx, platform, hostname); err != nil {
+				logger.Error(err, "failed to ensure Quay TLS certificate, will retry")
 			}
 		}
 
@@ -3942,6 +3964,11 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			}
 		}
 
+		// Create passthrough route
+		if err := r.ensureQuayPassthroughRoute(ctx, platform, quayRegistry); err != nil {
+			logger.Error(err, "failed to create Quay passthrough route, will retry on next reconciliation")
+		}
+
 		if quayConfig.Managed.Clair != nil && quayConfig.Managed.Clair.UseRedHatVEXOnly {
 			if err := r.configureClairVEX(ctx, quayRegistry); err != nil {
 				logger.Error(err, "failed to configure Clair VEX, will retry on next reconciliation")
@@ -3952,6 +3979,20 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 	}
 
 	return nil
+}
+
+// getQuayTLSCertData reads the cert-manager-issued TLS secret and returns the cert and key PEM bytes.
+func (r *DisconnectedPlatformReconciler) getQuayTLSCertData(ctx context.Context) (certPEM, keyPEM []byte, err error) {
+	tlsSecret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-quay-tls", Namespace: architectNamespace}, tlsSecret); err != nil {
+		return nil, nil, err
+	}
+	certPEM, hasCert := tlsSecret.Data["tls.crt"]
+	keyPEM, hasKey := tlsSecret.Data["tls.key"]
+	if !hasCert || !hasKey || len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, nil, fmt.Errorf("TLS secret mirror-operator-quay-tls missing tls.crt or tls.key")
+	}
+	return certPEM, keyPEM, nil
 }
 
 // createOrUpdateQuayS3ConfigSecret creates or updates the config bundle secret for Quay with resolved S3 credentials.
@@ -3984,10 +4025,20 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		return fmt.Errorf("failed to marshal Quay config: %w", err)
 	}
 
+	data := map[string][]byte{"config.yaml": configYAML}
+
+	certPEM, keyPEM, err := r.getQuayTLSCertData(ctx)
+	if err == nil {
+		data["ssl.cert"] = certPEM
+		data["ssl.key"] = keyPEM
+	} else {
+		logger.V(1).Info("Quay TLS cert not yet available, config bundle will not include TLS keys", "error", err)
+	}
+
 	secretName := quayRegistry.GetName() + "-config-bundle"
 	existing := &corev1.Secret{}
 	if err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: quayRegistry.GetNamespace()}, existing); err == nil {
-		existing.Data = map[string][]byte{"config.yaml": configYAML}
+		existing.Data = data
 		if err := r.Update(ctx, existing); err != nil {
 			return fmt.Errorf("failed to update Quay config bundle secret: %w", err)
 		}
@@ -4002,9 +4053,7 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 			Name:      secretName,
 			Namespace: quayRegistry.GetNamespace(),
 		},
-		Data: map[string][]byte{
-			"config.yaml": configYAML,
-		},
+		Data: data,
 		Type: corev1.SecretTypeOpaque,
 	}
 
@@ -4319,49 +4368,6 @@ func (r *DisconnectedPlatformReconciler) getQuayHostname(ctx context.Context, qu
 	return hostname, nil
 }
 
-func (r *DisconnectedPlatformReconciler) ensureQuayRouteAnnotations(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
-	logger := log.FromContext(ctx)
-
-	route := &unstructured.Unstructured{}
-	route.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "route.openshift.io",
-		Version: "v1",
-		Kind:    "Route",
-	})
-	route.SetName(quayRegistry.GetName() + "-quay")
-	route.SetNamespace(quayRegistry.GetNamespace())
-
-	if err := r.Get(ctx, client.ObjectKeyFromObject(route), route); err != nil {
-		return err
-	}
-
-	desired := map[string]string{
-		"haproxy.router.openshift.io/timeout":        "60m",
-		"haproxy.router.openshift.io/timeout-tunnel": "60m",
-	}
-
-	annotations := route.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	needsUpdate := false
-	for k, v := range desired {
-		if annotations[k] != v {
-			annotations[k] = v
-			needsUpdate = true
-		}
-	}
-
-	if !needsUpdate {
-		return nil
-	}
-
-	logger.Info("Updating Quay route annotations for large blob uploads", "route", route.GetName())
-	route.SetAnnotations(annotations)
-	return r.Update(ctx, route)
-}
-
 func (r *DisconnectedPlatformReconciler) ensureQuayGunicornTimeout(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
 	logger := log.FromContext(ctx)
 
@@ -4418,6 +4424,42 @@ func (r *DisconnectedPlatformReconciler) ensureQuayGunicornTimeout(ctx context.C
 	}
 
 	logger.Info("Setting GUNICORN_CMD_ARGS on QuayRegistry for large blob upload support")
+	if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
+		return err
+	}
+	return r.Update(ctx, quayRegistry)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayComponentsUnmanaged(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	components, found, err := unstructured.NestedSlice(quayRegistry.Object, "spec", "components")
+	if err != nil || !found {
+		return err
+	}
+
+	needsUpdate := false
+	for i, comp := range components {
+		c, ok := comp.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		kind, _, _ := unstructured.NestedString(c, "kind")
+		if kind == "route" || kind == "tls" {
+			managed, _, _ := unstructured.NestedBool(c, "managed")
+			if managed {
+				c["managed"] = false
+				components[i] = c
+				needsUpdate = true
+			}
+		}
+	}
+
+	if !needsUpdate {
+		return nil
+	}
+
+	logger.Info("Updating QuayRegistry to set route and tls components to unmanaged")
 	if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
 		return err
 	}
@@ -4652,6 +4694,124 @@ func (r *DisconnectedPlatformReconciler) ensureKeycloakTLS(ctx context.Context, 
 		log.FromContext(ctx).Info("Created certificate for Keycloak", "issuer", issuerName, "kind", issuerKind)
 	}
 
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayTLSCertificate(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, hostname string) error {
+	if platform.Spec.Connected == nil || platform.Spec.Connected.CertIssuer == nil {
+		return fmt.Errorf("spec.connected.certIssuer must be specified for Quay TLS passthrough")
+	}
+
+	issuerName := platform.Spec.Connected.CertIssuer.Name
+	issuerKind := "ClusterIssuer"
+	if platform.Spec.Connected.CertIssuer.Kind != "" {
+		issuerKind = platform.Spec.Connected.CertIssuer.Kind
+	}
+
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(certificateGVK)
+	cert.SetName("quay-certificate")
+	cert.SetNamespace(architectNamespace)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cert), cert); apierrors.IsNotFound(err) {
+		cert.Object["spec"] = map[string]interface{}{
+			"secretName": "mirror-operator-quay-tls",
+			"issuerRef": map[string]interface{}{
+				"name": issuerName,
+				"kind": issuerKind,
+			},
+			"commonName": hostname,
+			"dnsNames": []interface{}{
+				hostname,
+			},
+			"duration":    "8760h",
+			"renewBefore": "720h",
+		}
+		if err := r.Create(ctx, cert); err != nil {
+			return fmt.Errorf("failed to create Quay TLS certificate: %w", err)
+		}
+		log.FromContext(ctx).Info("Created cert-manager Certificate for Quay TLS passthrough", "issuer", issuerName, "kind", issuerKind, "hostname", hostname)
+	}
+
+	return nil
+}
+
+func (r *DisconnectedPlatformReconciler) getClusterIngressDomain(ctx context.Context) (string, error) {
+	ingress := &unstructured.Unstructured{}
+	ingress.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Ingress",
+	})
+	ingress.SetName("cluster")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err != nil {
+		return "", fmt.Errorf("failed to get cluster ingress config: %w", err)
+	}
+
+	domain, found, err := unstructured.NestedString(ingress.Object, "spec", "domain")
+	if err != nil || !found || domain == "" {
+		return "", fmt.Errorf("cluster ingress domain not found")
+	}
+
+	return domain, nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayPassthroughRoute(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	routeName := quayRegistry.GetName() + "-quay"
+	serviceName := quayRegistry.GetName() + "-quay-app"
+
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(routeGVK)
+	route.SetName(routeName)
+	route.SetNamespace(quayRegistry.GetNamespace())
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(route), route); err == nil {
+		termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+		if termination == "passthrough" {
+			return nil
+		}
+		// Existing route is not passthrough (e.g. edge from Quay Operator) — replace it
+		logger.Info("Deleting existing non-passthrough Quay route for replacement", "route", routeName, "currentTermination", termination)
+		if err := r.Delete(ctx, route); err != nil {
+			return fmt.Errorf("failed to delete existing Quay route: %w", err)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	domain, err := r.getClusterIngressDomain(ctx)
+	if err != nil {
+		return err
+	}
+	hostname := routeName + "-" + quayRegistry.GetNamespace() + "." + domain
+
+	newRoute := &unstructured.Unstructured{}
+	newRoute.SetGroupVersionKind(routeGVK)
+	newRoute.SetName(routeName)
+	newRoute.SetNamespace(quayRegistry.GetNamespace())
+	newRoute.SetLabels(map[string]string{
+		"app.kubernetes.io/name":       "quay-registry",
+		"app.kubernetes.io/part-of":    "mirror-operator",
+		"app.kubernetes.io/managed-by": "mirror-operator",
+	})
+
+	unstructured.SetNestedField(newRoute.Object, hostname, "spec", "host")
+	unstructured.SetNestedField(newRoute.Object, "Service", "spec", "to", "kind")
+	unstructured.SetNestedField(newRoute.Object, serviceName, "spec", "to", "name")
+	unstructured.SetNestedField(newRoute.Object, int64(100), "spec", "to", "weight")
+	unstructured.SetNestedField(newRoute.Object, "https", "spec", "port", "targetPort")
+	unstructured.SetNestedField(newRoute.Object, "passthrough", "spec", "tls", "termination")
+
+	setOwnerReference(newRoute, platform)
+
+	if err := r.Create(ctx, newRoute); err != nil {
+		return fmt.Errorf("failed to create Quay passthrough route: %w", err)
+	}
+
+	logger.Info("Created Quay passthrough route", "route", routeName, "hostname", hostname)
 	return nil
 }
 
@@ -10189,37 +10349,7 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   -f "$RHCOS_DIR/Containerfile" \
   "$RHCOS_DIR"
 
-echo "Saving image to OCI directory for push step..."
-buildah push --storage-driver=vfs "$FULL_IMAGE" "oci:/workspace/output/rhcos-server-oci:${RHCOS_VERSION}"
-
-echo "=== RHCOS server image build complete ==="
-`},
-					},
-					{
-						"name":    "push-image",
-						"image":   "quay.io/skopeo/stable:latest",
-						"command": []string{"/bin/bash", "-c"},
-						"args": []string{`
-set -ex
-
-INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
-if [ -z "$INTERMEDIATE_REGISTRY" ]; then
-  echo "No intermediate registry, skipping push"
-  exit 0
-fi
-
-if [ -f "/workspace/output/rhcos/RHCOS_VERSION.txt" ]; then
-  RHCOS_VERSION=$(cat /workspace/output/rhcos/RHCOS_VERSION.txt | grep rhcos_version | cut -d= -f2)
-else
-  RHCOS_VERSION=$(echo "$(params.oc-version)" | grep -oP '\d+\.\d+')
-fi
-
-OCI_DIR="/workspace/output/rhcos-server-oci"
-if [ ! -d "$OCI_DIR" ]; then
-  echo "No OCI directory found, build step likely skipped"
-  exit 0
-fi
-
+# Push directly to internal Quay service (bypasses external route/HAProxy)
 REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
 REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
@@ -10231,7 +10361,7 @@ else
   PUSH_IMAGE="${INTERNAL_HOST}/rhcos-server:${RHCOS_VERSION}"
 fi
 
-# Extract credentials from pull secret and login
+# Extract credentials from pull secret
 AUTH_B64=$(cat /workspace/pull-secret/.dockerconfigjson | \
   grep -o "\"${REGISTRY_HOST}[^\"]*\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1 | \
   grep -o '"auth":"[^"]*"' | cut -d'"' -f4)
@@ -10239,16 +10369,14 @@ if [ -n "$AUTH_B64" ]; then
   CREDS=$(echo "$AUTH_B64" | base64 -d)
   CRED_USER=$(echo "$CREDS" | cut -d: -f1)
   CRED_PASS=$(echo "$CREDS" | cut -d: -f2-)
-  skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
+  buildah login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
 fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
-skopeo copy --dest-tls-verify=false --retry-times 3 \
-  "oci:${OCI_DIR}:${RHCOS_VERSION}" \
-  "docker://${PUSH_IMAGE}"
+buildah push --storage-driver=vfs --tls-verify=false --retry 3 \
+  "$FULL_IMAGE" "docker://${PUSH_IMAGE}"
 
-rm -rf "$OCI_DIR"
-echo "RHCOS server image pushed: ${PUSH_IMAGE}"
+echo "=== RHCOS server image build and push complete ==="
 `},
 					},
 				},

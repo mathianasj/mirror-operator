@@ -195,7 +195,7 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedQuay(ctx context.Cont
 	}
 
 	replicaOverride := r.resolveQuayReplicaOverride(ctx, quayConfig.Replicas)
-	components := buildQuayComponents(replicaOverride, false)
+	components := buildQuayComponents(replicaOverride, false, true, true)
 
 	if err := unstructured.SetNestedSlice(quayRegistry.Object, components, "spec", "components"); err != nil {
 		return fmt.Errorf("failed to set QuayRegistry components: %w", err)
