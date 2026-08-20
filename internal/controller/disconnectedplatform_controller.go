@@ -10165,23 +10165,19 @@ else
   PUSH_IMAGE="${INTERNAL_HOST}/rhcos-server:${RHCOS_VERSION}"
 fi
 
-cp /workspace/pull-secret/.dockerconfigjson /tmp/push-auth.json
-python3 -c "
-import json
-with open('/tmp/push-auth.json') as f:
-    d = json.load(f)
-for key in list(d.get('auths', {}).keys()):
-    host = key.replace('https://','').replace('http://','').rstrip('/')
-    if host == '${REGISTRY_HOST}' or host.startswith('${REGISTRY_HOST}/'):
-        d['auths']['${INTERNAL_HOST}'] = d['auths'][key]
-        break
-with open('/tmp/push-auth.json', 'w') as f:
-    json.dump(d, f)
-" 2>/dev/null || true
+# Extract credentials from pull secret and login to internal service
+AUTH_B64=$(cat /workspace/pull-secret/.dockerconfigjson | \
+  grep -o "\"${REGISTRY_HOST}[^\"]*\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1 | \
+  grep -o '"auth":"[^"]*"' | cut -d'"' -f4)
+if [ -n "$AUTH_B64" ]; then
+  CREDS=$(echo "$AUTH_B64" | base64 -d)
+  CRED_USER=$(echo "$CREDS" | cut -d: -f1)
+  CRED_PASS=$(echo "$CREDS" | cut -d: -f2-)
+  skopeo login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
+fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
 skopeo copy --dest-tls-verify=false \
-  --authfile=/tmp/push-auth.json \
   "oci:${OCI_DIR}:${RHCOS_VERSION}" \
   "docker://${PUSH_IMAGE}"
 
