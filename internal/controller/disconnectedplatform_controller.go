@@ -3842,6 +3842,13 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		// Check if QuayRegistry already exists
 		err := r.Get(ctx, client.ObjectKeyFromObject(quayRegistry), quayRegistry)
 		if err == nil {
+			// Get hostname first (needed for config bundle and mirrorRegistry)
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			if err != nil {
+				logger.Error(err, "failed to get Quay hostname")
+				return err
+			}
+
 			// QuayRegistry exists — ensure config bundle secret has valid S3 creds
 			if useS3Storage {
 				creds, err := r.resolveQuayS3Credentials(ctx, platform, quayConfig.Managed.Storage)
@@ -3849,17 +3856,10 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 					return fmt.Errorf("failed to resolve Quay S3 credentials: %w", err)
 				}
 				if creds != nil {
-					if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds); err != nil {
+					if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds, hostname); err != nil {
 						logger.Error(err, "failed to update Quay S3 config secret")
 					}
 				}
-			}
-
-			// Get hostname and update mirrorRegistry
-			hostname, err := r.getQuayHostname(ctx, quayRegistry)
-			if err != nil {
-				logger.Error(err, "failed to get Quay hostname")
-				return err
 			}
 
 			if hostname != "" && platform.Spec.Connected.MirrorRegistry != hostname+"/mirror" {
@@ -3944,10 +3944,11 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			return fmt.Errorf("failed to set configBundleSecret: %w", err)
 		}
 
-		// Ensure cert-manager Certificate and passthrough route before creating QuayRegistry
+		// Derive hostname for config bundle and TLS certificate
+		var newQuayHostname string
 		if domain, err := r.getClusterIngressDomain(ctx); err == nil {
-			hostname := quayRegistry.GetName() + "-quay-" + quayRegistry.GetNamespace() + "." + domain
-			if err := r.ensureQuayTLSCertificate(ctx, platform, hostname); err != nil {
+			newQuayHostname = quayRegistry.GetName() + "-quay-" + quayRegistry.GetNamespace() + "." + domain
+			if err := r.ensureQuayTLSCertificate(ctx, platform, newQuayHostname); err != nil {
 				logger.Error(err, "failed to ensure Quay TLS certificate, will retry")
 			}
 		}
@@ -3959,7 +3960,7 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 		logger.Info("Created managed Quay registry", "name", quayRegistry.GetName(), "s3Storage", useS3Storage)
 
 		if useS3Storage {
-			if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds); err != nil {
+			if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds, newQuayHostname); err != nil {
 				logger.Error(err, "failed to create Quay S3 config secret, will retry on next reconciliation")
 			}
 		}
@@ -3996,7 +3997,7 @@ func (r *DisconnectedPlatformReconciler) getQuayTLSCertData(ctx context.Context)
 }
 
 // createOrUpdateQuayS3ConfigSecret creates or updates the config bundle secret for Quay with resolved S3 credentials.
-func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx context.Context, quayRegistry *unstructured.Unstructured, creds *resolvedS3Credentials) error {
+func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx context.Context, quayRegistry *unstructured.Unstructured, creds *resolvedS3Credentials, serverHostname string) error {
 	logger := log.FromContext(ctx)
 
 	quayConfig := map[string]interface{}{
@@ -4018,6 +4019,11 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		"DISTRIBUTED_STORAGE_PREFERENCE": []interface{}{
 			"default",
 		},
+	}
+
+	if serverHostname != "" {
+		quayConfig["SERVER_HOSTNAME"] = serverHostname
+		quayConfig["PREFERRED_URL_SCHEME"] = "https"
 	}
 
 	configYAML, err := yaml.Marshal(quayConfig)
