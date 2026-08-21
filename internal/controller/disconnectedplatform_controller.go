@@ -10377,6 +10377,15 @@ if [ -n "$AUTH_B64" ]; then
   buildah login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
 fi
 
+# Map external hostname to internal service IP so Quay's auth/upload
+# redirects (which use SERVER_HOSTNAME) stay cluster-internal
+INTERNAL_IP=$(getent hosts "$INTERNAL_HOST" | awk '{print $1}' | head -1)
+if [ -n "$INTERNAL_IP" ]; then
+  echo "$INTERNAL_IP $REGISTRY_HOST" >> /etc/hosts
+  echo "Mapped $REGISTRY_HOST -> $INTERNAL_IP to bypass CLB"
+  buildah login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$REGISTRY_HOST" 2>/dev/null || true
+fi
+
 echo "Pushing via internal service: ${PUSH_IMAGE}"
 buildah push --storage-driver=vfs --tls-verify=false --retry 3 \
   "$FULL_IMAGE" "docker://${PUSH_IMAGE}"
