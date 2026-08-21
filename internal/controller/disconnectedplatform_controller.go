@@ -4720,7 +4720,6 @@ func (r *DisconnectedPlatformReconciler) ensureQuayTLSCertificate(ctx context.Co
 				"name": issuerName,
 				"kind": issuerKind,
 			},
-			"commonName": hostname,
 			"dnsNames": []interface{}{
 				hostname,
 			},
