@@ -9420,19 +9420,20 @@ grep -E "(registry.redhat.io|quay.io|cdn.*quay.io)" /etc/hosts
 # Verify intermediate registry is accessible before starting mirror
 echo ""
 echo "=== Verifying intermediate registry access ==="
-if ! curl -f -k -s "https://$(params.intermediate-registry)/v2/" >/dev/null 2>&1 && \
-   ! curl -f -k -s "http://$(params.intermediate-registry)/v2/" >/dev/null 2>&1; then
-  echo "ERROR: Cannot reach intermediate registry: $(params.intermediate-registry)"
+REGISTRY_HOST=$(echo "$(params.intermediate-registry)" | cut -d'/' -f1)
+if ! curl -f -k -s "https://${REGISTRY_HOST}/v2/" >/dev/null 2>&1 && \
+   ! curl -f -k -s "http://${REGISTRY_HOST}/v2/" >/dev/null 2>&1; then
+  echo "ERROR: Cannot reach intermediate registry: ${REGISTRY_HOST}"
   echo "Ensure the registry is accessible from this pod and contains mirrored content"
   exit 1
 fi
-echo "✓ Intermediate registry is accessible"
+echo "✓ Intermediate registry is accessible (${REGISTRY_HOST})"
 
 # List available repositories (helps debug missing content)
 echo ""
 echo "=== Checking intermediate registry content ==="
-if curl -f -k -s --user "$(cat /workspace/pull-secret/.dockerconfigjson | jq -r '.auths["$(params.intermediate-registry)"].auth' | base64 -d)" \
-  "https://$(params.intermediate-registry)/v2/_catalog?n=10" 2>/dev/null | jq -r '.repositories[]?' | head -5; then
+if curl -f -k -s --user "$(cat /workspace/pull-secret/.dockerconfigjson | jq -r '.auths["'"${REGISTRY_HOST}"'"].auth' | base64 -d)" \
+  "https://${REGISTRY_HOST}/v2/_catalog?n=10" 2>/dev/null | jq -r '.repositories[]?' | head -5; then
   echo "✓ Found repositories in intermediate registry"
 else
   echo "⚠ Warning: Could not list repositories (may need authentication or different endpoint)"
