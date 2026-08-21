@@ -80,19 +80,16 @@ const (
 )
 
 type CollectionPipelineStatus struct {
-	Conditions                []metav1.Condition `json:"conditions,omitempty"`
-	Phase                     string             `json:"phase,omitempty"`
-	Version                   string             `json:"version,omitempty"`
-	PipelineRunRef            string             `json:"pipelineRunRef,omitempty"`
-	ConfigMapRef              string             `json:"configMapRef,omitempty"`
-	StartTime                 *metav1.Time       `json:"startTime,omitempty"`
-	CompletionTime            *metav1.Time       `json:"completionTime,omitempty"`
-	BundleURL                 string             `json:"bundleUrl,omitempty"`
-	SignatureURL              string             `json:"signatureUrl,omitempty"`
-	SbomUrl                   string             `json:"sbomUrl,omitempty"`
-	ArchitectFrontendImageURL string             `json:"architectFrontendImageUrl,omitempty"`
-	ArchitectBackendImageURL  string             `json:"architectBackendImageUrl,omitempty"`
-	ArchitectImportScriptURL  string             `json:"architectImportScriptUrl,omitempty"`
+	Conditions     []metav1.Condition `json:"conditions,omitempty"`
+	Phase          string             `json:"phase,omitempty"`
+	Version        string             `json:"version,omitempty"`
+	PipelineRunRef string             `json:"pipelineRunRef,omitempty"`
+	ConfigMapRef   string             `json:"configMapRef,omitempty"`
+	StartTime      *metav1.Time       `json:"startTime,omitempty"`
+	CompletionTime *metav1.Time       `json:"completionTime,omitempty"`
+	BundleURL      string             `json:"bundleUrl,omitempty"`
+	SignatureURL   string             `json:"signatureUrl,omitempty"`
+	SbomUrl        string             `json:"sbomUrl,omitempty"`
 	// WorkingPVCName is the name of the PVC used for working storage during collection.
 	// This is the PVC that contains oc-mirror's cache.
 	// +optional
