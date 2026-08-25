@@ -145,6 +145,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=route.openshift.io,resources=routes/custom-host,verbs=create;update;patch
 // +kubebuilder:rbac:groups=console.openshift.io,resources=consoleplugins,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=consoles,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=operator.openshift.io,resources=ingresscontrollers,verbs=get;list;watch;update;patch
@@ -4005,13 +4006,15 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 			"default": []interface{}{
 				"RadosGWStorage",
 				map[string]interface{}{
-					"hostname":     creds.Hostname,
-					"is_secure":    creds.IsSecure,
-					"port":         creds.Port,
-					"bucket_name":  creds.Bucket,
-					"access_key":   creds.AccessKey,
-					"secret_key":   creds.SecretKey,
-					"storage_path": "/datastorage/registry",
+					"hostname":              creds.Hostname,
+					"is_secure":             creds.IsSecure,
+					"port":                  creds.Port,
+					"bucket_name":           creds.Bucket,
+					"access_key":            creds.AccessKey,
+					"secret_key":            creds.SecretKey,
+					"storage_path":          "/datastorage/registry",
+					"server_side_assembly":  false,
+					"maximum_chunk_size_mb": 100,
 				},
 			},
 		},
@@ -4025,6 +4028,7 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		quayConfig["SERVER_HOSTNAME"] = serverHostname
 		quayConfig["PREFERRED_URL_SCHEME"] = "https"
 	}
+	quayConfig["FEATURE_PROXY_STORAGE"] = false
 
 	configYAML, err := yaml.Marshal(quayConfig)
 	if err != nil {
@@ -4151,21 +4155,12 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayOBC(ctx context.Context, p
 		}
 	}
 
-	// Use external S3 route instead of internal svc so that nodes and external
-	// consumers (e.g. OSUS pods) can reach the object store via redirect URLs.
+	// Keep internal S3 service hostname for Quay storage access to avoid
+	// route timeouts on large blob uploads. Append .cluster.local if needed
+	// so the FQDN resolves inside the Quay pod.
 	if hostname == "s3.openshift-storage.svc" {
-		s3Route := &unstructured.Unstructured{}
-		s3Route.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "route.openshift.io",
-			Version: "v1",
-			Kind:    "Route",
-		})
-		if err := r.Get(ctx, types.NamespacedName{Name: "s3", Namespace: "openshift-storage"}, s3Route); err == nil {
-			if host, found, _ := unstructured.NestedString(s3Route.Object, "spec", "host"); found && host != "" {
-				hostname = host
-				logger.Info("Using external S3 route for Quay storage", "hostname", hostname)
-			}
-		}
+		hostname = "s3.openshift-storage.svc.cluster.local"
+		logger.Info("Using internal S3 service for Quay storage", "hostname", hostname)
 	}
 
 	return &resolvedS3Credentials{
@@ -4361,6 +4356,9 @@ func (r *DisconnectedPlatformReconciler) getQuayHostname(ctx context.Context, qu
 		route.SetNamespace(quayRegistry.GetNamespace())
 
 		if err := r.Get(ctx, client.ObjectKeyFromObject(route), route); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", nil
+			}
 			return "", err
 		}
 
@@ -4382,9 +4380,9 @@ func (r *DisconnectedPlatformReconciler) ensureQuayGunicornTimeout(ctx context.C
 		return err
 	}
 
-	desiredEnv := map[string]interface{}{
-		"name":  "GUNICORN_CMD_ARGS",
-		"value": "--timeout 300",
+	desiredEnvVars := []map[string]interface{}{
+		{"name": "GUNICORN_CMD_ARGS", "value": "--timeout 300"},
+		{"name": "WORKER_COUNT_REGISTRY", "value": "2"},
 	}
 
 	needsUpdate := false
@@ -4399,29 +4397,34 @@ func (r *DisconnectedPlatformReconciler) ensureQuayGunicornTimeout(ctx context.C
 		}
 
 		envList, _, _ := unstructured.NestedSlice(c, "overrides", "env")
-		hasTimeout := false
+		existingNames := map[string]bool{}
 		for _, e := range envList {
 			entry, ok := e.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if entry["name"] == "GUNICORN_CMD_ARGS" {
-				hasTimeout = true
-				break
+			if name, ok := entry["name"].(string); ok {
+				existingNames[name] = true
 			}
 		}
-		if hasTimeout {
+
+		for _, desired := range desiredEnvVars {
+			if !existingNames[desired["name"].(string)] {
+				envList = append(envList, desired)
+				needsUpdate = true
+			}
+		}
+
+		if !needsUpdate {
 			return nil
 		}
 
-		envList = append(envList, desiredEnv)
 		if c["overrides"] == nil {
 			c["overrides"] = map[string]interface{}{}
 		}
 		overrides := c["overrides"].(map[string]interface{})
 		overrides["env"] = envList
 		components[i] = c
-		needsUpdate = true
 		break
 	}
 
@@ -10389,6 +10392,7 @@ fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
 buildah push --storage-driver=vfs --tls-verify=false --retry 3 \
+  --max-parallel-copies=1 \
   "$FULL_IMAGE" "docker://${PUSH_IMAGE}"
 
 echo "=== RHCOS server image build and push complete ==="
