@@ -369,17 +369,16 @@ release: ## Create a versioned release (usage: make release VERSION=x.y.z)
 	@echo "Releasing v$(VERSION)  (previous: $(OLD_VERSION))"
 	@# Update VERSION in Makefile
 	sed -i '' 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile
-	@# Update catalog-templates/basic.yaml — channel entry name
-	sed -i '' 's/name: mirror-operator\.v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/name: mirror-operator.v$(VERSION)/' catalog-templates/basic.yaml
-	@# Update catalog-templates/basic.yaml — bundle image tag
-	sed -i '' 's|mirror-operator:[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|mirror-operator:$(VERSION)|' catalog-templates/basic.yaml
-	@# Add replaces field for upgrade path (skip if previous was 0.0.1 — never published)
-	@if [ "$(OLD_VERSION)" != "$(VERSION)" ] && [ "$(OLD_VERSION)" != "0.0.1" ]; then \
-		if grep -q 'replaces:' catalog-templates/basic.yaml; then \
-			sed -i '' 's/replaces: mirror-operator\.v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/replaces: mirror-operator.v$(OLD_VERSION)/' catalog-templates/basic.yaml; \
+	@# Update catalog-templates/basic.yaml — add new channel entry and bundle (additive, not destructive)
+	@if ! yq e '(.entries[] | select(.schema == "olm.channel") | .entries[] | select(.name == "mirror-operator.v$(VERSION)"))' catalog-templates/basic.yaml | grep -q 'mirror-operator'; then \
+		if [ "$(OLD_VERSION)" != "$(VERSION)" ] && [ "$(OLD_VERSION)" != "0.0.1" ]; then \
+			yq e -i '(.entries[] | select(.schema == "olm.channel")).entries += [{"name": "mirror-operator.v$(VERSION)", "replaces": "mirror-operator.v$(OLD_VERSION)"}]' catalog-templates/basic.yaml; \
 		else \
-			sed -i '' '/name: mirror-operator\.v$(VERSION)/a\'$$'\n''        replaces: mirror-operator.v$(OLD_VERSION)' catalog-templates/basic.yaml; \
+			yq e -i '(.entries[] | select(.schema == "olm.channel")).entries += [{"name": "mirror-operator.v$(VERSION)"}]' catalog-templates/basic.yaml; \
 		fi \
+	fi
+	@if ! grep -q 'mirror-operator:$(VERSION)' catalog-templates/basic.yaml; then \
+		yq e -i '.entries += [{"schema": "olm.bundle", "image": "quay.io/community-operator-pipeline-prod/mirror-operator:$(VERSION)"}]' catalog-templates/basic.yaml; \
 	fi
 	git add Makefile catalog-templates/basic.yaml
 	git commit -m "Release v$(VERSION)"

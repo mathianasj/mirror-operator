@@ -93,35 +93,6 @@ jobs:
           curl -sSLo operators/${{ env.OPERATOR_NAME }}/Makefile \
             https://raw.githubusercontent.com/redhat-openshift-ecosystem/operator-pipelines/main/fbc/Makefile
 
-      - name: Patch catalog template with release version
-        run: |
-          VERSION=${{ steps.version.outputs.VERSION }}
-          CATALOG_TEMPLATE="community-operators-prod/operators/${{ env.OPERATOR_NAME }}/catalog-templates/basic.yaml"
-
-          # Update channel entry name to current version
-          sed -i 's/name: mirror-operator\.v[0-9]\+\.[0-9]\+\.[0-9]\+/name: mirror-operator.v'"${VERSION}"'/' "$CATALOG_TEMPLATE"
-
-          # Update bundle image tag to current version
-          sed -i 's|mirror-operator:[0-9]\+\.[0-9]\+\.[0-9]\+|mirror-operator:'"${VERSION}"'|' "$CATALOG_TEMPLATE"
-
-          # Determine previous version for replaces field
-          PREV_VERSION=""
-          if [ -d "community-operators-prod/operators/${{ env.OPERATOR_NAME }}" ]; then
-            PREV_VERSION=$(ls -d community-operators-prod/operators/${{ env.OPERATOR_NAME }}/[0-9]* 2>/dev/null | sort -V | tail -1 | xargs basename 2>/dev/null || true)
-          fi
-
-          # Add or update replaces field if there is a previous version
-          if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$VERSION" ]; then
-            if grep -q 'replaces:' "$CATALOG_TEMPLATE"; then
-              sed -i 's/replaces: mirror-operator\.v[0-9]\+\.[0-9]\+\.[0-9]\+/replaces: mirror-operator.v'"${PREV_VERSION}"'/' "$CATALOG_TEMPLATE"
-            else
-              sed -i '/name: mirror-operator\.v'"${VERSION}"'/a\        replaces: mirror-operator.v'"${PREV_VERSION}"'' "$CATALOG_TEMPLATE"
-            fi
-          fi
-
-          echo "Patched catalog template:"
-          cat "$CATALOG_TEMPLATE"
-
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
