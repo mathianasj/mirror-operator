@@ -369,7 +369,9 @@ release: ## Create a versioned release (usage: make release VERSION=x.y.z)
 	@echo "Releasing v$(VERSION)  (previous: $(OLD_VERSION))"
 	@# Update VERSION in Makefile
 	sed -i '' 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile
-	git add Makefile
+	@# Update replaces in release-config.yaml to point to previous version
+	sed -i '' 's/^    replaces: mirror-operator\.v.*/    replaces: mirror-operator.v$(OLD_VERSION)/' community-operators/release-config.yaml
+	git add Makefile community-operators/release-config.yaml
 	git commit -m "Release v$(VERSION)"
 	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
 	git push origin HEAD "v$(VERSION)"
