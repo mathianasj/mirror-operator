@@ -4028,7 +4028,7 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		quayConfig["SERVER_HOSTNAME"] = serverHostname
 		quayConfig["PREFERRED_URL_SCHEME"] = "https"
 	}
-	quayConfig["FEATURE_PROXY_STORAGE"] = false
+	quayConfig["FEATURE_PROXY_STORAGE"] = true
 
 	configYAML, err := yaml.Marshal(quayConfig)
 	if err != nil {
@@ -9424,8 +9424,9 @@ grep -E "(registry.redhat.io|quay.io|cdn.*quay.io)" /etc/hosts
 echo ""
 echo "=== Verifying intermediate registry access ==="
 REGISTRY_HOST=$(echo "$(params.intermediate-registry)" | cut -d'/' -f1)
-if ! curl -f -k -s "https://${REGISTRY_HOST}/v2/" >/dev/null 2>&1 && \
-   ! curl -f -k -s "http://${REGISTRY_HOST}/v2/" >/dev/null 2>&1; then
+HTTPS_CODE=$(curl -k -s -o /dev/null -w "%%{http_code}" "https://${REGISTRY_HOST}/v2/" 2>/dev/null || true)
+HTTP_CODE=$(curl -k -s -o /dev/null -w "%%{http_code}" "http://${REGISTRY_HOST}/v2/" 2>/dev/null || true)
+if [ "$HTTPS_CODE" = "000" ] && [ "$HTTP_CODE" = "000" ]; then
   echo "ERROR: Cannot reach intermediate registry: ${REGISTRY_HOST}"
   echo "Ensure the registry is accessible from this pod and contains mirrored content"
   exit 1
@@ -10392,7 +10393,6 @@ fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
 buildah push --storage-driver=vfs --tls-verify=false --retry 3 \
-  --max-parallel-copies=1 \
   "$FULL_IMAGE" "docker://${PUSH_IMAGE}"
 
 echo "=== RHCOS server image build and push complete ==="
@@ -10435,7 +10435,7 @@ ls -lh /workspace/output/import-airgap-architect.sh
 		// Task 12: repackage-bundle (combine oc-mirror output with architect artifacts)
 		{
 			"name":     "repackage-bundle",
-			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools", "create-bundle-sbom"},
+			"runAfter": []string{"copy-import-script", "mirror-from-intermediate", "oc-mirror", "download-cli-tools"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{

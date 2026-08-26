@@ -637,6 +637,11 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 		log.FromContext(ctx).Error(err, "failed to inject RHCOS server image, continuing without it")
 	}
 
+	// Inject architectures into platform config if not already specified.
+	// The local OSUS graph only indexes by concrete arch (e.g. amd64), not "multi".
+	// oc-mirror defaults to arch=multi when unset, returning 0 results from local OSUS.
+	enrichedConfig = injectDefaultArchitecture(enrichedConfig)
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -1209,6 +1214,30 @@ func (r *CollectionPipelineReconciler) extractOCPVersion(configYAML string) stri
 		}
 	}
 	return "latest"
+}
+
+func injectDefaultArchitecture(configYAML string) string {
+	var imageSetConfig map[string]interface{}
+	if err := yaml.Unmarshal([]byte(configYAML), &imageSetConfig); err != nil {
+		return configYAML
+	}
+	mirror, ok := imageSetConfig["mirror"].(map[string]interface{})
+	if !ok {
+		return configYAML
+	}
+	platform, ok := mirror["platform"].(map[string]interface{})
+	if !ok {
+		return configYAML
+	}
+	if _, exists := platform["architectures"]; exists {
+		return configYAML
+	}
+	platform["architectures"] = []string{"amd64"}
+	out, err := yaml.Marshal(imageSetConfig)
+	if err != nil {
+		return configYAML
+	}
+	return string(out)
 }
 
 // normalizeImageRef ensures image references have a fully qualified registry prefix.
