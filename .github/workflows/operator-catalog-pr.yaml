@@ -86,8 +86,8 @@ jobs:
           # Copy ci.yaml to operator root (FBC config + auto-approval)
           cp ../mirror-operator/community-operators/ci.yaml operators/${{ env.OPERATOR_NAME }}/ci.yaml
 
-          # Copy catalog-templates for FBC
-          cp -r ../mirror-operator/catalog-templates operators/${{ env.OPERATOR_NAME }}/
+          # Note: catalog-templates are NOT copied — the pipeline's add-bundle-to-fbc
+          # handles updating the template automatically via release-config.yaml
 
           # Download the FBC Makefile from operator-pipelines
           curl -sSLo operators/${{ env.OPERATOR_NAME }}/Makefile \
