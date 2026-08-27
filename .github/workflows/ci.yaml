@@ -96,7 +96,7 @@ jobs:
             VERSION="${VERSION#v}"
             TAG="v${VERSION}"
           else
-            VERSION="latest"
+            VERSION=$(grep '^VERSION ?=' Makefile | sed 's/VERSION ?= //')
             TAG="latest"
           fi
           echo "img=${{ needs.build-and-push.outputs.operator-image }}" >> "$GITHUB_OUTPUT"
