@@ -368,11 +368,22 @@ release: ## Create a versioned release (usage: make release VERSION=x.y.z)
 	$(eval OLD_VERSION := $(shell grep '^VERSION ?=' Makefile | sed 's/VERSION ?= //'))
 	@echo "Releasing v$(VERSION)  (previous: $(OLD_VERSION))"
 	@# Update VERSION in Makefile
-	sed -i '' 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile
+	@if sed --version >/dev/null 2>&1; then \
+		sed -i 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile; \
+	else \
+		sed -i '' 's/^VERSION ?= .*/VERSION ?= $(VERSION)/' Makefile; \
+	fi
 	@# Update replaces in release-config.yaml to point to previous version
-	sed -i '' 's/^    replaces: mirror-operator\.v.*/    replaces: mirror-operator.v$(OLD_VERSION)/' community-operators/release-config.yaml
+	@if sed --version >/dev/null 2>&1; then \
+		sed -i 's/^    replaces: mirror-operator\.v.*/    replaces: mirror-operator.v$(OLD_VERSION)/' community-operators/release-config.yaml; \
+	else \
+		sed -i '' 's/^    replaces: mirror-operator\.v.*/    replaces: mirror-operator.v$(OLD_VERSION)/' community-operators/release-config.yaml; \
+	fi
 	git add Makefile community-operators/release-config.yaml
 	git commit -m "Release v$(VERSION)"
 	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
 	git push origin HEAD "v$(VERSION)"
-	gh release create "v$(VERSION)" --title "v$(VERSION)" --generate-notes
+	@NOTES=$$(hack/release-notes.sh $(VERSION)); \
+	gh release create "v$(VERSION)" --title "v$(VERSION)" --notes-file "$$NOTES"; \
+	rm -f "$$NOTES"
+	hack/close-milestone.sh $(VERSION)
