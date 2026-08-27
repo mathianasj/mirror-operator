@@ -146,7 +146,7 @@ func (r *CollectionPipelineReconciler) Reconcile(ctx context.Context, req ctrl.R
 				signingConfigChanged := false
 
 				// Simple check: if pipeline has keyless signing but PipelineRun doesn't have Fulcio env vars
-				if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil {
+				if pipeline.Spec.Signing != nil && pipeline.Spec.Signing.Keyless != nil && pr.Spec.PipelineSpec != nil {
 					// Find the cosign-sign task (it should be named "cosign-sign")
 					var signTask *pipelinev1.PipelineTask
 					for i := range pr.Spec.PipelineSpec.Tasks {

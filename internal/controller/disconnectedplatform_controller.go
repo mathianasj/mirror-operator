@@ -50,7 +50,6 @@ const (
 	defaultPullSecretNS   = "openshift-config"
 	pullSecretVolumeName  = "pull-secret"
 	pullSecretMountPath   = "/opt/app-root/src/.openshift"
-	pullSecretFile        = "pull-secret"
 	pullSecretKey         = ".dockerconfigjson"
 )
 
@@ -5325,24 +5324,27 @@ func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Contex
 		auths = make(map[string]interface{})
 	}
 
-	if _, exists := auths[quayHostname]; !exists {
-		authValue := base64.StdEncoding.EncodeToString([]byte(robotUser + ":" + robotToken))
-		auths[quayHostname] = map[string]interface{}{
-			"auth": authValue,
+	authValue := base64.StdEncoding.EncodeToString([]byte(robotUser + ":" + robotToken))
+	if existing, exists := auths[quayHostname]; exists {
+		if existingMap, ok := existing.(map[string]interface{}); ok && existingMap["auth"] == authValue {
+			return nil
 		}
-		cfg["auths"] = auths
-
-		merged, err := json.Marshal(cfg)
-		if err != nil {
-			return fmt.Errorf("failed to marshal cluster pull-secret: %w", err)
-		}
-
-		clusterPullSecret.Data[".dockerconfigjson"] = merged
-		if err := r.Update(ctx, clusterPullSecret); err != nil {
-			return fmt.Errorf("failed to update cluster pull-secret: %w", err)
-		}
-		logger.Info("Added Quay credentials to cluster pull-secret", "quayHost", quayHostname)
 	}
+	auths[quayHostname] = map[string]interface{}{
+		"auth": authValue,
+	}
+	cfg["auths"] = auths
+
+	merged, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cluster pull-secret: %w", err)
+	}
+
+	clusterPullSecret.Data[".dockerconfigjson"] = merged
+	if err := r.Update(ctx, clusterPullSecret); err != nil {
+		return fmt.Errorf("failed to update cluster pull-secret: %w", err)
+	}
+	logger.Info("Updated Quay credentials in cluster pull-secret", "quayHost", quayHostname)
 
 	return nil
 }
@@ -5725,25 +5727,27 @@ func (r *DisconnectedPlatformReconciler) addQuayCredentialsIfNeeded(ctx context.
 		dockerConfig["auths"] = auths
 	}
 
-	// Check if Quay credentials already exist
-	if _, hasQuay := auths[hostname]; hasQuay {
-		// Already have credentials, return unchanged
-		return dockerconfigJSON, false, nil
-	}
-
 	// Get robot credentials from database
 	robot, token, err := r.getQuayRobotCredentials(ctx)
 	if err != nil {
+		if _, hasQuay := auths[hostname]; hasQuay {
+			return dockerconfigJSON, false, nil
+		}
 		return dockerconfigJSON, false, fmt.Errorf("failed to get Quay robot credentials: %w", err)
 	}
 
-	// Add Quay credentials (base64 encode username:token)
+	// Add or update Quay credentials (base64 encode username:token)
 	authString := base64.StdEncoding.EncodeToString([]byte(robot + ":" + token))
+	if existing, hasQuay := auths[hostname]; hasQuay {
+		if existingMap, ok := existing.(map[string]interface{}); ok && existingMap["auth"] == authString {
+			return dockerconfigJSON, false, nil
+		}
+	}
 	auths[hostname] = map[string]interface{}{
 		"auth": authString,
 	}
 
-	logger.Info("Adding Quay credentials to pull-secret", "registry", hostname, "robot", robot)
+	logger.Info("Updating Quay credentials in pull-secret", "registry", hostname, "robot", robot)
 
 	// Marshal back
 	updated, err := json.Marshal(dockerConfig)
@@ -8079,59 +8083,6 @@ func (r *DisconnectedPlatformReconciler) syncS3ConfigToSecret(ctx context.Contex
 	return nil
 }
 
-// mergeQuayCredentialsIntoPullSecret adds Quay robot credentials to the pull-secret
-func (r *DisconnectedPlatformReconciler) mergeQuayCredentialsIntoPullSecret(ctx context.Context, hostname, username, token string) error {
-	logger := log.FromContext(ctx)
-
-	pullSecret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "pull-secret", Namespace: architectNamespace}, pullSecret); err != nil {
-		return fmt.Errorf("failed to get pull-secret: %w", err)
-	}
-
-	// Parse existing dockerconfigjson
-	var dockerConfig map[string]interface{}
-	if pullSecret.Data[".dockerconfigjson"] != nil {
-		if err := json.Unmarshal(pullSecret.Data[".dockerconfigjson"], &dockerConfig); err != nil {
-			return fmt.Errorf("failed to parse dockerconfigjson: %w", err)
-		}
-	} else {
-		dockerConfig = map[string]interface{}{
-			"auths": make(map[string]interface{}),
-		}
-	}
-
-	// Add Quay credentials
-	auths, ok := dockerConfig["auths"].(map[string]interface{})
-	if !ok {
-		auths = make(map[string]interface{})
-		dockerConfig["auths"] = auths
-	}
-
-	// Create auth string: base64(username:token)
-	authString := username + ":" + token
-	authEncoded := map[string]interface{}{
-		"auth": authString,
-	}
-
-	auths[hostname] = authEncoded
-	logger.Info("Adding Quay registry to pull-secret", "registry", hostname)
-
-	// Marshal back to JSON
-	updatedConfig, err := json.Marshal(dockerConfig)
-	if err != nil {
-		return fmt.Errorf("failed to marshal updated dockerconfig: %w", err)
-	}
-
-	pullSecret.Data[".dockerconfigjson"] = updatedConfig
-
-	if err := r.Update(ctx, pullSecret); err != nil {
-		return fmt.Errorf("failed to update pull-secret: %w", err)
-	}
-
-	logger.Info("Successfully merged Quay credentials into pull-secret", "registry", hostname)
-	return nil
-}
-
 // generateRandomPassword generates a random password
 func generateRandomPassword(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -10312,12 +10263,15 @@ else
 fi
 
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
+REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
+REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 
 # Check if RHCOS server image already exists in intermediate registry
 AUTH=$(cat /workspace/pull-secret/.dockerconfigjson | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-for key in ['${INTERMEDIATE_REGISTRY}','https://${INTERMEDIATE_REGISTRY}','https://${INTERMEDIATE_REGISTRY}/v2']:
+host = '${INTERMEDIATE_REGISTRY}'.split('/')[0]
+for key in [host, '${INTERMEDIATE_REGISTRY}', 'https://' + host, 'https://${INTERMEDIATE_REGISTRY}']:
   if key in d.get('auths',{}):
     print(d['auths'][key].get('auth',''))
     break
@@ -10328,7 +10282,8 @@ if [ -n "$AUTH" ]; then
 fi
 HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
   ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-  "https://${INTERMEDIATE_REGISTRY}/v2/rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || echo "000")
+  "https://${REGISTRY_HOST}/v2/${REGISTRY_PATH:+${REGISTRY_PATH}/}rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || true)
+if [ -z "$HTTP_CODE" ]; then HTTP_CODE="000"; fi
 if [ "$HTTP_CODE" = "200" ]; then
   echo "RHCOS server image already exists: ${FULL_IMAGE} — skipping build"
   exit 0
@@ -10360,8 +10315,6 @@ buildah bud --storage-driver=vfs --isolation=chroot \
   "$RHCOS_DIR"
 
 # Push directly to internal Quay service (bypasses external route/HAProxy)
-REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
-REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
 INTERNAL_HOST="mirror-operator-quay-quay-app.${NAMESPACE}.svc.cluster.local"
 
