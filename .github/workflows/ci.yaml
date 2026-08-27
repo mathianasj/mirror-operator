@@ -60,7 +60,7 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || '0.0.1' }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
 
   bundle-and-catalog:
     needs: build-and-push
@@ -94,13 +94,15 @@ jobs:
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
           else
-            VERSION="0.0.1"
+            VERSION="latest"
+            TAG="latest"
           fi
           echo "img=${{ needs.build-and-push.outputs.operator-image }}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "bundle_img=${REPO}-bundle:v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "catalog_img=${REPO}-catalog:v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "bundle_img=${REPO}-bundle:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "catalog_img=${REPO}-catalog:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Generate bundle
         run: make bundle IMG=${{ steps.vars.outputs.img }} VERSION=${{ steps.vars.outputs.version }}
