@@ -6,7 +6,6 @@ REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q .nameWithOwner
 TAG="v${VERSION}"
 PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
 
-milestone_number=""
 milestone_issues=()
 
 ms_json=$(gh api "repos/${REPO}/milestones?state=all&per_page=100" 2>/dev/null || echo "[]")
@@ -28,24 +27,27 @@ if [[ -n "$PREV_TAG" ]]; then
     | grep -oE '#[0-9]+' | tr -d '#' | sort -un)
 fi
 
-declare -A seen
+seen_nums=""
 all_issues=()
 for entry in "${milestone_issues[@]+"${milestone_issues[@]}"}"; do
   num="${entry%%|*}"
-  seen["$num"]=1
+  seen_nums="${seen_nums} ${num} "
   all_issues+=("$entry")
 done
 
 for num in "${commit_issues[@]+"${commit_issues[@]}"}"; do
-  if [[ -z "${seen[$num]:-}" ]]; then
-    issue_json=$(gh issue view "$num" --repo "$REPO" --json title,labels 2>/dev/null || echo "")
-    if [[ -n "$issue_json" ]]; then
-      title=$(echo "$issue_json" | jq -r '.title')
-      labels=$(echo "$issue_json" | jq -r '[.labels[].name] | join(",")')
-      all_issues+=("${num}|${title}|${labels}")
-      seen["$num"]=1
-    fi
-  fi
+  case "$seen_nums" in
+    *" ${num} "*) ;;
+    *)
+      issue_json=$(gh issue view "$num" --repo "$REPO" --json title,labels 2>/dev/null || echo "")
+      if [[ -n "$issue_json" ]]; then
+        title=$(echo "$issue_json" | jq -r '.title')
+        labels=$(echo "$issue_json" | jq -r '[.labels[].name] | join(",")')
+        all_issues+=("${num}|${title}|${labels}")
+        seen_nums="${seen_nums} ${num} "
+      fi
+      ;;
+  esac
 done
 
 bugs=()
