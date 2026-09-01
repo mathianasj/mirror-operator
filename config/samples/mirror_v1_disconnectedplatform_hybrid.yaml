@@ -56,9 +56,9 @@ spec:
   architect:
     enabled: true
     # Standalone frontend (accessible via Route)
-    frontendImage: "quay.io/mirror-operator/openshift-airgap-architect-frontend:latest"
+    frontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
     # Backend API (shared by both UIs)
-    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    backendImage: "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
     # Console plugin (embedded in OpenShift Console)
     consolePlugin:
       enabled: true

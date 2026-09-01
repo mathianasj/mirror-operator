@@ -112,7 +112,7 @@ Two ways to access the same data:
 - OpenShift 4.10+ cluster
 - mirror-operator deployed
 - Container images available:
-  - `quay.io/mirror-operator/openshift-airgap-architect-backend:latest`
+  - `quay.io/mathianasj/openshift-airgap-architect-backend:latest`
   - `quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest`
 
 ### Standalone Mode (Default)
@@ -147,7 +147,7 @@ spec:
   mode: connected
   architect:
     enabled: true
-    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    backendImage: "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
     consolePlugin:
       enabled: true
       image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
@@ -167,8 +167,8 @@ spec:
   mode: connected
   architect:
     enabled: true
-    frontendImage: "quay.io/mirror-operator/openshift-airgap-architect-frontend:latest"
-    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    frontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
+    backendImage: "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
     consolePlugin:
       enabled: true
       image: "quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest"
@@ -290,7 +290,7 @@ The operator will automatically:
 ```yaml
 architect:
   enabled: true
-  frontendImage: "quay.io/mirror-operator/openshift-airgap-architect-frontend:latest"
+  frontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
   consolePlugin:
     enabled: false  # Or remove this section
 ```
@@ -404,8 +404,8 @@ If the plugin appears but looks broken:
 The operator supports configuring default images via command-line flags:
 
 ```bash
---architect-backend-image=quay.io/mirror-operator/openshift-airgap-architect-backend:latest
---architect-frontend-image=quay.io/mirror-operator/openshift-airgap-architect-frontend:latest
+--architect-backend-image=quay.io/mathianasj/openshift-airgap-architect-backend:latest
+--architect-frontend-image=quay.io/mathianasj/openshift-airgap-architect-frontend:latest
 --architect-console-plugin-image=quay.io/mirror-operator/openshift-airgap-architect-console-plugin:latest
 ```
 

@@ -5,8 +5,8 @@ This document describes how to integrate Airgap Architect container images into 
 ## TODO
 
 - **Pipeline Parameter Defaults**: The architect-frontend-image and architect-backend-image parameters should have default values in the pipeline template definition. This allows standalone PipelineRuns (manual or GitOps-driven) to work without requiring the controller to pass these values. Current defaults should be:
-  - `architect-frontend-image`: `quay.io/mirror-operator/airgap-architect-frontend:latest`
-  - `architect-backend-image`: `quay.io/mirror-operator/airgap-architect-backend:latest`
+  - `architect-frontend-image`: `quay.io/mathianasj/openshift-airgap-architect-frontend:latest`
+  - `architect-backend-image`: `quay.io/mathianasj/openshift-airgap-architect-backend:latest`
 
 - **Shared SBOM Cache Between Collection Pipelines**: Currently each CollectionPipeline has its own SBOM cache in `/workspace/output/sbom-cache`. This means the same images get scanned multiple times across different collections, wasting time and resources. 
   - **Problem**: The syft-sbom task stores cached SBOMs by digest in the working PVC, but each collection uses a separate PVC (1:1 mapping).
@@ -134,7 +134,7 @@ func (r *CollectionPipelineReconciler) getArchitectFrontendImage() string {
     if platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.FrontendImage != "" {
         return platform.Spec.Architect.FrontendImage
     }
-    return "quay.io/mirror-operator/airgap-architect-frontend:latest"
+    return "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
 }
 
 func (r *CollectionPipelineReconciler) getArchitectBackendImage() string {
@@ -143,7 +143,7 @@ func (r *CollectionPipelineReconciler) getArchitectBackendImage() string {
     if platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.BackendImage != "" {
         return platform.Spec.Architect.BackendImage
     }
-    return "quay.io/mirror-operator/airgap-architect-backend:latest"
+    return "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
 }
 ```
 
