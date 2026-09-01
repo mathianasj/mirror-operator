@@ -17,7 +17,7 @@ spec:
   # Airgap Architect with OpenShift Console Plugin enabled
   architect:
     enabled: true
-    backendImage: "quay.io/mirror-operator/openshift-airgap-architect-backend:latest"
+    backendImage: "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
     # Enable console plugin mode (replaces standalone frontend)
     consolePlugin:
       enabled: true

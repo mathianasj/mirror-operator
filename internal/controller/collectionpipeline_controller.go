@@ -1059,7 +1059,7 @@ func (r *CollectionPipelineReconciler) getArchitectFrontendImage(ctx context.Con
 	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.FrontendImage != "" {
 		return platform.Spec.Architect.FrontendImage
 	}
-	return "quay.io/mirror-operator/airgap-architect-frontend:latest"
+	return "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
 }
 
 func (r *CollectionPipelineReconciler) getArchitectBackendImage(ctx context.Context) string {
@@ -1067,7 +1067,7 @@ func (r *CollectionPipelineReconciler) getArchitectBackendImage(ctx context.Cont
 	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.BackendImage != "" {
 		return platform.Spec.Architect.BackendImage
 	}
-	return "quay.io/mirror-operator/airgap-architect-backend:latest"
+	return "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
 }
 
 func (r *CollectionPipelineReconciler) getArchitectConsolePluginImage(ctx context.Context) string {

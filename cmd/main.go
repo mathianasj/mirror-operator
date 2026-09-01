@@ -86,9 +86,9 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&mirrorImage, "mirror-image", "quay.io/mathianasj/oc-mirror:v2",
 		"oc-mirror container image for CollectionPipeline and MirrorImport job steps")
-	flag.StringVar(&architectFrontendImage, "architect-frontend-image", "quay.io/mirror-operator/airgap-architect-frontend:latest",
+	flag.StringVar(&architectFrontendImage, "architect-frontend-image", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
 		"airgap-architect frontend UI container image")
-	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mirror-operator/airgap-architect-backend:latest",
+	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 		"airgap-architect backend API container image")
 	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest",
 		"airgap-architect OpenShift console plugin container image")

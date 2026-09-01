@@ -57,7 +57,7 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 ## Images
 - **Controller image** (`controller:latest`): operator controller Go binary on UBI 9 minimal (Dockerfile, multi-stage build with `golang:1.24`)
 - **Tooling image** (`quay.io/mirror-operator/oc-mirror:v2`): oc-mirror 4.21.0, cosign v2.4.3, syft v1.21.0, oc 4.21.17, kubectl (Dockerfile.tooling, multi-stage build for linux/amd64)
-- **Architect images**: frontend (`quay.io/mirror-operator/airgap-architect-frontend:latest`) and backend (`quay.io/mirror-operator/airgap-architect-backend:latest`) containers for the airgap-architect config UI; configurable via `--architect-frontend-image` / `--architect-backend-image` flags and per-CR `spec.architect.frontendImage` / `spec.architect.backendImage`.
+- **Architect images**: frontend (`quay.io/mathianasj/openshift-airgap-architect-frontend:latest`) and backend (`quay.io/mathianasj/openshift-airgap-architect-backend:latest`) containers for the airgap-architect config UI; configurable via `--architect-frontend-image` / `--architect-backend-image` flags and per-CR `spec.architect.frontendImage` / `spec.architect.backendImage`.
 
 ## CRDs
 
@@ -139,8 +139,8 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 | Flag | Default | Description |
 |---|---|---|
 | `--mirror-image` | `quay.io/mirror-operator/oc-mirror:v2` | Container image for CollectionPipeline PipelineRun and Import Job |
-| `--architect-frontend-image` | `quay.io/mirror-operator/airgap-architect-frontend:latest` | Container image for DisconnectedPlatform airgap-architect frontend Deployment |
-| `--architect-backend-image` | `quay.io/mirror-operator/airgap-architect-backend:latest` | Container image for DisconnectedPlatform airgap-architect backend Deployment |
+| `--architect-frontend-image` | `quay.io/mathianasj/openshift-airgap-architect-frontend:latest` | Container image for DisconnectedPlatform airgap-architect frontend Deployment |
+| `--architect-backend-image` | `quay.io/mathianasj/openshift-airgap-architect-backend:latest` | Container image for DisconnectedPlatform airgap-architect backend Deployment |
 | `--metrics-bind-address` | `0` | Metrics endpoint |
 | `--health-probe-bind-address` | `:8081` | Health probe endpoint |
 | `--leader-elect` | `false` | Leader election for controller manager |

@@ -289,7 +289,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					Architect: &mirrorv1.AirgapArchitectConfig{
 						Enabled:       true,
 						Replicas:      replicas,
-						FrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+						FrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
 					},
 				},
 			}
@@ -301,8 +301,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					WithObjects(platform, pullSecret).
 					Build(),
 				Scheme:                 testScheme,
-				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
-				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
@@ -338,7 +338,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					Mode: mirrorv1.PlatformModeAirgapped,
 					Architect: &mirrorv1.AirgapArchitectConfig{
 						Enabled:       true,
-						FrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
+						FrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
 						Route: &mirrorv1.RouteConfig{
 							Host: "architect.apps.example.com",
 							TLS: &mirrorv1.TLSConfig{
@@ -356,8 +356,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					WithObjects(platform, pullSecret).
 					Build(),
 				Scheme:                 testScheme,
-				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
-				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
@@ -394,8 +394,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					WithObjects(platform).
 					Build(),
 				Scheme:                 testScheme,
-				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
-				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
@@ -456,8 +456,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					WithObjects(platform, backendDep, frontendDep, backendSvc, frontendSvc).
 					Build(),
 				Scheme:                 testScheme,
-				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
-				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
@@ -517,8 +517,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					WithObjects(platform, backendDep).
 					Build(),
 				Scheme:                 testScheme,
-				ArchitectFrontendImage: "quay.io/mirror-operator/airgap-architect-frontend:latest",
-				ArchitectBackendImage:  "quay.io/mirror-operator/airgap-architect-backend:latest",
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
