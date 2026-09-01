@@ -323,12 +323,23 @@ CATALOG_IMG ?= $(IMAGE_TAG_BASE)-catalog:v$(VERSION)
 # Directory for the File-Based Catalog content.
 CATALOG_DIR ?= catalog/mirror-operator
 
+# Dev channel name (e.g., "master"). When set, a dev channel is added to the catalog.
+DEV_CHANNEL ?=
+
+# Release bundle images from the tracking file.
+RELEASE_BUNDLE_IMGS = $(shell cat catalog-templates/bundle-images.txt 2>/dev/null | tr '\n' ' ')
+
 .PHONY: fbc-render
 fbc-render: opm ## Render bundle image(s) into a File-Based Catalog.
 	mkdir -p $(CATALOG_DIR)
 	@echo '{"schema":"olm.package","name":"mirror-operator","defaultChannel":"alpha"}' > $(CATALOG_DIR)/catalog.json
-	@echo '{"schema":"olm.channel","name":"alpha","package":"mirror-operator","entries":[{"name":"mirror-operator.v$(VERSION)"}]}' >> $(CATALOG_DIR)/catalog.json
-	$(OPM) render $(BUNDLE_IMGS) -o json >> $(CATALOG_DIR)/catalog.json
+	@cat catalog-templates/alpha-channel.json >> $(CATALOG_DIR)/catalog.json
+ifneq ($(DEV_CHANNEL),)
+	@echo '{"schema":"olm.channel","name":"$(DEV_CHANNEL)","package":"mirror-operator","entries":[{"name":"mirror-operator.v$(VERSION)","skipRange":">=0.0.0-0"}]}' >> $(CATALOG_DIR)/catalog.json
+	$(OPM) render $(RELEASE_BUNDLE_IMGS) $(BUNDLE_IMGS) -o json >> $(CATALOG_DIR)/catalog.json
+else
+	$(OPM) render $(RELEASE_BUNDLE_IMGS) -o json >> $(CATALOG_DIR)/catalog.json
+endif
 
 .PHONY: fbc-validate
 fbc-validate: opm ## Validate the File-Based Catalog.
@@ -379,7 +390,15 @@ release: ## Create a versioned release (usage: make release VERSION=x.y.z)
 	else \
 		sed -i '' 's/^    replaces: mirror-operator\.v.*/    replaces: mirror-operator.v$(OLD_VERSION)/' community-operators/release-config.yaml; \
 	fi
-	git add Makefile community-operators/release-config.yaml
+	@# Update alpha-channel.json with new version entry
+	@if sed --version >/dev/null 2>&1; then \
+		sed -i 's/\]}$$/,{"name":"mirror-operator.v$(VERSION)","replaces":"mirror-operator.v$(OLD_VERSION)"}]}/' catalog-templates/alpha-channel.json; \
+	else \
+		sed -i '' 's/\]}$$/,{"name":"mirror-operator.v$(VERSION)","replaces":"mirror-operator.v$(OLD_VERSION)"}]}/' catalog-templates/alpha-channel.json; \
+	fi
+	@# Add new bundle image to tracking file
+	@echo "$(IMAGE_TAG_BASE)-bundle:v$(VERSION)" >> catalog-templates/bundle-images.txt
+	git add Makefile community-operators/release-config.yaml catalog-templates/alpha-channel.json catalog-templates/bundle-images.txt
 	git commit -m "Release v$(VERSION)"
 	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
 	git push origin HEAD "v$(VERSION)"

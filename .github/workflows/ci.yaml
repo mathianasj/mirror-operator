@@ -47,8 +47,9 @@ jobs:
             echo "tags=${REPO}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
             echo "operator_image=${REPO}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${REPO}:latest" >> "$GITHUB_OUTPUT"
-            echo "operator_image=${REPO}:latest" >> "$GITHUB_OUTPUT"
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "tags=${REPO}:latest,${REPO}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "operator_image=${REPO}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: docker/build-push-action@v6
@@ -94,15 +95,27 @@ jobs:
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
-            TAG="v${VERSION}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "bundle_img=${REPO}-bundle:v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "catalog_img=${REPO}-catalog:v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "catalog_img_latest=${REPO}-catalog:latest" >> "$GITHUB_OUTPUT"
+            echo "dev_channel=" >> "$GITHUB_OUTPUT"
           else
-            VERSION=$(grep '^VERSION ?=' Makefile | sed 's/VERSION ?= //')
-            TAG="latest"
+            CURRENT_VERSION=$(grep '^VERSION ?=' Makefile | sed 's/VERSION ?= //')
+            MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+            MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+            PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+            NEXT_PATCH=$((PATCH + 1))
+            BRANCH=$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+            TIMESTAMP=$(date +%s)
+            DEV_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-${BRANCH}.${TIMESTAMP}"
+            echo "version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "bundle_img=${REPO}-bundle:${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "catalog_img=${REPO}-catalog:latest" >> "$GITHUB_OUTPUT"
+            echo "catalog_img_latest=" >> "$GITHUB_OUTPUT"
+            echo "dev_channel=${BRANCH}" >> "$GITHUB_OUTPUT"
           fi
           echo "img=${{ needs.build-and-push.outputs.operator-image }}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "bundle_img=${REPO}-bundle:${TAG}" >> "$GITHUB_OUTPUT"
-          echo "catalog_img=${REPO}-catalog:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Generate bundle
         run: make bundle IMG=${{ steps.vars.outputs.img }} VERSION=${{ steps.vars.outputs.version }}
@@ -119,6 +132,20 @@ jobs:
 
       - name: Build and push catalog image (FBC)
         run: |
-          make catalog-build CATALOG_IMG=${{ steps.vars.outputs.catalog_img }} BUNDLE_IMGS=${{ steps.vars.outputs.bundle_img }} VERSION=${{ steps.vars.outputs.version }}
+          if [ -n "${{ steps.vars.outputs.dev_channel }}" ]; then
+            make catalog-build \
+              CATALOG_IMG=${{ steps.vars.outputs.catalog_img }} \
+              BUNDLE_IMGS=${{ steps.vars.outputs.bundle_img }} \
+              DEV_CHANNEL=${{ steps.vars.outputs.dev_channel }} \
+              VERSION=${{ steps.vars.outputs.version }}
+          else
+            make catalog-build \
+              CATALOG_IMG=${{ steps.vars.outputs.catalog_img }} \
+              VERSION=${{ steps.vars.outputs.version }}
+          fi
           make catalog-push CATALOG_IMG=${{ steps.vars.outputs.catalog_img }}
+          if [ -n "${{ steps.vars.outputs.catalog_img_latest }}" ]; then
+            docker tag ${{ steps.vars.outputs.catalog_img }} ${{ steps.vars.outputs.catalog_img_latest }}
+            make catalog-push CATALOG_IMG=${{ steps.vars.outputs.catalog_img_latest }}
+          fi
           make catalog-clean
