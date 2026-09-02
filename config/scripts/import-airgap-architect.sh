@@ -119,6 +119,7 @@ Commands:
 Options:
     --bundle-dir DIR    Directory containing image tarballs (default: script directory)
     --data-dir DIR      Directory for persistent data (default: ~/.local/share/airgap-architect)
+    --skip-mirror       Skip mirroring images from archives to registry during start
     --help              Show this help message
 
 Environment Variables:
