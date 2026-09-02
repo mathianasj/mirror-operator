@@ -2000,7 +2000,7 @@ func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx con
 	params := []map[string]interface{}{
 		{"name": "bundle-filename", "type": "string", "description": "Tar filename on the bundle PVC"},
 		{"name": "target-registry", "type": "string", "description": "Destination mirror registry URL"},
-		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2", "description": "oc-mirror container image"},
+		{"name": "mirror-image", "type": "string", "default": r.MirrorImage, "description": "oc-mirror container image"},
 		{"name": "verify-enabled", "type": "string", "default": "false", "description": "Enable cosign signature verification"},
 		{"name": "cosign-pub-secret", "type": "string", "default": "", "description": "Secret name containing cosign public key"},
 	}

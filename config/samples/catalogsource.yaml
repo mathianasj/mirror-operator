@@ -1,3 +1,5 @@
+# NOTE: For development/testing only. Production users should install
+# mirror-operator from the community-operators-prod catalog.
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:

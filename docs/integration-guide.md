@@ -39,10 +39,34 @@ The mirror-operator provides CRDs that enable:
 
 ### Prerequisites
 
-1. Mirror-operator installed in your cluster:
+1. Mirror-operator installed in your cluster from the community operators catalog:
    ```bash
+   # Subscribe to mirror-operator from the community catalog
+   cat <<EOF | kubectl apply -f -
+   apiVersion: operators.coreos.com/v1alpha1
+   kind: Subscription
+   metadata:
+     name: mirror-operator
+     namespace: mirror-operator-system
+   spec:
+     channel: alpha
+     name: mirror-operator
+     source: community-operators
+     sourceNamespace: openshift-marketplace
+   EOF
+
+   # Verify CRDs are available
    kubectl get crd | grep mirror.mathianasj.github.com
    ```
+
+   For airgapped environments, include mirror-operator in your ImageSetConfiguration:
+   ```yaml
+   operators:
+     - catalog: registry.redhat.io/redhat/community-operator-index:v4.17
+       packages:
+         - name: mirror-operator
+   ```
+   This mirrors the operator and all its `relatedImages` (including Architect UI images) automatically via oc-mirror.
 
 2. RBAC permissions to create/read mirror-operator CRDs:
    ```yaml

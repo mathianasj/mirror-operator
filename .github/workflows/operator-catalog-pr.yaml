@@ -1,8 +1,9 @@
 name: Submit to OpenShift OperatorHub
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -16,17 +17,23 @@ jobs:
   submit-to-openshift-catalog:
     name: Create PR to OpenShift OperatorHub
     runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - name: Checkout mirror-operator
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_branch || github.ref }}
           path: mirror-operator
 
       - name: Extract version
         id: version
         run: |
-          if [ "${{ github.event_name }}" == "release" ]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            VERSION=${{ github.event.workflow_run.head_branch }}
+            VERSION=${VERSION#v}
           else
             VERSION=${{ github.event.inputs.version }}
           fi
@@ -46,7 +53,10 @@ jobs:
           chmod +x operator-sdk
           sudo mv operator-sdk /usr/local/bin/
 
-      - name: Generate bundle
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Generate bundle with relatedImages
         run: |
           cd mirror-operator
           make bundle IMG=quay.io/mathianasj/mirror-operator:${{ steps.version.outputs.VERSION_TAG }} VERSION=${{ steps.version.outputs.VERSION }}

@@ -104,6 +104,7 @@ var (
 type DisconnectedPlatformReconciler struct {
 	client.Client
 	Scheme                      *runtime.Scheme
+	MirrorImage                 string
 	ArchitectFrontendImage      string
 	ArchitectBackendImage       string
 	ArchitectConsolePluginImage string
@@ -6097,7 +6098,8 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 			consolePluginImage = r.ArchitectConsolePluginImage
 		}
 		if consolePluginImage == "" {
-			consolePluginImage = "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
+			consolePluginImage = envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN",
+				"quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest")
 		}
 		pluginName := "airgap-architect-plugin"
 		pluginLabels := architectComponentLabels("console-plugin")
@@ -8401,7 +8403,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 	// Define pipeline parameters
 	params := []map[string]interface{}{
 		{"name": "config-map-name", "type": "string", "description": "ConfigMap containing ImageSetConfiguration"},
-		{"name": "mirror-image", "type": "string", "default": "quay.io/mathianasj/oc-mirror:v2"},
+		{"name": "mirror-image", "type": "string", "default": r.MirrorImage},
 		{"name": "working-pvc-name", "type": "string", "description": "PVC for working directory/cache"},
 		{"name": "collection-name", "type": "string", "description": "Name of the CollectionPipeline resource"},
 		{"name": "parent-pipeline", "type": "string", "default": "", "description": "Parent pipeline name (non-empty for update/child collections)"},

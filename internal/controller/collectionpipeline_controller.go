@@ -26,10 +26,11 @@ import (
 )
 
 const (
-	pipelineFinalizer  = "mirror.mathianasj.github.com/pipeline-finalizer"
-	defaultMirrorImage = "quay.io/mathianasj/oc-mirror:v2"
-	configMapKey       = "imageset-config.yaml"
+	pipelineFinalizer = "mirror.mathianasj.github.com/pipeline-finalizer"
+	configMapKey      = "imageset-config.yaml"
 )
+
+var defaultMirrorImage = envOrDefault("RELATED_IMAGE_OC_MIRROR", "quay.io/mathianasj/oc-mirror:v2")
 
 type CollectionPipelineReconciler struct {
 	client.Client
@@ -624,11 +625,7 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 		return nil, err
 	}
 
-	// Inject Airgap Architect images into the ImageSetConfiguration as additionalImages
-	enrichedConfig, err := r.injectArchitectImages(ctx, pipeline.Spec.ImageSetConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inject architect images: %w", err)
-	}
+	enrichedConfig := pipeline.Spec.ImageSetConfig
 
 	// Inject RHCOS server image from intermediate registry so oc-mirror mirrors it for airgapped deployment
 	intReg := r.getIntermediateRegistry(ctx, pipeline)
@@ -887,10 +884,20 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "s3-secret-name", Value: pipelinev1.ParamValue{Type: "string", StringVal: s3SecretName}},
 	)
 
-	// Add Airgap Architect image parameters
+	// Add Airgap Architect image parameters for tarball export
+	frontendImage := envOrDefault("RELATED_IMAGE_ARCHITECT_FRONTEND", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest")
+	backendImage := envOrDefault("RELATED_IMAGE_ARCHITECT_BACKEND", "quay.io/mathianasj/openshift-airgap-architect-backend:latest")
+	if platform, err := r.findPlatform(ctx); err == nil && platform != nil && platform.Spec.Architect != nil {
+		if platform.Spec.Architect.FrontendImage != "" {
+			frontendImage = platform.Spec.Architect.FrontendImage
+		}
+		if platform.Spec.Architect.BackendImage != "" {
+			backendImage = platform.Spec.Architect.BackendImage
+		}
+	}
 	params = append(params,
-		pipelinev1.Param{Name: "architect-frontend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getArchitectFrontendImage(ctx)}},
-		pipelinev1.Param{Name: "architect-backend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: r.getArchitectBackendImage(ctx)}},
+		pipelinev1.Param{Name: "architect-frontend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: frontendImage}},
+		pipelinev1.Param{Name: "architect-backend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: backendImage}},
 	)
 
 	// Auto-detect CLI tool versions from ImageSetConfiguration
@@ -1052,76 +1059,6 @@ func (r *CollectionPipelineReconciler) getMirrorImage() string {
 		return r.MirrorImage
 	}
 	return defaultMirrorImage
-}
-
-func (r *CollectionPipelineReconciler) getArchitectFrontendImage(ctx context.Context) string {
-	platform, err := r.findPlatform(ctx)
-	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.FrontendImage != "" {
-		return platform.Spec.Architect.FrontendImage
-	}
-	return "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
-}
-
-func (r *CollectionPipelineReconciler) getArchitectBackendImage(ctx context.Context) string {
-	platform, err := r.findPlatform(ctx)
-	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.BackendImage != "" {
-		return platform.Spec.Architect.BackendImage
-	}
-	return "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
-}
-
-func (r *CollectionPipelineReconciler) getArchitectConsolePluginImage(ctx context.Context) string {
-	platform, err := r.findPlatform(ctx)
-	if err == nil && platform != nil && platform.Spec.Architect != nil && platform.Spec.Architect.ConsolePlugin != nil && platform.Spec.Architect.ConsolePlugin.Image != "" {
-		return platform.Spec.Architect.ConsolePlugin.Image
-	}
-	return "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
-}
-
-func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context, originalConfigYAML string) (string, error) {
-	// Parse the original ImageSetConfiguration
-	var config ImageSetConfiguration
-	if err := yaml.Unmarshal([]byte(originalConfigYAML), &config); err != nil {
-		return "", fmt.Errorf("failed to parse ImageSetConfiguration: %w", err)
-	}
-
-	// Get architect images from DisconnectedPlatform
-	frontendImage := r.getArchitectFrontendImage(ctx)
-	backendImage := r.getArchitectBackendImage(ctx)
-	pluginImage := r.getArchitectConsolePluginImage(ctx)
-
-	// Initialize additionalImages if nil
-	if config.Mirror.AdditionalImages == nil {
-		config.Mirror.AdditionalImages = []ImageConfig{}
-	}
-
-	// Add architect images if not already present
-	architectImages := []string{frontendImage, backendImage, pluginImage}
-	for _, img := range architectImages {
-		found := false
-		for _, existing := range config.Mirror.AdditionalImages {
-			if existing.Name == img {
-				found = true
-				break
-			}
-		}
-		if !found {
-			config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: img})
-		}
-	}
-
-	// Normalize short-form Docker Hub references to fully qualified docker.io/ prefix
-	for i, img := range config.Mirror.AdditionalImages {
-		config.Mirror.AdditionalImages[i].Name = normalizeImageRef(img.Name)
-	}
-
-	// Serialize back to YAML
-	enrichedYAML, err := yaml.Marshal(&config)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal enriched config: %w", err)
-	}
-
-	return string(enrichedYAML), nil
 }
 
 func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Context, configYAML string, intermediateRegistry string) (string, error) {

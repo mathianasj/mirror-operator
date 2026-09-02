@@ -55,6 +55,7 @@ spec:
   # Airgap Architect in HYBRID mode - both standalone and console plugin enabled
   architect:
     enabled: true
+    # Optional: image overrides. Defaults are set from the operator's relatedImages.
     # Standalone frontend (accessible via Route)
     frontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
     # Backend API (shared by both UIs)

@@ -23,6 +23,9 @@ spec:
           packages:
            - name: aws-load-balancer-operator
            - name: node-observability-operator
+        - catalog: registry.redhat.io/redhat/community-operator-index:v4.18
+          packages:
+           - name: mirror-operator
       additionalImages:
        - name: quay.io/my-org/custom-app:v1.0
 

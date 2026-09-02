@@ -2,12 +2,20 @@ package controller
 
 import (
 	"context"
+	"os"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func (r *DisconnectedPlatformReconciler) isSingleNodeOpenShift(ctx context.Context) bool {
 	logger := log.FromContext(ctx)

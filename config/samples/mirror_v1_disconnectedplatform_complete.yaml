@@ -81,6 +81,7 @@ spec:
   # Airgap Architect console configuration
   architect:
     enabled: true
+    # Optional: image overrides. Defaults are set from the operator's relatedImages.
     frontendImage: quay.io/mathianasj/openshift-airgap-architect-frontend:latest
     backendImage: quay.io/mathianasj/openshift-airgap-architect-backend:latest
     replicas: 2

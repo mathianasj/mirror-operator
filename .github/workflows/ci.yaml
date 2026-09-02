@@ -120,6 +120,9 @@ jobs:
       - name: Generate bundle
         run: make bundle IMG=${{ steps.vars.outputs.img }} VERSION=${{ steps.vars.outputs.version }}
 
+      - name: Validate bundle relatedImages
+        run: operator-sdk bundle validate ./bundle --select-optional suite=operatorframework
+
       - name: Build and push bundle image
         run: |
           make bundle-build BUNDLE_IMG=${{ steps.vars.outputs.bundle_img }}

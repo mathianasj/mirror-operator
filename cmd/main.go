@@ -63,6 +63,13 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -84,13 +91,17 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&mirrorImage, "mirror-image", "quay.io/mathianasj/oc-mirror:v2",
+	flag.StringVar(&mirrorImage, "mirror-image",
+		envOrDefault("RELATED_IMAGE_OC_MIRROR", "quay.io/mathianasj/oc-mirror:v2"),
 		"oc-mirror container image for CollectionPipeline and MirrorImport job steps")
-	flag.StringVar(&architectFrontendImage, "architect-frontend-image", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+	flag.StringVar(&architectFrontendImage, "architect-frontend-image",
+		envOrDefault("RELATED_IMAGE_ARCHITECT_FRONTEND", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"),
 		"airgap-architect frontend UI container image")
-	flag.StringVar(&architectBackendImage, "architect-backend-image", "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
+	flag.StringVar(&architectBackendImage, "architect-backend-image",
+		envOrDefault("RELATED_IMAGE_ARCHITECT_BACKEND", "quay.io/mathianasj/openshift-airgap-architect-backend:latest"),
 		"airgap-architect backend API container image")
-	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest",
+	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image",
+		envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"),
 		"airgap-architect OpenShift console plugin container image")
 	opts := zap.Options{
 		Development: true,
@@ -193,6 +204,7 @@ func main() {
 	if err = (&controller.DisconnectedPlatformReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
+		MirrorImage:                 mirrorImage,
 		ArchitectFrontendImage:      architectFrontendImage,
 		ArchitectBackendImage:       architectBackendImage,
 		ArchitectConsolePluginImage: architectConsolePluginImage,

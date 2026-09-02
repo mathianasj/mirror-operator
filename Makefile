@@ -52,6 +52,13 @@ OPERATOR_SDK_VERSION ?= v1.39.2
 # Image URL to use all building/pushing image targets
 IMG ?= $(IMAGE_TAG_BASE):latest
 
+# Operand images managed by the operator (used for relatedImages in the CSV).
+# Override these with digest-pinned references for release bundles.
+MIRROR_IMG ?= quay.io/mathianasj/oc-mirror:v2
+ARCHITECT_FRONTEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-frontend:latest
+ARCHITECT_BACKEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-backend:latest
+ARCHITECT_CONSOLE_PLUGIN_IMG ?= quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
+
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
 BUILD_DATE ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS ?= -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
@@ -222,12 +229,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+YQ = $(LOCALBIN)/yq
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.4.3
 CONTROLLER_TOOLS_VERSION ?= v0.16.1
 ENVTEST_VERSION ?= release-0.19
 GOLANGCI_LINT_VERSION ?= v1.59.1
+YQ_VERSION ?= v4.44.3
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -248,6 +257,11 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: yq
+yq: $(YQ) ## Download yq locally if necessary.
+$(YQ): $(LOCALBIN)
+	$(call go-install-tool,$(YQ),github.com/mikefarah/yq/v4,$(YQ_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -287,6 +301,28 @@ bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metada
 	$(OPERATOR_SDK) generate kustomize manifests -q --interactive=false
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
+	$(OPERATOR_SDK) bundle validate ./bundle
+	$(MAKE) bundle-related-images
+
+CSV_PATH = bundle/manifests/mirror-operator.clusterserviceversion.yaml
+
+.PHONY: bundle-related-images
+bundle-related-images: yq ## Resolve image digests and inject relatedImages + env vars into the CSV.
+	@echo "Resolving image digests..."
+	$(eval IMG_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(IMG) 2>/dev/null))
+	$(eval MIRROR_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(MIRROR_IMG) 2>/dev/null))
+	$(eval FRONTEND_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_FRONTEND_IMG) 2>/dev/null))
+	$(eval BACKEND_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_BACKEND_IMG) 2>/dev/null))
+	$(eval CONSOLE_PLUGIN_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_CONSOLE_PLUGIN_IMG) 2>/dev/null))
+	$(eval IMG_BASE := $(firstword $(subst :, ,$(IMG))))
+	$(eval MIRROR_BASE := $(firstword $(subst :, ,$(MIRROR_IMG))))
+	$(eval FRONTEND_BASE := $(firstword $(subst :, ,$(ARCHITECT_FRONTEND_IMG))))
+	$(eval BACKEND_BASE := $(firstword $(subst :, ,$(ARCHITECT_BACKEND_IMG))))
+	$(eval CONSOLE_PLUGIN_BASE := $(firstword $(subst :, ,$(ARCHITECT_CONSOLE_PLUGIN_IMG))))
+	@echo "Injecting relatedImages into CSV..."
+	$(YQ) -i '.spec.relatedImages = [{"name": "manager", "image": "$(IMG_BASE)@$(IMG_DIGEST)"}, {"name": "oc-mirror", "image": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "architect-frontend", "image": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "architect-backend", "image": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "architect-console-plugin", "image": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}]' $(CSV_PATH)
+	@echo "Injecting RELATED_IMAGE env vars into CSV..."
+	$(YQ) -i '(.spec.install.spec.deployments[0].spec.template.spec.containers[] | select(.name == "manager") | .env) += [{"name": "RELATED_IMAGE_OC_MIRROR", "value": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_FRONTEND", "value": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_BACKEND", "value": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "value": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}]' $(CSV_PATH)
 	$(OPERATOR_SDK) bundle validate ./bundle
 
 .PHONY: bundle-build
