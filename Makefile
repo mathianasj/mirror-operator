@@ -58,6 +58,9 @@ MIRROR_IMG ?= quay.io/mathianasj/oc-mirror:v2
 ARCHITECT_FRONTEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-frontend:latest
 ARCHITECT_BACKEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-backend:latest
 ARCHITECT_CONSOLE_PLUGIN_IMG ?= quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
+SKOPEO_IMG ?= quay.io/skopeo/stable:latest
+UBI9_IMG ?= registry.access.redhat.com/ubi9/ubi:latest
+UBI9_MINIMAL_IMG ?= registry.access.redhat.com/ubi9/ubi-minimal:latest
 
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
 BUILD_DATE ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
@@ -314,15 +317,21 @@ bundle-related-images: yq ## Resolve image digests and inject relatedImages + en
 	$(eval FRONTEND_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_FRONTEND_IMG) 2>/dev/null))
 	$(eval BACKEND_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_BACKEND_IMG) 2>/dev/null))
 	$(eval CONSOLE_PLUGIN_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(ARCHITECT_CONSOLE_PLUGIN_IMG) 2>/dev/null))
+	$(eval SKOPEO_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(SKOPEO_IMG) 2>/dev/null))
+	$(eval UBI9_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(UBI9_IMG) 2>/dev/null))
+	$(eval UBI9_MINIMAL_DIGEST := $(shell skopeo inspect --format '{{.Digest}}' docker://$(UBI9_MINIMAL_IMG) 2>/dev/null))
 	$(eval IMG_BASE := $(firstword $(subst :, ,$(IMG))))
 	$(eval MIRROR_BASE := $(firstword $(subst :, ,$(MIRROR_IMG))))
 	$(eval FRONTEND_BASE := $(firstword $(subst :, ,$(ARCHITECT_FRONTEND_IMG))))
 	$(eval BACKEND_BASE := $(firstword $(subst :, ,$(ARCHITECT_BACKEND_IMG))))
 	$(eval CONSOLE_PLUGIN_BASE := $(firstword $(subst :, ,$(ARCHITECT_CONSOLE_PLUGIN_IMG))))
+	$(eval SKOPEO_BASE := $(firstword $(subst :, ,$(SKOPEO_IMG))))
+	$(eval UBI9_BASE := $(firstword $(subst :, ,$(UBI9_IMG))))
+	$(eval UBI9_MINIMAL_BASE := $(firstword $(subst :, ,$(UBI9_MINIMAL_IMG))))
 	@echo "Injecting relatedImages into CSV..."
-	$(YQ) -i '.spec.relatedImages = [{"name": "manager", "image": "$(IMG_BASE)@$(IMG_DIGEST)"}, {"name": "oc-mirror", "image": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "architect-frontend", "image": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "architect-backend", "image": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "architect-console-plugin", "image": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}]' $(CSV_PATH)
+	$(YQ) -i '.spec.relatedImages = [{"name": "manager", "image": "$(IMG_BASE)@$(IMG_DIGEST)"}, {"name": "oc-mirror", "image": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "architect-frontend", "image": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "architect-backend", "image": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "architect-console-plugin", "image": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}, {"name": "skopeo", "image": "$(SKOPEO_BASE)@$(SKOPEO_DIGEST)"}, {"name": "ubi9", "image": "$(UBI9_BASE)@$(UBI9_DIGEST)"}, {"name": "ubi9-minimal", "image": "$(UBI9_MINIMAL_BASE)@$(UBI9_MINIMAL_DIGEST)"}]' $(CSV_PATH)
 	@echo "Injecting RELATED_IMAGE env vars into CSV..."
-	$(YQ) -i '(.spec.install.spec.deployments[0].spec.template.spec.containers[] | select(.name == "manager") | .env) += [{"name": "RELATED_IMAGE_OC_MIRROR", "value": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_FRONTEND", "value": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_BACKEND", "value": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "value": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}]' $(CSV_PATH)
+	$(YQ) -i '(.spec.install.spec.deployments[0].spec.template.spec.containers[] | select(.name == "manager") | .env) += [{"name": "RELATED_IMAGE_OC_MIRROR", "value": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_FRONTEND", "value": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_BACKEND", "value": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "value": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}, {"name": "RELATED_IMAGE_SKOPEO", "value": "$(SKOPEO_BASE)@$(SKOPEO_DIGEST)"}, {"name": "RELATED_IMAGE_UBI9", "value": "$(UBI9_BASE)@$(UBI9_DIGEST)"}, {"name": "RELATED_IMAGE_UBI9_MINIMAL", "value": "$(UBI9_MINIMAL_BASE)@$(UBI9_MINIMAL_DIGEST)"}]' $(CSV_PATH)
 	$(OPERATOR_SDK) bundle validate ./bundle
 
 .PHONY: bundle-build

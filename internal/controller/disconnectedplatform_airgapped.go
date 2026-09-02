@@ -2124,7 +2124,7 @@ echo "=== All verifications passed ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "extract",
-						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"image":   r.UBI9Image,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
@@ -2230,7 +2230,7 @@ echo "=== Cluster manifests applied ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "cleanup",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"image":   r.UBI9MinimalImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex

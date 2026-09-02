@@ -103,6 +103,18 @@ func main() {
 	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image",
 		envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"),
 		"airgap-architect OpenShift console plugin container image")
+	var skopeoImage string
+	var ubi9Image string
+	var ubi9MinimalImage string
+	flag.StringVar(&skopeoImage, "skopeo-image",
+		envOrDefault("RELATED_IMAGE_SKOPEO", "quay.io/skopeo/stable:latest"),
+		"skopeo container image for image copy tasks")
+	flag.StringVar(&ubi9Image, "ubi9-image",
+		envOrDefault("RELATED_IMAGE_UBI9", "registry.access.redhat.com/ubi9/ubi:latest"),
+		"UBI9 base container image for pipeline tasks")
+	flag.StringVar(&ubi9MinimalImage, "ubi9-minimal-image",
+		envOrDefault("RELATED_IMAGE_UBI9_MINIMAL", "registry.access.redhat.com/ubi9/ubi-minimal:latest"),
+		"UBI9 minimal container image for pipeline tasks")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -208,6 +220,9 @@ func main() {
 		ArchitectFrontendImage:      architectFrontendImage,
 		ArchitectBackendImage:       architectBackendImage,
 		ArchitectConsolePluginImage: architectConsolePluginImage,
+		SkopeoImage:                 skopeoImage,
+		UBI9Image:                   ubi9Image,
+		UBI9MinimalImage:            ubi9MinimalImage,
 		ClientSet:                   clientSet,
 		RESTConfig:                  mgr.GetConfig(),
 		TektonAvailable:             tektonAvailable,

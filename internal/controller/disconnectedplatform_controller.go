@@ -108,6 +108,9 @@ type DisconnectedPlatformReconciler struct {
 	ArchitectFrontendImage      string
 	ArchitectBackendImage       string
 	ArchitectConsolePluginImage string
+	SkopeoImage                 string
+	UBI9Image                   string
+	UBI9MinimalImage            string
 	ClientSet                   kubernetes.Interface
 	RESTConfig                  *rest.Config
 	TektonAvailable             bool
@@ -9955,7 +9958,7 @@ fi
 				"steps": []map[string]interface{}{
 					{
 						"name":    "save-images",
-						"image":   "quay.io/skopeo/stable:latest",
+						"image":   r.SkopeoImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
@@ -10007,7 +10010,7 @@ ls -lh /workspace/output/airgap-architect-*.tar.gz
 				"steps": []map[string]interface{}{
 					{
 						"name":    "download-tools",
-						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"image":   r.UBI9Image,
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
 set -ex
@@ -10129,7 +10132,7 @@ cat "$CLI_DIR/VERSIONS.txt"
 				"steps": []map[string]interface{}{
 					{
 						"name":    "download-rhcos",
-						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"image":   r.UBI9Image,
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
 set -ex
@@ -10369,7 +10372,7 @@ echo "=== RHCOS server image build and push complete ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "copy-script",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"image":   r.UBI9MinimalImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
@@ -10395,7 +10398,7 @@ ls -lh /workspace/output/import-airgap-architect.sh
 				"steps": []map[string]interface{}{
 					{
 						"name":    "repackage",
-						"image":   "registry.access.redhat.com/ubi9/ubi:latest",
+						"image":   r.UBI9Image,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -ex
@@ -10711,7 +10714,7 @@ func (r *DisconnectedPlatformReconciler) buildPipelineFinallyTasks() []map[strin
 				"steps": []map[string]interface{}{
 					{
 						"name":    "cleanup",
-						"image":   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+						"image":   r.UBI9MinimalImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -x
