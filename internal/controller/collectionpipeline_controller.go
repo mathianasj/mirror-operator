@@ -627,6 +627,9 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 
 	enrichedConfig := pipeline.Spec.ImageSetConfig
 
+	// Inject mirror-operator from community catalog so the operator and its relatedImages get mirrored
+	enrichedConfig = r.injectMirrorOperator(enrichedConfig)
+
 	// Inject RHCOS server image from intermediate registry so oc-mirror mirrors it for airgapped deployment
 	intReg := r.getIntermediateRegistry(ctx, pipeline)
 	enrichedConfig, err = r.injectRHCOSServerImage(ctx, enrichedConfig, intReg)
@@ -1105,6 +1108,49 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 		return "", fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return string(enrichedYAML), nil
+}
+
+const communityOperatorCatalog = "registry.redhat.io/redhat/community-operator-index"
+const mirrorOperatorPackage = "mirror-operator"
+
+// injectMirrorOperator ensures the community-operator-index with the mirror-operator
+// package is present in the ImageSetConfiguration operators section. This allows
+// oc-mirror to discover and mirror the operator and all its relatedImages.
+func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string) string {
+	var config ImageSetConfiguration
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return configYAML
+	}
+
+	ocVersion := r.extractOCPVersion(configYAML)
+	catalogRef := fmt.Sprintf("%s:v%s", communityOperatorCatalog, ocVersion)
+
+	for i, op := range config.Mirror.Operators {
+		if !strings.HasPrefix(op.Catalog, communityOperatorCatalog) {
+			continue
+		}
+		for _, pkg := range op.Packages {
+			if pkg.Name == mirrorOperatorPackage {
+				return configYAML
+			}
+		}
+		config.Mirror.Operators[i].Packages = append(op.Packages, PackageConfig{Name: mirrorOperatorPackage})
+		enrichedYAML, err := yaml.Marshal(&config)
+		if err != nil {
+			return configYAML
+		}
+		return string(enrichedYAML)
+	}
+
+	config.Mirror.Operators = append(config.Mirror.Operators, OperatorConfig{
+		Catalog:  catalogRef,
+		Packages: []PackageConfig{{Name: mirrorOperatorPackage}},
+	})
+	enrichedYAML, err := yaml.Marshal(&config)
+	if err != nil {
+		return configYAML
+	}
+	return string(enrichedYAML)
 }
 
 // getIntermediateRegistry returns the intermediate registry URL for the m2m workflow.
