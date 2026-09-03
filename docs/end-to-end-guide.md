@@ -139,36 +139,40 @@ apiVersion: mirror.mirror.mathianasj.github.com/v1
 kind: DisconnectedPlatform
 metadata:
   name: disconnected-platform
-  namespace: mirror-operator-system
 spec:
   mode: connected
   connected:
-    # Cron schedule for automated collections (weekly at 2 AM Sunday)
     collectionSchedule: "0 2 * * 0"
-    # Intermediate registry for staging mirrored content
-    mirrorRegistry: "quay.example.com/mirror"
-    # PVC size for collection artifacts
-    artifactStorage:
-      size: 200Gi
-    # Which trigger types to enable for collections
     triggerTypes:
       - scheduled
       - manual
-    # Operators to install as dependencies
     operators:
-      openshiftPipelines: {}   # Required: runs collection pipelines
-      rhtas: {}                # Optional: supply chain signing
-      rhtpa: {}                # Optional: SBOM analysis
-    # RHTAS OIDC configuration (if rhtas operator is enabled)
+      openshiftPipelines: {}
+      keycloak: {}
+      rhtas: {}
+      rhtpa: {}
+      quayOperator: {}
+      osus: {}
     rhtas:
       oidc:
         managed:
           enabled: true
           realm: trusted-artifact-signer
-  # Airgap Architect UI
+    rhtpa:
+      storage:
+        type: local
+        size: 200Gi
+    quay:
+      managed:
+        enabled: true
+    # Change this to your cluster's cert-manager ClusterIssuer name
+    certIssuer:
+      name: letsencrypt-production-ec2
   architect:
     enabled: true
 ```
+
+> **Note:** The `certIssuer.name` must reference an existing cert-manager `ClusterIssuer` on your cluster. This is used by managed Keycloak for TLS certificate provisioning. See the [Prerequisites](prerequisites.md) for cert-manager requirements.
 
 ```bash
 oc apply -f disconnected-platform.yaml
@@ -201,29 +205,11 @@ Verify the managed components are running:
 
 For a detailed explanation of the reconciliation flow, see the [Architecture Guide](architecture.md).
 
-### 1.3 Enabling the Airgap Architect UI
+### 1.3 Enabling the Airgap Architect Console Plugin
 
-The Airgap Architect provides a web UI for managing collections, imports, and cluster configuration. It can run in three modes:
+The Airgap Architect provides a management UI for collections, imports, and cluster configuration, embedded directly in the OpenShift console. This gives you a single pane of glass for managing your disconnected environment alongside your existing cluster operations.
 
-| Mode | Description | When to Use |
-|------|-------------|-------------|
-| Standalone (default) | Separate frontend with its own route | Simple setup, direct URL access |
-| Console Plugin | Embedded in the OpenShift console | Integrated experience, single pane of glass |
-| Hybrid | Both standalone and console plugin | Transition period, or when both access methods are needed |
-
-#### Standalone Mode (Default)
-
-When `architect.enabled: true` is set without a `consolePlugin` section, the operator deploys a standalone frontend. Access it via the route:
-
-```bash
-oc get route airgap-architect -n openshift-airgap-architect -o jsonpath='{.spec.host}'
-```
-
-Open the URL in your browser to access the Architect dashboard.
-
-#### Console Plugin Mode
-
-To embed the Architect UI directly in the OpenShift console, add the `consolePlugin` configuration:
+Add the `consolePlugin` configuration to your `DisconnectedPlatform` CR:
 
 ```yaml
 spec:
@@ -231,7 +217,6 @@ spec:
     enabled: true
     consolePlugin:
       enabled: true
-      image: "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
 ```
 
 After the operator deploys the plugin, enable it in the Console operator:
@@ -248,28 +233,19 @@ Verify the plugin is registered:
 oc get consoleplugin airgap-architect-plugin
 ```
 
+Verify the plugin pod is running:
+
+```bash
+oc get pods -n openshift-airgap-architect -l app.kubernetes.io/component=console-plugin
+```
+
 Then refresh your browser (Ctrl+Shift+R / Cmd+Shift+R) and navigate to **Administrator** > **Airgap Architect**.
 
 ![OpenShift console sidebar showing the Airgap Architect menu item under Administrator](images/01-console-nav-airgap-architect.png)
 
 ![Airgap Architect dashboard showing platform status, collection history, and import history](images/01-architect-dashboard.png)
 
-#### Hybrid Mode
-
-To enable both standalone and console plugin access simultaneously, set both `frontendImage` and `consolePlugin.enabled`:
-
-```yaml
-spec:
-  architect:
-    enabled: true
-    frontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"
-    backendImage: "quay.io/mathianasj/openshift-airgap-architect-backend:latest"
-    consolePlugin:
-      enabled: true
-      image: "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"
-```
-
-For full details on deployment modes, switching between modes, and troubleshooting, see the [Console Plugin Integration Guide](console-plugin-integration.md).
+For alternative deployment modes (standalone route or hybrid), troubleshooting, and advanced configuration, see the [Console Plugin Integration Guide](console-plugin-integration.md).
 
 ---
 

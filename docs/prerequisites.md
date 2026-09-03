@@ -11,6 +11,7 @@ This document covers the requirements for deploying and using the mirror-operato
 | OpenShift | 4.10 or later |
 | Access level | `cluster-admin` |
 | OLM | Operator Lifecycle Manager must be available |
+| cert-manager | Required when using RHTAS with managed Keycloak. A `ClusterIssuer` must be configured for TLS certificate provisioning. |
 | Internet access | Must reach `registry.redhat.io`, `quay.io`, and `github.com` |
 
 ### Airgapped Side
@@ -25,51 +26,7 @@ This document covers the requirements for deploying and using the mirror-operato
 
 ## Required Credentials
 
-### Red Hat Pull Secret
-
-Obtain your pull secret from [console.redhat.com/openshift/install/pull-secret](https://console.redhat.com/openshift/install/pull-secret).
-
-Create the secret in the `openshift-config` namespace:
-
-```bash
-oc create secret generic pull-secret \
-  -n openshift-config \
-  --from-file=.dockerconfigjson=pull-secret.json \
-  --type=kubernetes.io/dockerconfigjson
-```
-
-The operator automatically copies this secret to the `mirror-operator-system` namespace and mounts it into collection and import workloads.
-
-### Registry Credentials
-
-For the mirror registry (airgapped side), create a `dockerconfigjson` secret:
-
-```bash
-oc create secret docker-registry mirror-registry-creds \
-  -n mirror-operator-system \
-  --docker-server=quay.airgap.local \
-  --docker-username=admin \
-  --docker-password=<password>
-```
-
-### Cosign Signing Key (Optional)
-
-If using image signing, generate a cosign key pair and create secrets:
-
-```bash
-cosign generate-key-pair
-
-oc create secret generic cosign-signing-key \
-  -n mirror-operator-system \
-  --from-file=cosign.key=cosign.key \
-  --from-literal=cosign.password=<password>
-
-oc create secret generic cosign-public-key \
-  -n mirror-operator-system \
-  --from-file=cosign.pub=cosign.pub
-```
-
-For keyless signing via RHTAS, see the [RHTAS Integration Guide](rhtas-integration.md).
+The operator uses the cluster's existing pull secret from `openshift-config/pull-secret` (created during OpenShift installation) and automatically copies it to the `mirror-operator-system` namespace for collection and import workloads.
 
 ## Storage Sizing Guide
 
@@ -83,17 +40,6 @@ For keyless signing via RHTAS, see the [RHTAS Integration Guide](rhtas-integrati
 | RHTPA storage (if enabled) | 50Gi | 200Gi | SBOM analysis data |
 
 Storage classes with `ReadWriteOnce` (RWO) access mode are sufficient for most components. The SBOM cache benefits from `ReadWriteMany` (RWX) if sharing across concurrent pipelines.
-
-### S3 Storage Alternative
-
-Collection output can be directed to S3-compatible storage instead of PVCs. This requires an S3 credentials secret:
-
-```bash
-oc create secret generic s3-credentials \
-  -n mirror-operator-system \
-  --from-literal=AWS_ACCESS_KEY_ID=<key> \
-  --from-literal=AWS_SECRET_ACCESS_KEY=<secret>
-```
 
 ## Network Requirements
 
