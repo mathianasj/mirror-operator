@@ -209,17 +209,7 @@ For a detailed explanation of the reconciliation flow, see the [Architecture Gui
 
 The Airgap Architect provides a management UI for collections, imports, and cluster configuration, embedded directly in the OpenShift console. This gives you a single pane of glass for managing your disconnected environment alongside your existing cluster operations.
 
-Add the `consolePlugin` configuration to your `DisconnectedPlatform` CR:
-
-```yaml
-spec:
-  architect:
-    enabled: true
-    consolePlugin:
-      enabled: true
-```
-
-After the operator deploys the plugin, enable it in the Console operator:
+The console plugin is deployed automatically when `architect.enabled: true` is set (as in the CR above). After the operator deploys the plugin, enable it in the Console operator:
 
 ```bash
 oc patch console.operator.openshift.io cluster \
