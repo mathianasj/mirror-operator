@@ -253,15 +253,23 @@ The `ImageSetConfiguration` defines what content to collect. It has three main s
 | `operators` | Operator catalogs and packages | `redhat-operator-index:v4.17` |
 | `additionalImages` | Extra container images | `ose-cli:v4.17` |
 
-#### Using the Architect UI
+#### Using the Console Plugin
 
-The Airgap Architect console plugin provides a wizard for building the ImageSetConfiguration:
+The Airgap Architect console plugin provides a 4-step wizard for building the ImageSetConfiguration and creating the collection:
 
 1. Navigate to **Administrator** > **Airgap Architect** in the OpenShift console
-2. Select the operators, platform channels, and additional images to include
-3. The wizard generates the ImageSetConfiguration YAML and creates the CollectionPipeline CR for you
+2. Click **Create Collection** to launch the wizard
+
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Release Selection | Select the OpenShift channel (e.g., `stable-4.17`) and patch version to mirror |
+| 2 | Operators | Select operator catalogs and individual packages to include |
+| 3 | Additional Images | Add any extra container images beyond platform and operators |
+| 4 | Create Pipeline | Review the generated ImageSetConfiguration and create the `CollectionPipeline` CR |
 
 ![Architect UI ImageSetConfiguration editor wizard with platform channels and operator selection](images/02-imageset-editor.png)
+
+For delta/update collections, click **Create Update** from an existing collection. Steps 1 and 2 show the parent's existing selections and let you modify them.
 
 #### Writing ImageSetConfiguration Manually
 
@@ -574,16 +582,44 @@ No manual intervention is required — the script prompts for sudo access when n
 
 #### 3.A.6 Creating Cluster 0
 
-With the registry populated and the Airgap Architect UI running, use the UI to create your first cluster. The Architect generates an agent-based installation ISO that includes:
+With the registry populated and the Airgap Architect UI running at `http://localhost:5173`, use it to create your first cluster. Because the import script mounted the registry configuration, the UI runs in **preloaded mode** — mirror registry settings, CA certificates, pull secrets, and mirror sources are pre-populated and locked so you cannot accidentally misconfigure them.
 
-- The mirrored registry CA certificate
-- ImageDigestMirrorSet / ImageTagMirrorSet configuration
-- CatalogSource definitions for mirrored operator catalogs
-- install-config.yaml and agent-config.yaml
+Open the Airgap Architect UI and click **Start new install** on the landing page. The wizard walks through these steps:
 
-Boot your target nodes from the generated ISO to begin the cluster installation.
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Blueprint | Select target platform (Bare Metal, vSphere, etc.), CPU architecture, and OpenShift version. The version is pre-populated from the bundle's ImageSetConfiguration. |
+| 2 | Methodology | Choose install method — **Agent-Based Installer** is recommended for airgapped bare metal and vSphere environments. |
+| 3 | Identity & Access | Set cluster name (e.g., `production-cluster-01`), base domain (e.g., `airgap.local`), and SSH public key. Mirror registry and pull secret fields are pre-configured and read-only. |
+| 4 | Networking | Configure IP stack, machine network CIDR, cluster/service network CIDRs, and API/Ingress VIPs. |
+| 5 | Connectivity & Mirroring | Mirror registry FQDN and mirror sources (from IDMS/ITMS) are pre-configured and read-only. Configure NTP servers if needed. |
+| 6 | Trust & Proxy | Mirror registry CA certificate is pre-loaded. Add any additional CA certificates or proxy settings. |
+| 7 | Platform Specifics | Platform-specific settings — vCenter credentials for vSphere, boot artifact type for bare metal, etc. |
+| 8 | Hosts / Inventory | Define cluster nodes — hostnames, MAC addresses, BMC credentials, and network configuration for each control plane and worker node. |
+| 9 | Assets & Guide | Review the generated `install-config.yaml` and `agent-config.yaml`. Download individual files or the complete deployment bundle. |
+| 10 | Generate Agent ISO | Click **Generate ISO** to run `openshift-install agent create image`. Download the generated ISO and note the kubeadmin credentials. |
 
-> **Tip:** After cluster 0 is running, transition to **Path B** for ongoing content updates. Install the mirror-operator on the new cluster and create a `DisconnectedPlatform` in `airgapped` mode.
+> **Note:** The "Operators" and "Run oc-mirror" steps that appear in the non-preloaded flow are hidden — operators are already defined in the bundle's ImageSetConfiguration and mirroring was completed by the import script.
+
+Boot your target nodes from the generated agent ISO to begin the cluster installation. The ISO includes all mirrored content references so the installer pulls images from your local registry.
+
+#### 3.A.7 Post-Install: Configuring Storage
+
+After the cluster finishes its initial bootstrap and the API is reachable, log in and configure a storage provider. Several cluster components (registry, monitoring, logging) require PersistentVolumeClaims and will remain pending until storage is available.
+
+```bash
+export KUBECONFIG=<path-to-kubeadmin-kubeconfig>
+oc login -u kubeadmin -p <password-from-step-10>
+```
+
+Install and configure the appropriate storage solution for your platform (e.g., OpenShift Data Foundation, local-storage operator, vSphere CSI driver, NFS provisioner). Once a default `StorageClass` is available, pending PVC-dependent components will complete their installation automatically.
+
+```bash
+oc get storageclass
+oc get pvc -A --field-selector='status.phase!=Bound'
+```
+
+> **Tip:** After storage is configured and all cluster operators are available (`oc get clusteroperators`), transition to **Path B** for ongoing content updates. Install the mirror-operator on the new cluster and create a `DisconnectedPlatform` in `airgapped` mode.
 
 ---
 
@@ -644,16 +680,33 @@ The operator will:
 > oc label node <node-name> mirror-operator.io/import-node=true
 > ```
 
-#### 3.B.2 Automatic Bundle Import
+#### 3.B.2 Importing via the Console Plugin
 
-When `importPath` is configured, the operator creates a CronJob (`import-bundle-scanner`) that runs every 30 minutes by default. The scanner:
+On the airgapped side, the Airgap Architect console plugin switches to import mode automatically. Navigate to **Administrator** > **Airgap Architect** — you will see the import list view instead of the collection view.
+
+Click **Import Bundle** to launch the 4-step import wizard:
+
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Bundle Source | Choose how to provide the bundle: **Upload from browser** (drag-and-drop a tar file) or **Select from import volume** (pick a file already on the PVC at the `importPath`) |
+| 2 | Storage | Create a new PVC or select an existing one for the import working space. The wizard auto-suggests a size at 3.5x the bundle size. |
+| 3 | Configuration | Set the target mirror registry URL. Toggle publish options: **CatalogSource creation** and **ICSP/IDMS creation**. |
+| 4 | Review & Import | Review all settings and click **Import Bundle** to create the `MirrorImport` CR. If using browser upload, the file is uploaded via chunked transfer. |
+
+After creation, the import detail view shows the pipeline progress, task status, duration, bundle info, and publish options.
+
+![MirrorImport detail view showing import progress, verification status, and registry target](images/03b-import-detail.png)
+
+#### 3.B.3 Automatic Bundle Import (Alternative)
+
+Instead of using the console plugin wizard, you can rely on the automatic scanner. When `importPath` is configured, the operator creates a CronJob (`import-bundle-scanner`) that runs every 30 minutes by default. The scanner:
 
 1. Scans `importPath` for `.tar` and `.tar.gz` files
 2. Extracts the `imageset-config.yaml` from each bundle
 3. Creates a `MirrorImport` CR for each unprocessed bundle
 4. Skips bundles that already have a corresponding `MirrorImport` CR
 
-This means importing is automatic — just drop the bundle file at the import path and wait for the next scan cycle.
+This means importing can be fully automatic — just drop the bundle file at the import path and wait for the next scan cycle.
 
 To trigger an immediate scan instead of waiting:
 
@@ -668,11 +721,9 @@ Monitor the auto-created `MirrorImport` resources:
 oc get mirrorimport -n openshift-airgap-architect
 ```
 
-![MirrorImport detail view showing import progress, verification status, and registry target](images/03-import-view.png)
+#### 3.B.4 Manual Import via CLI (Alternative)
 
-#### 3.B.3 Manual Import (Alternative)
-
-If you need more control over the import, you can create a `MirrorImport` CR manually instead of relying on the scanner:
+If you prefer full control, create a `MirrorImport` CR manually:
 
 ```yaml
 apiVersion: mirror.mirror.mathianasj.github.com/v1
@@ -701,7 +752,7 @@ spec:
 oc apply -f mirror-import.yaml
 ```
 
-#### 3.B.4 Post-Import Verification
+#### 3.B.5 Post-Import Verification
 
 After the import completes, verify that the mirrored content is available.
 
@@ -711,7 +762,7 @@ After the import completes, verify that the mirrored content is available.
 oc get catalogsource -n openshift-marketplace
 ```
 
-![OperatorHub displaying operators from the mirrored CatalogSource after successful import](images/03-operatorhub-mirrored.png)
+![OperatorHub displaying operators from the mirrored CatalogSource after successful import](images/03b-operatorhub-mirrored.png)
 
 **ImageDigestMirrorSet** — The import creates an `ImageDigestMirrorSet` (or `ImageContentSourcePolicy` on older clusters) that redirects image pulls from upstream registries to the mirror:
 
@@ -719,7 +770,7 @@ oc get catalogsource -n openshift-marketplace
 oc get imagedigestmirrorset
 ```
 
-![OpenShift console showing CatalogSource and ImageDigestMirrorSet resources created by the import](images/03-catalogsource-resources.png)
+![OpenShift console showing CatalogSource and ImageDigestMirrorSet resources created by the import](images/03b-catalogsource-resources.png)
 
 For details on IDMS configuration and registries.conf generation, see the [IDMS-Based registries.conf Guide](idms-based-registries-conf.md).
 
