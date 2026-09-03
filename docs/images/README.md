@@ -51,8 +51,8 @@ This directory contains screenshots for the [End-to-End Guide](../end-to-end-gui
 | 21 | `03b-operatorhub-mirrored.png` | OperatorHub displaying operators from the mirrored CatalogSource after successful import |
 | 22 | `03b-catalogsource-resources.png` | OpenShift console showing CatalogSource and ImageDigestMirrorSet resources created by the import |
 
-## Phase 4: Cluster Bootstrap
+## Phase 4: Additional Cluster Provisioning
 
 | # | Filename | What to Capture |
 |---|----------|-----------------|
-| 14 | `04-bootstrap-status.png` | ClusterBootstrap resource status view showing cluster provisioning phase and configuration |
+| 23 | `04-bootstrap-status.png` | ClusterBootstrap resource status view showing cluster provisioning phase and configuration |
