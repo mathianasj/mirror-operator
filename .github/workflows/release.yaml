@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   issues: write
+  packages: write
 
 jobs:
   release:
@@ -30,3 +31,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: make release VERSION=${{ inputs.version }}
+
+  build:
+    needs: release
+    uses: ./.github/workflows/ci.yaml
+    with:
+      version: v${{ inputs.version }}
+    secrets: inherit
+
+  submit-to-operatorhub:
+    needs: build
+    uses: ./.github/workflows/operator-catalog-pr.yaml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit
