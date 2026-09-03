@@ -1,6 +1,11 @@
 # Documentation
 
-## Getting Started
+## End-to-End Walkthrough
+
+- [Prerequisites and Environment Setup](prerequisites.md) -- Cluster requirements, credentials, storage sizing
+- [End-to-End Guide](end-to-end-guide.md) -- Complete walkthrough from installation through collection, import, and cluster bootstrap
+
+## Project Overview
 
 - [Project Overview](../README.md) -- What mirror-operator does and how to get started
 - [Architecture Guide](architecture.md) -- How the operator works, with diagrams
