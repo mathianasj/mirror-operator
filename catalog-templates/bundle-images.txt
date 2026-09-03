@@ -2,3 +2,4 @@ quay.io/mathianasj/mirror-operator-bundle:v0.1.0
 quay.io/mathianasj/mirror-operator-bundle:v0.1.1
 quay.io/mathianasj/mirror-operator-bundle:v0.1.2
 quay.io/mathianasj/mirror-operator-bundle:v0.1.3
+quay.io/mathianasj/mirror-operator-bundle:v0.1.4
