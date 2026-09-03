@@ -9,7 +9,7 @@ Before you begin, ensure your environment meets the requirements in the [Prerequ
 - [Workflow Overview](#workflow-overview)
 - [Phase 1: Installation and Platform Setup](#phase-1-installation-and-platform-setup)
 - [Phase 2: Creating a Content Bundle](#phase-2-creating-a-content-bundle)
-- [Phase 3: Transferring and Importing](#phase-3-transferring-and-importing) *(coming soon)*
+- [Phase 3: Transferring and Importing](#phase-3-transferring-and-importing)
 - [Phase 4: Bootstrapping Cluster 0](#phase-4-bootstrapping-cluster-0) *(coming soon)*
 
 ## Workflow Overview
@@ -253,15 +253,23 @@ The `ImageSetConfiguration` defines what content to collect. It has three main s
 | `operators` | Operator catalogs and packages | `redhat-operator-index:v4.17` |
 | `additionalImages` | Extra container images | `ose-cli:v4.17` |
 
-#### Using the Architect UI
+#### Using the Console Plugin
 
-The Airgap Architect console plugin provides a wizard for building the ImageSetConfiguration:
+The Airgap Architect console plugin provides a 4-step wizard for building the ImageSetConfiguration and creating the collection:
 
 1. Navigate to **Administrator** > **Airgap Architect** in the OpenShift console
-2. Select the operators, platform channels, and additional images to include
-3. The wizard generates the ImageSetConfiguration YAML and creates the CollectionPipeline CR for you
+2. Click **Create Collection** to launch the wizard
+
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Release Selection | Select the OpenShift channel (e.g., `stable-4.17`) and patch version to mirror |
+| 2 | Operators | Select operator catalogs and individual packages to include |
+| 3 | Additional Images | Add any extra container images beyond platform and operators |
+| 4 | Create Pipeline | Review the generated ImageSetConfiguration and create the `CollectionPipeline` CR |
 
 ![Architect UI ImageSetConfiguration editor wizard with platform channels and operator selection](images/02-imageset-editor.png)
+
+For delta/update collections, click **Create Update** from an existing collection. Steps 1 and 2 show the parent's existing selections and let you modify them.
 
 #### Writing ImageSetConfiguration Manually
 
@@ -450,4 +458,324 @@ For details on parent pipeline validation, PVC sharing, and lineage tracking, se
 
 ---
 
-*Phase 3 (Transferring and Importing) and Phase 4 (Bootstrapping Cluster 0) are covered in upcoming sections.*
+## Phase 3: Transferring and Importing
+
+Once a collection completes on the connected side, the bundle needs to be physically transferred and imported into the airgapped environment. There are two distinct import paths depending on whether you already have a running cluster:
+
+| Path | When to Use | Tool |
+|------|-------------|------|
+| **Path A: Bootstrap Import** | No cluster exists yet — you need to stand up cluster 0 | Import script + Airgap Architect on bastion host |
+| **Path B: Ongoing Import** | Cluster 0 is running — ongoing content updates | MirrorImport CRs via the mirror-operator |
+
+Most environments start with Path A to bootstrap their first cluster, then transition to Path B for day-2 content updates.
+
+### 3.1 Physical Transfer
+
+Download the bundle from S3 on the connected side. The collection status provides the bundle URL:
+
+```bash
+oc get collectionpipeline collection-v4-17 \
+  -o jsonpath='{.status.bundleUrl}'
+```
+
+Transfer the bundle file to the airgapped environment using your approved transfer mechanism (USB drive, DVD, cross-domain solution, etc.).
+
+- **Path A:** Place the bundle on the bastion host where you will run the import script
+- **Path B:** Place the bundle on the import node at the path configured in the airgapped platform's `importPath` (e.g., `/mnt/physical-media`)
+
+---
+
+### Path A: Bootstrap Import (Pre-Cluster)
+
+Use this path when no OpenShift cluster exists in the airgapped environment yet. The import script runs on a bastion host (a RHEL system with podman) and handles everything needed to prepare for cluster installation:
+
+1. Installs CLI tools (oc, oc-mirror, openshift-install) from the bundle
+2. Installs or connects to a mirror registry (Quay)
+3. Mirrors the bundle's images into the registry using oc-mirror
+4. Starts the Airgap Architect UI for creating the cluster installation ISO
+
+#### 3.A.1 Prerequisites
+
+The bastion host needs:
+
+| Requirement | Details |
+|-------------|---------|
+| RHEL 8 or 9 | Bastion operating system |
+| podman | For running the Airgap Architect containers |
+| Network access | To the mirror registry (can be on the same host) |
+| Disk space | Enough for the bundle + extracted images + registry storage |
+
+#### 3.A.2 Extracting and Running the Import Script
+
+Extract the collection bundle and run the import script:
+
+```bash
+tar -xzf bundle.tar.gz
+cd <extracted-bundle-directory>
+./import-airgap-architect.sh start
+```
+
+The script is interactive and walks you through the setup. On first run, it will:
+
+1. **Install CLI tools** — Extracts `oc`, `oc-mirror`, `kubectl`, and `openshift-install` from the bundle and installs them to `~/.local/bin` (or `/usr/local/bin` on STIG-hardened systems)
+
+2. **Configure a mirror registry** — Prompts you to choose:
+   - **Install mirror-registry (Quay)** on this host — the script handles installation, TLS certificates, and initial configuration
+   - **Use an existing registry** — provide the URL and credentials, the script validates the connection
+   - **Skip registry setup** — if you plan to configure it manually later
+
+3. **Mirror images** — Runs `oc-mirror` to push all images from the bundle archives into the registry. This generates IDMS/ITMS and CatalogSource manifests needed for cluster installation.
+
+4. **Start the Airgap Architect UI** — Imports the frontend and backend container images and starts them via podman
+
+After completion, the Airgap Architect UI is available at `http://localhost:5173` and the backend API at `http://localhost:4000`.
+
+#### 3.A.3 Non-Interactive Mode
+
+For automated deployments, configure the script via environment variables instead of interactive prompts:
+
+```bash
+MIRROR_REGISTRY_INSTALL=true \
+MIRROR_REGISTRY_HOSTNAME=bastion.lab.local \
+MIRROR_REGISTRY_PORT=8443 \
+MIRROR_REGISTRY_INIT_PASSWORD=SecurePass123 \
+./import-airgap-architect.sh start
+```
+
+Or to use an existing registry:
+
+```bash
+MIRROR_REGISTRY_EXISTING=true \
+EXISTING_REGISTRY_URL=registry.example.com:8443 \
+EXISTING_REGISTRY_USERNAME=admin \
+EXISTING_REGISTRY_PASSWORD=mypassword \
+./import-airgap-architect.sh start
+```
+
+See `./import-airgap-architect.sh --help` for all environment variables.
+
+#### 3.A.4 Managing the Import Environment
+
+The import script provides lifecycle commands:
+
+| Command | Description |
+|---------|-------------|
+| `./import-airgap-architect.sh start` | Start (imports images and mirrors to registry if needed) |
+| `./import-airgap-architect.sh stop` | Stop the Architect containers |
+| `./import-airgap-architect.sh restart` | Restart the Architect containers |
+| `./import-airgap-architect.sh status` | Show container status |
+| `./import-airgap-architect.sh logs` | View container logs |
+| `./import-airgap-architect.sh mirror` | Re-run the mirror step only |
+| `./import-airgap-architect.sh clean` | Remove containers and images (preserves data) |
+| `./import-airgap-architect.sh uninstall-mirror-registry` | Uninstall the mirror-registry from this host |
+
+#### 3.A.5 STIG/FIPS-Hardened Environments
+
+The import script automatically detects DISA STIG-hardened systems (noexec on /home, restrictive umask, fapolicyd, disabled user namespaces) and adjusts its behavior:
+
+- Installs CLI tools to `/usr/local/bin` instead of `~/.local/bin`
+- Temporarily stops fapolicyd during installation and adds tools to the trust list
+- Increases `user.max_user_namespaces` for rootless podman
+- Sets appropriate SELinux contexts on binaries
+
+No manual intervention is required — the script prompts for sudo access when needed. For details, see the [STIG and FIPS Compliance Guide](stig-fips-compliance.md).
+
+#### 3.A.6 Creating Cluster 0
+
+With the registry populated and the Airgap Architect UI running at `http://localhost:5173`, use it to create your first cluster. Because the import script mounted the registry configuration, the UI runs in **preloaded mode** — mirror registry settings, CA certificates, pull secrets, and mirror sources are pre-populated and locked so you cannot accidentally misconfigure them.
+
+Open the Airgap Architect UI and click **Start new install** on the landing page. The wizard walks through these steps:
+
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Blueprint | Select target platform (Bare Metal, vSphere, etc.), CPU architecture, and OpenShift version. The version is pre-populated from the bundle's ImageSetConfiguration. |
+| 2 | Methodology | Choose install method — **Agent-Based Installer** is recommended for airgapped bare metal and vSphere environments. |
+| 3 | Identity & Access | Set cluster name (e.g., `production-cluster-01`), base domain (e.g., `airgap.local`), and SSH public key. Mirror registry and pull secret fields are pre-configured and read-only. |
+| 4 | Networking | Configure IP stack, machine network CIDR, cluster/service network CIDRs, and API/Ingress VIPs. |
+| 5 | Connectivity & Mirroring | Mirror registry FQDN and mirror sources (from IDMS/ITMS) are pre-configured and read-only. Configure NTP servers if needed. |
+| 6 | Trust & Proxy | Mirror registry CA certificate is pre-loaded. Add any additional CA certificates or proxy settings. |
+| 7 | Platform Specifics | Platform-specific settings — vCenter credentials for vSphere, boot artifact type for bare metal, etc. |
+| 8 | Hosts / Inventory | Define cluster nodes — hostnames, MAC addresses, BMC credentials, and network configuration for each control plane and worker node. |
+| 9 | Assets & Guide | Review the generated `install-config.yaml` and `agent-config.yaml`. Download individual files or the complete deployment bundle. |
+| 10 | Generate Agent ISO | Click **Generate ISO** to run `openshift-install agent create image`. Download the generated ISO and note the kubeadmin credentials. |
+
+> **Note:** The "Operators" and "Run oc-mirror" steps that appear in the non-preloaded flow are hidden — operators are already defined in the bundle's ImageSetConfiguration and mirroring was completed by the import script.
+
+Boot your target nodes from the generated agent ISO to begin the cluster installation. The ISO includes all mirrored content references so the installer pulls images from your local registry.
+
+#### 3.A.7 Post-Install: Configuring Storage
+
+After the cluster finishes its initial bootstrap and the API is reachable, log in and configure a storage provider. Several cluster components (registry, monitoring, logging) require PersistentVolumeClaims and will remain pending until storage is available.
+
+```bash
+export KUBECONFIG=<path-to-kubeadmin-kubeconfig>
+oc login -u kubeadmin -p <password-from-step-10>
+```
+
+Install and configure the appropriate storage solution for your platform (e.g., OpenShift Data Foundation, local-storage operator, vSphere CSI driver, NFS provisioner). Once a default `StorageClass` is available, pending PVC-dependent components will complete their installation automatically.
+
+```bash
+oc get storageclass
+oc get pvc -A --field-selector='status.phase!=Bound'
+```
+
+> **Tip:** After storage is configured and all cluster operators are available (`oc get clusteroperators`), transition to **Path B** for ongoing content updates. Install the mirror-operator on the new cluster and create a `DisconnectedPlatform` in `airgapped` mode.
+
+---
+
+### Path B: Ongoing Import (Post-Cluster)
+
+Use this path when you already have a running OpenShift cluster in the airgapped environment and want to import new content bundles on an ongoing basis.
+
+#### 3.B.1 Setting Up the Airgapped Platform
+
+On the airgapped OpenShift cluster, install the mirror-operator from the mirrored catalog (the collection bundle includes the mirror-operator in the community operator index).
+
+Create the `DisconnectedPlatform` CR in `airgapped` mode:
+
+```yaml
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  name: disconnected-platform-airgapped
+spec:
+  mode: airgapped
+  airgapped:
+    managementCluster: true
+    importPath: /mnt/physical-media
+    quay:
+      enabled: true
+    acm:
+      hostInventory:
+        infraEnv:
+          enabled: true
+      subscription:
+        catalogSource: cs-redhat-operator-index
+  architect:
+    enabled: true
+```
+
+```bash
+oc apply -f disconnected-platform-airgapped.yaml
+```
+
+Key fields:
+
+| Field | Description |
+|-------|-------------|
+| `managementCluster` | Marks this cluster as the management hub |
+| `importPath` | Host filesystem path where bundles are placed for import |
+| `quay.enabled` | Deploys a managed Quay registry as the mirror target |
+| `acm.hostInventory` | Enables ACM assisted installer for bare-metal provisioning |
+| `acm.subscription.catalogSource` | CatalogSource name for ACM from mirrored content |
+
+The operator will:
+- Deploy a managed Quay registry for mirrored images
+- Create an import scanner CronJob that watches `importPath` for new bundles
+- Set up ACM with host inventory for cluster provisioning
+- Deploy the Airgap Architect console plugin
+
+> **Note:** The import node must be labeled for the scanner CronJob to schedule on it:
+> ```bash
+> oc label node <node-name> mirror-operator.io/import-node=true
+> ```
+
+#### 3.B.2 Importing via the Console Plugin
+
+On the airgapped side, the Airgap Architect console plugin switches to import mode automatically. Navigate to **Administrator** > **Airgap Architect** — you will see the import list view instead of the collection view.
+
+Click **Import Bundle** to launch the 4-step import wizard:
+
+| Step | Name | What You Do |
+|------|------|-------------|
+| 1 | Bundle Source | Choose how to provide the bundle: **Upload from browser** (drag-and-drop a tar file) or **Select from import volume** (pick a file already on the PVC at the `importPath`) |
+| 2 | Storage | Create a new PVC or select an existing one for the import working space. The wizard auto-suggests a size at 3.5x the bundle size. |
+| 3 | Configuration | Set the target mirror registry URL. Toggle publish options: **CatalogSource creation** and **ICSP/IDMS creation**. |
+| 4 | Review & Import | Review all settings and click **Import Bundle** to create the `MirrorImport` CR. If using browser upload, the file is uploaded via chunked transfer. |
+
+After creation, the import detail view shows the pipeline progress, task status, duration, bundle info, and publish options.
+
+![MirrorImport detail view showing import progress, verification status, and registry target](images/03b-import-detail.png)
+
+#### 3.B.3 Automatic Bundle Import (Alternative)
+
+Instead of using the console plugin wizard, you can rely on the automatic scanner. When `importPath` is configured, the operator creates a CronJob (`import-bundle-scanner`) that runs every 30 minutes by default. The scanner:
+
+1. Scans `importPath` for `.tar` and `.tar.gz` files
+2. Extracts the `imageset-config.yaml` from each bundle
+3. Creates a `MirrorImport` CR for each unprocessed bundle
+4. Skips bundles that already have a corresponding `MirrorImport` CR
+
+This means importing can be fully automatic — just drop the bundle file at the import path and wait for the next scan cycle.
+
+To trigger an immediate scan instead of waiting:
+
+```bash
+oc create job --from=cronjob/import-bundle-scanner import-now \
+  -n openshift-airgap-architect
+```
+
+Monitor the auto-created `MirrorImport` resources:
+
+```bash
+oc get mirrorimport -n openshift-airgap-architect
+```
+
+#### 3.B.4 Manual Import via CLI (Alternative)
+
+If you prefer full control, create a `MirrorImport` CR manually:
+
+```yaml
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: MirrorImport
+metadata:
+  name: import-v4-17
+spec:
+  imageSetConfig: |
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v2alpha1
+    mirror:
+      operators:
+        - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17
+  bundle:
+    pvc: import-data
+    filename: release-v4.17.tar
+  targetRegistry:
+    url: https://quay.airgap.local
+  publish:
+    catalogSource: true
+    imageContentSourcePolicy: true
+  collectionVersion: v2026.05.26.001-manual
+```
+
+```bash
+oc apply -f mirror-import.yaml
+```
+
+#### 3.B.5 Post-Import Verification
+
+After the import completes, verify that the mirrored content is available.
+
+**CatalogSource** — The import creates a `CatalogSource` pointing to the mirrored operator index in your registry:
+
+```bash
+oc get catalogsource -n openshift-marketplace
+```
+
+![OperatorHub displaying operators from the mirrored CatalogSource after successful import](images/03b-operatorhub-mirrored.png)
+
+**ImageDigestMirrorSet** — The import creates an `ImageDigestMirrorSet` (or `ImageContentSourcePolicy` on older clusters) that redirects image pulls from upstream registries to the mirror:
+
+```bash
+oc get imagedigestmirrorset
+```
+
+![OpenShift console showing CatalogSource and ImageDigestMirrorSet resources created by the import](images/03b-catalogsource-resources.png)
+
+For details on IDMS configuration and registries.conf generation, see the [IDMS-Based registries.conf Guide](idms-based-registries-conf.md).
+
+**Verify Operators in OperatorHub** — Navigate to **OperatorHub** in the OpenShift console and confirm that operators from the mirrored catalog are available for installation.
+
+---
+
+*Phase 4 (Bootstrapping Cluster 0) is covered in the upcoming section.*
