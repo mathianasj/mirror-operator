@@ -6,12 +6,20 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master]
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag to build (e.g. v0.1.4)'
+        required: true
+        type: string
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || '' }}
 
       - uses: actions/setup-go@v5
         with:
@@ -22,12 +30,14 @@ jobs:
 
   build-and-push:
     needs: test
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     runs-on: ubuntu-latest
     outputs:
       operator-image: ${{ steps.tags.outputs.operator_image }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || '' }}
 
       - uses: docker/setup-qemu-action@v3
 
@@ -43,7 +53,10 @@ jobs:
         id: tags
         run: |
           REPO=quay.io/mathianasj/mirror-operator
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "tags=${REPO}:${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "operator_image=${REPO}:${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
             echo "tags=${REPO}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
             echo "operator_image=${REPO}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           else
@@ -61,14 +74,16 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+            VERSION=${{ inputs.version || (github.ref_type == 'tag' && github.ref_name) || 'latest' }}
 
   bundle-and-catalog:
     needs: build-and-push
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || '' }}
 
       - uses: actions/setup-go@v5
         with:
@@ -92,7 +107,15 @@ jobs:
         id: vars
         run: |
           REPO=quay.io/mathianasj/mirror-operator
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "bundle_img=${REPO}-bundle:v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "catalog_img=${REPO}-catalog:v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "catalog_img_latest=${REPO}-catalog:latest" >> "$GITHUB_OUTPUT"
+            echo "dev_channel=" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"

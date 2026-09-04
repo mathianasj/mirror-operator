@@ -4,6 +4,12 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+  workflow_call:
+    inputs:
+      version:
+        description: 'Operator version (e.g., 0.0.1 without v prefix)'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
@@ -19,19 +25,22 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'workflow_dispatch') ||
+      (inputs.version != '') ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - name: Checkout mirror-operator
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_branch || github.ref }}
+          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.event.workflow_run.head_branch || github.ref }}
           path: mirror-operator
 
       - name: Extract version
         id: version
         run: |
-          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION=${{ inputs.version }}
+          elif [ "${{ github.event_name }}" == "workflow_run" ]; then
             VERSION=${{ github.event.workflow_run.head_branch }}
             VERSION=${VERSION#v}
           else
