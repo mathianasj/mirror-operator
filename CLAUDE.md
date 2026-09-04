@@ -118,12 +118,36 @@ make run            # Run controller locally
 make docker-build   # Build container image
 ```
 
+## Go Best Practices
+
+- Always pass `ctx context.Context` as the first parameter. Never store it in a struct.
+- Wrap errors with context: `fmt.Errorf("reconciling quay config: %w", err)`. Never swallow errors silently.
+- Use `errors.Is()` and `errors.As()` for error comparison — never match on `err.Error()` string content.
+- Use `:=` inside functions. Use `var` only for zero-value declarations or package-level variables.
+- Nil slices are fine — they work with `append`, `len`, `range`. Don't `make` unless you need specific capacity.
+- No unnecessary interfaces — don't define one until there are 2+ implementations. Accept interfaces, return concrete types.
+- No stutter in naming: `quay.Manager` not `quay.QuayManager`. Use short receiver names (`r` not `reconciler`).
+- Use pointer receivers consistently on a type — don't mix pointer and value receivers.
+- No `init()` functions — pass dependencies explicitly.
+- Prefer standard library (`net/http`, `encoding/json`, `slices`, `maps`) over third-party equivalents.
+- Use table-driven tests with `t.Run(tt.name, ...)` for unit helpers. Use Ginkgo/Gomega for controller tests.
+
 ## Code Organization Guidelines
 
 - Keep functions under 100 lines (excluding embedded shell script strings for pipeline tasks).
 - When adding new functionality to a controller, extract it into a focused helper function or a separate file rather than growing existing functions.
 - Group related functionality into domain-specific packages under `internal/controller/` (e.g., `internal/controller/quay/` for Quay registry management). Do not add new domain logic directly into the monolithic controller files.
 - Avoid duplicating logic across connected and airgapped code paths — extract shared logic into common helpers.
+
+## Operator Conventions
+
+- **Logging**: Always use `log.FromContext(ctx)` — never `fmt.Println` or `log.Printf`.
+- **Requeue strategy**: Use `ctrl.Result{RequeueAfter: 30 * time.Second}` when waiting on external dependencies. Return `ctrl.Result{}` (no requeue) on success. Return the error to trigger default exponential backoff.
+- **Finalizers**: Use naming format `mirror.mathianasj.github.com/<resource>-finalizer`. Add finalizer before any reconciliation logic; remove it last in deletion handling.
+- **Owner references**: Use `ctrl.SetControllerReference(owner, owned, r.Scheme)` — not manual `OwnerReference` construction.
+- **Unstructured resources**: Always call `SetGroupVersionKind()` before any Get/Create/Update — omitting it causes silent failures.
+- **After any CRD or RBAC marker change**: Run `make manifests generate` before committing.
+- **`make test` already runs `manifests generate fmt vet`** — don't run them separately before `make test`.
 
 ## Architecture Patterns
 
@@ -250,15 +274,7 @@ func (r *SomeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 Use owner references for garbage collection:
 ```go
-deployment.SetOwnerReferences([]metav1.OwnerReference{
-    {
-        APIVersion: platform.APIVersion,
-        Kind:       platform.Kind,
-        Name:       platform.Name,
-        UID:        platform.UID,
-        Controller: func() *bool { b := true; return &b }(),
-    },
-})
+ctrl.SetControllerReference(platform, deployment, r.Scheme)
 ```
 
 Check-create-update pattern:
