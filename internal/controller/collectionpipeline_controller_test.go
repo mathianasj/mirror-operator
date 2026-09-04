@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -18,6 +19,8 @@ import (
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	knativeapis "knative.dev/pkg/apis"
+	knativeduckv1 "knative.dev/pkg/apis/duck/v1"
 )
 
 var _ = Describe("CollectionPipelineReconciler", func() {
@@ -621,6 +624,293 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 
 			// Should not panic or error
 			r.updatePlatformCollectionHistory(ctx, pipeline)
+		})
+	})
+
+	Describe("collectionPipelineRunPhase", func() {
+		It("returns Complete when completion time is set and Succeeded is True", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionTrue,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			Expect(collectionPipelineRunPhase(pr)).To(Equal("Complete"))
+		})
+
+		It("returns Failed when completion time is set but Succeeded is not True", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionFalse,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			Expect(collectionPipelineRunPhase(pr)).To(Equal("Failed"))
+		})
+
+		It("returns Collecting when start time is set but no completion", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						StartTime: &now,
+					},
+				},
+			}
+			Expect(collectionPipelineRunPhase(pr)).To(Equal("Collecting"))
+		})
+
+		It("returns Pending when no start or completion time", func() {
+			pr := &pipelinev1.PipelineRun{}
+			Expect(collectionPipelineRunPhase(pr)).To(Equal("Pending"))
+		})
+	})
+
+	Describe("getStorageSize", func() {
+		It("returns spec storage size when set", func() {
+			size := resource.MustParse("200Gi")
+			pipeline = &mirrorv1.CollectionPipeline{
+				Spec: mirrorv1.CollectionPipelineSpec{
+					StorageSize: &size,
+				},
+			}
+			result := getStorageSize(pipeline)
+			Expect(result.String()).To(Equal("200Gi"))
+		})
+
+		It("returns default 100Gi when not specified", func() {
+			pipeline = &mirrorv1.CollectionPipeline{}
+			result := getStorageSize(pipeline)
+			Expect(result.String()).To(Equal("100Gi"))
+		})
+	})
+
+	Describe("normalizeImageRef", func() {
+		It("adds docker.io prefix to short-form refs", func() {
+			Expect(normalizeImageRef("amazon/aws-cli:latest")).To(Equal("docker.io/amazon/aws-cli:latest"))
+		})
+
+		It("adds docker.io prefix to library images", func() {
+			Expect(normalizeImageRef("library/nginx")).To(Equal("docker.io/library/nginx"))
+		})
+
+		It("preserves fully-qualified refs", func() {
+			Expect(normalizeImageRef("quay.io/myorg/myimage:v1")).To(Equal("quay.io/myorg/myimage:v1"))
+		})
+
+		It("preserves registry.redhat.io refs", func() {
+			Expect(normalizeImageRef("registry.redhat.io/redhat/ubi9:latest")).To(Equal("registry.redhat.io/redhat/ubi9:latest"))
+		})
+
+		It("preserves localhost refs", func() {
+			Expect(normalizeImageRef("localhost/myimage:v1")).To(Equal("localhost/myimage:v1"))
+		})
+
+		It("preserves refs with port numbers", func() {
+			Expect(normalizeImageRef("myregistry:5000/myimage:v1")).To(Equal("myregistry:5000/myimage:v1"))
+		})
+	})
+
+	Describe("rewriteImageReference", func() {
+		It("rewrites registry.redhat.io to intermediate", func() {
+			result := rewriteImageReference("registry.redhat.io/redhat/ubi9:latest", "quay.apps.example.com/mirror")
+			Expect(result).To(Equal("quay.apps.example.com/mirror/ubi9:latest"))
+		})
+
+		It("rewrites quay.io refs", func() {
+			result := rewriteImageReference("quay.io/openshift/origin-cli:v4.18", "quay.apps.example.com/mirror")
+			Expect(result).To(Equal("quay.apps.example.com/mirror/origin-cli:v4.18"))
+		})
+
+		It("strips docker:// prefix", func() {
+			result := rewriteImageReference("docker://registry.redhat.io/redhat/ubi9:latest", "quay.apps.example.com/mirror")
+			Expect(result).To(Equal("quay.apps.example.com/mirror/ubi9:latest"))
+		})
+
+		It("preserves wildcard patterns", func() {
+			result := rewriteImageReference("quay.io/my-org/*", "intermediate.local/mirror")
+			Expect(result).To(Equal("intermediate.local/mirror/my-org/*"))
+		})
+	})
+
+	Describe("injectDefaultArchitecture", func() {
+		It("injects amd64 when no architectures specified", func() {
+			config := `kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v1alpha2
+mirror:
+  platform:
+    channels:
+    - name: stable-4.17`
+
+			result := injectDefaultArchitecture(config)
+			Expect(result).To(ContainSubstring("amd64"))
+		})
+
+		It("does not modify when architectures already set", func() {
+			config := `kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v1alpha2
+mirror:
+  platform:
+    architectures:
+    - arm64
+    channels:
+    - name: stable-4.17`
+
+			result := injectDefaultArchitecture(config)
+			Expect(result).To(ContainSubstring("arm64"))
+			Expect(result).NotTo(ContainSubstring("amd64"))
+		})
+
+		It("returns original when no platform section", func() {
+			config := `kind: ImageSetConfiguration
+mirror:
+  operators:
+  - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.17`
+
+			result := injectDefaultArchitecture(config)
+			Expect(result).NotTo(ContainSubstring("amd64"))
+		})
+
+		It("returns original for invalid YAML", func() {
+			config := "not: valid: yaml: {["
+			result := injectDefaultArchitecture(config)
+			Expect(result).To(Equal(config))
+		})
+	})
+
+	Describe("hasChildPipelines", func() {
+		It("returns false when no other pipelines reference this one", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "parent-pipeline", Namespace: "default"},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).Build(),
+				Scheme: testScheme,
+			}
+
+			has, err := r.hasChildPipelines(ctx, pipeline)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(has).To(BeFalse())
+		})
+
+		It("returns true when a child pipeline references this one as parent", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "parent-pipeline", Namespace: "default"},
+			}
+			child := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "child-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ParentPipeline: "parent-pipeline",
+				},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, child).Build(),
+				Scheme: testScheme,
+			}
+
+			has, err := r.hasChildPipelines(ctx, pipeline)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(has).To(BeTrue())
+		})
+	})
+
+	Describe("findPlatform", func() {
+		It("returns the first DisconnectedPlatform", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			found, err := r.findPlatform(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).NotTo(BeNil())
+			Expect(found.Name).To(Equal("test-platform"))
+		})
+
+		It("returns nil when no platform exists", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			found, err := r.findPlatform(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeNil())
+		})
+	})
+
+	Describe("getMirrorImage", func() {
+		It("returns custom image when set", func() {
+			r := &CollectionPipelineReconciler{
+				MirrorImage: "custom-mirror:v2",
+			}
+			Expect(r.getMirrorImage()).To(Equal("custom-mirror:v2"))
+		})
+
+		It("returns default image when not set", func() {
+			r := &CollectionPipelineReconciler{}
+			Expect(r.getMirrorImage()).To(Equal(defaultMirrorImage))
+		})
+	})
+
+	Describe("deleteWorkingPVC", func() {
+		It("deletes the PVC", func() {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "collection-storage-test-pipeline",
+					Namespace: "default",
+				},
+			}
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Status: mirrorv1.CollectionPipelineStatus{
+					WorkingPVCName: "collection-storage-test-pipeline",
+				},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pvc).Build(),
+				Scheme: testScheme,
+			}
+
+			r.deleteWorkingPVC(ctx, pipeline)
+
+			existing := &corev1.PersistentVolumeClaim{}
+			err := r.Get(ctx, types.NamespacedName{Name: "collection-storage-test-pipeline", Namespace: "default"}, existing)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	// Suppress unused import of time
+	Describe("time import", func() {
+		It("time package is usable", func() {
+			Expect(time.Now()).NotTo(BeZero())
 		})
 	})
 })
