@@ -146,10 +146,35 @@ make docker-build   # Build container image
 - **Finalizers**: Use naming format `mirror.mathianasj.github.com/<resource>-finalizer`. Add finalizer before any reconciliation logic; remove it last in deletion handling.
 - **Owner references**: Use `ctrl.SetControllerReference(owner, owned, r.Scheme)` — not manual `OwnerReference` construction.
 - **Unstructured resources**: Always call `SetGroupVersionKind()` before any Get/Create/Update — omitting it causes silent failures.
+- **Status conditions**: Use `metav1.Condition` with `Ready` and `Degraded` types. Always set `ObservedGeneration: obj.Generation`. Only update `LastTransitionTime` when the condition status actually changes.
+- **Status update conflicts**: Ignore `apierrors.IsConflict(err)` on status updates — the next reconcile will pick it up.
+- **Optional CRD availability**: When a reconcile depends on a CRD that may not be installed (e.g., Tekton, OLM), track a `crdMissing` flag and requeue after 30s instead of erroring.
+- **Cross-resource watches**: Use custom event handlers (e.g., `secretEventHandler`) in `SetupWithManager` to map events from non-owned resources back to the parent CR via `handler.EnqueueRequestsFromMapFunc`.
+- **PipelineRun tracking**: Store `PipelineRunRef` in the CR status, then poll the referenced PipelineRun's conditions on each reconcile.
 - **After any CRD or RBAC marker change**: Run `make manifests generate` before committing.
 - **`make test` already runs `manifests generate fmt vet`** — don't run them separately before `make test`.
 
 ## Architecture Patterns
+
+### Target Package Structure
+
+The codebase is being refactored from monolithic controller files into domain-specific packages. New code should follow the target structure:
+
+```
+internal/controller/
+├── keycloak/       # Realm/client config, admin token, TLS, OIDC
+├── postgres/       # Shared EnsurePostgreSQL(opts) for RHTPA and Keycloak
+├── quay/           # Registry config, Clair VEX, OBC, routes, robot accounts
+├── trustservices/  # RHTAS root keys + signing, RHTPA OIDC + Trustify
+├── pipelines/      # CollectionBuilder and ImportBuilder — accept config, return pipeline specs
+├── architect/      # Frontend/backend deployments, SA, routes
+├── storage/        # Shared EnsureObjectBucketClaim(opts)
+├── constants.go    # API group strings, resource names, namespaces, labels, storage classes
+├── helpers.go      # newUnstructured() helper, shared findPlatform
+└── images.go       # All container image refs as configurable constants
+```
+
+Domain packages use a `Manager` struct pattern. Reconcilers should be thin orchestrators that call domain manager methods in sequence — the `Reconcile` method itself should stay under 100 lines.
 
 ### Controller Pattern
 All controllers follow standard Kubernetes controller-runtime patterns:
