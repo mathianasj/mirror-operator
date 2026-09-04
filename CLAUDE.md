@@ -271,6 +271,8 @@ if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err == nil 
 
 ## Testing
 
+**All code changes must include unit tests.** Run `make test` to verify tests pass before committing.
+
 ### Unit Tests
 Located in `*_test.go` files alongside controllers. Use `envtest` for controller testing:
 

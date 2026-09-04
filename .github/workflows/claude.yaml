@@ -31,6 +31,11 @@ jobs:
           use_vertex: "true"
           trigger_phrase: "@claude"
           create_pull_request: "true"
+          custom_instructions: |
+            Always write unit tests for any code changes. Use the existing test patterns
+            in *_test.go files. Run 'make test' to verify tests pass before committing.
+            If modifying controller logic, add corresponding test cases in the controller's
+            test file using envtest and Ginkgo/Gomega conventions.
         env:
           CLOUD_ML_REGION: ${{ secrets.GCP_REGION }}
           ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
