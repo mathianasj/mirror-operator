@@ -118,6 +118,13 @@ make run            # Run controller locally
 make docker-build   # Build container image
 ```
 
+## Code Organization Guidelines
+
+- Keep functions under 100 lines (excluding embedded shell script strings for pipeline tasks).
+- When adding new functionality to a controller, extract it into a focused helper function or a separate file rather than growing existing functions.
+- Group related functionality into domain-specific packages under `internal/controller/` (e.g., `internal/controller/quay/` for Quay registry management). Do not add new domain logic directly into the monolithic controller files.
+- Avoid duplicating logic across connected and airgapped code paths — extract shared logic into common helpers.
+
 ## Architecture Patterns
 
 ### Controller Pattern
