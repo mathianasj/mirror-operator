@@ -5,10 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1951,6 +1956,1455 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Scheme: testScheme,
 			}
 			err := r.deleteResource(ctx, deploymentGVK, "nonexistent")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("getQuayHostname", func() {
+		It("returns hostname from QuayRegistry status registryEndpoint", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"status": map[string]interface{}{
+					"registryEndpoint": "https://quay.example.com",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hostname).To(Equal("quay.example.com"))
+		})
+
+		It("strips http:// prefix from hostname", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"status": map[string]interface{}{
+					"registryEndpoint": "http://quay.example.com",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hostname).To(Equal("quay.example.com"))
+		})
+
+		It("falls back to Route spec.host when no status endpoint", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+			}}
+			route := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1",
+				"kind":       "Route",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"host": "quay-route.example.com",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry, route).Build(),
+				Scheme: testScheme,
+			}
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hostname).To(Equal("quay-route.example.com"))
+		})
+
+		It("returns empty string when no status and no route", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			hostname, err := r.getQuayHostname(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hostname).To(BeEmpty())
+		})
+	})
+
+	Describe("ensureQuayGunicornTimeout", func() {
+		It("adds GUNICORN_CMD_ARGS and WORKER_COUNT_REGISTRY env vars to quay component", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"components": []interface{}{
+						map[string]interface{}{
+							"kind":    "quay",
+							"managed": true,
+						},
+						map[string]interface{}{
+							"kind":    "clair",
+							"managed": true,
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayGunicornTimeout(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay", Namespace: architectNamespace}, updated)).To(Succeed())
+
+			components, _, _ := unstructured.NestedSlice(updated.Object, "spec", "components")
+			for _, comp := range components {
+				c := comp.(map[string]interface{})
+				kind, _, _ := unstructured.NestedString(c, "kind")
+				if kind == "quay" {
+					envList, _, _ := unstructured.NestedSlice(c, "overrides", "env")
+					Expect(len(envList)).To(BeNumerically(">=", 2))
+					names := []string{}
+					for _, e := range envList {
+						entry := e.(map[string]interface{})
+						names = append(names, entry["name"].(string))
+					}
+					Expect(names).To(ContainElements("GUNICORN_CMD_ARGS", "WORKER_COUNT_REGISTRY"))
+				}
+			}
+		})
+
+		It("is idempotent — does not duplicate env vars", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"components": []interface{}{
+						map[string]interface{}{
+							"kind":    "quay",
+							"managed": true,
+							"overrides": map[string]interface{}{
+								"env": []interface{}{
+									map[string]interface{}{"name": "GUNICORN_CMD_ARGS", "value": "--timeout 300"},
+									map[string]interface{}{"name": "WORKER_COUNT_REGISTRY", "value": "2"},
+								},
+							},
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayGunicornTimeout(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when no components found", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayGunicornTimeout(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureQuayComponentsUnmanaged", func() {
+		It("sets route and tls components to unmanaged", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"components": []interface{}{
+						map[string]interface{}{
+							"kind":    "route",
+							"managed": true,
+						},
+						map[string]interface{}{
+							"kind":    "tls",
+							"managed": true,
+						},
+						map[string]interface{}{
+							"kind":    "clair",
+							"managed": true,
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayComponentsUnmanaged(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay", Namespace: architectNamespace}, updated)).To(Succeed())
+
+			components, _, _ := unstructured.NestedSlice(updated.Object, "spec", "components")
+			for _, comp := range components {
+				c := comp.(map[string]interface{})
+				kind, _, _ := unstructured.NestedString(c, "kind")
+				managed, _, _ := unstructured.NestedBool(c, "managed")
+				if kind == "route" || kind == "tls" {
+					Expect(managed).To(BeFalse())
+				}
+				if kind == "clair" {
+					Expect(managed).To(BeTrue())
+				}
+			}
+		})
+
+		It("is idempotent when components already unmanaged", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"components": []interface{}{
+						map[string]interface{}{
+							"kind":    "route",
+							"managed": false,
+						},
+						map[string]interface{}{
+							"kind":    "tls",
+							"managed": false,
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayComponentsUnmanaged(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileQuayOBC", func() {
+		It("creates ObjectBucketClaim when not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: architectNamespace,
+					UID:       "uid-123",
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			creds, err := r.reconcileQuayOBC(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(creds).To(BeNil())
+
+			obc := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			obc.SetGroupVersionKind(schema.GroupVersionKind{Group: "objectbucket.io", Version: "v1alpha1", Kind: "ObjectBucketClaim"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "quay-storage", Namespace: architectNamespace}, obc)).To(Succeed())
+			bucketName, _, _ := unstructured.NestedString(obc.Object, "spec", "generateBucketName")
+			Expect(bucketName).To(Equal("quay-storage"))
+		})
+
+		It("returns resolved credentials when OBC configmap and secret exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: architectNamespace,
+					UID:       "uid-123",
+				},
+			}
+			obc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "objectbucket.io/v1alpha1",
+				"kind":       "ObjectBucketClaim",
+				"metadata": map[string]interface{}{
+					"name":      "quay-storage",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"generateBucketName": "quay-storage",
+				},
+			}}
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "quay-storage", Namespace: architectNamespace},
+				Data: map[string]string{
+					"BUCKET_HOST": "s3.openshift-storage.svc",
+					"BUCKET_PORT": "443",
+					"BUCKET_NAME": "my-bucket",
+				},
+			}
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "quay-storage", Namespace: architectNamespace},
+				Data: map[string][]byte{
+					"AWS_ACCESS_KEY_ID":     []byte("access-key"),
+					"AWS_SECRET_ACCESS_KEY": []byte("secret-key"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, obc, cm, secret).Build(),
+				Scheme: testScheme,
+			}
+			creds, err := r.reconcileQuayOBC(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(creds).NotTo(BeNil())
+			Expect(creds.Hostname).To(Equal("s3.openshift-storage.svc.cluster.local"))
+			Expect(creds.Port).To(Equal(443))
+			Expect(creds.IsSecure).To(BeTrue())
+			Expect(creds.Bucket).To(Equal("my-bucket"))
+			Expect(creds.AccessKey).To(Equal("access-key"))
+			Expect(creds.SecretKey).To(Equal("secret-key"))
+		})
+
+		It("returns nil credentials when OBC ConfigMap is not ready", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: architectNamespace,
+					UID:       "uid-123",
+				},
+			}
+			obc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "objectbucket.io/v1alpha1",
+				"kind":       "ObjectBucketClaim",
+				"metadata": map[string]interface{}{
+					"name":      "quay-storage",
+					"namespace": architectNamespace,
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, obc).Build(),
+				Scheme: testScheme,
+			}
+			creds, err := r.reconcileQuayOBC(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(creds).To(BeNil())
+		})
+	})
+
+	Describe("configureClairVEX", func() {
+		It("returns nil when Clair deployment not found", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.configureClairVEX(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates VEX config secret and updates deployment volume", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+					"uid":       "quay-uid-123",
+				},
+			}}
+
+			clairConfig := `auth:
+    psk:
+        key: test-psk-key
+http_listen_addr: :8080
+indexer:
+    connstring: host=db port=5432
+matcher:
+    connstring: host=db port=5432
+notifier:
+    connstring: host=db port=5432
+    webhook:
+        target: http://callback-target
+`
+			configSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-quay-clair-config",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{
+					"config.yaml": []byte(clairConfig),
+				},
+			}
+
+			clairDeployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-quay-clair-app",
+					Namespace: architectNamespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "clair"}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "clair"}},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "clair", Image: "clair:latest"}},
+							Volumes: []corev1.Volume{
+								{
+									Name: "config",
+									VolumeSource: corev1.VolumeSource{
+										Secret: &corev1.SecretVolumeSource{SecretName: "test-quay-clair-config"},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(configSecret, clairDeployment).Build(),
+				Scheme: testScheme,
+			}
+			err := r.configureClairVEX(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			vexSecret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay-clair-vex-config", Namespace: architectNamespace}, vexSecret)).To(Succeed())
+			configContent := string(vexSecret.Data["config.yaml"])
+			if configContent == "" {
+				configContent = vexSecret.StringData["config.yaml"]
+			}
+			Expect(configContent).To(ContainSubstring("vex: true"))
+
+			updatedDeploy := &appsv1.Deployment{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay-clair-app", Namespace: architectNamespace}, updatedDeploy)).To(Succeed())
+			Expect(updatedDeploy.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal("test-quay-clair-vex-config"))
+		})
+	})
+
+	Describe("createOrUpdateQuayS3ConfigSecret", func() {
+		It("creates config bundle secret with S3 credentials", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+					"uid":       "quay-uid-123",
+				},
+			}}
+			creds := &resolvedS3Credentials{
+				Hostname:  "s3.example.com",
+				Port:      443,
+				IsSecure:  true,
+				Bucket:    "my-bucket",
+				AccessKey: "access",
+				SecretKey: "secret",
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds, "quay.example.com")
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay-config-bundle", Namespace: architectNamespace}, secret)).To(Succeed())
+			Expect(secret.Data).To(HaveKey("config.yaml"))
+			configYAML := string(secret.Data["config.yaml"])
+			Expect(configYAML).To(ContainSubstring("s3.example.com"))
+			Expect(configYAML).To(ContainSubstring("my-bucket"))
+		})
+
+		It("updates existing config bundle secret", func() {
+			existing := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-quay-config-bundle",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{"config.yaml": []byte("old-config")},
+			}
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+					"uid":       "quay-uid-123",
+				},
+			}}
+			creds := &resolvedS3Credentials{
+				Hostname: "s3-new.example.com", Port: 443, IsSecure: true,
+				Bucket: "new-bucket", AccessKey: "key", SecretKey: "secret",
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds, "")
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay-config-bundle", Namespace: architectNamespace}, secret)).To(Succeed())
+			Expect(string(secret.Data["config.yaml"])).To(ContainSubstring("s3-new.example.com"))
+		})
+	})
+
+	Describe("ensureQuayPassthroughRoute", func() {
+		It("creates passthrough route when none exists", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: architectNamespace,
+					UID:       "uid-123",
+				},
+			}
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "test-quay",
+					"namespace": architectNamespace,
+				},
+			}}
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Ingress",
+				"metadata": map[string]interface{}{
+					"name": "cluster",
+				},
+				"spec": map[string]interface{}{
+					"domain": "apps.cluster.example.com",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, ingress).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayPassthroughRoute(ctx, platform, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			route := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			route.SetGroupVersionKind(routeGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-quay-quay", Namespace: architectNamespace}, route)).To(Succeed())
+			termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+			Expect(termination).To(Equal("passthrough"))
+			host, _, _ := unstructured.NestedString(route.Object, "spec", "host")
+			Expect(host).To(Equal("test-quay-quay-" + architectNamespace + ".apps.cluster.example.com"))
+		})
+
+		It("returns nil when route already has passthrough termination", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: architectNamespace, UID: "uid-123"},
+			}
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "test-quay", "namespace": architectNamespace},
+			}}
+			existingRoute := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1",
+				"kind":       "Route",
+				"metadata":   map[string]interface{}{"name": "test-quay-quay", "namespace": architectNamespace},
+				"spec": map[string]interface{}{
+					"tls": map[string]interface{}{"termination": "passthrough"},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, existingRoute).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayPassthroughRoute(ctx, platform, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileRHTASConfig", func() {
+		It("returns nil when RHTAS config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when OIDC is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates SecureSign CR with explicit OIDC config", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Issuer:   "https://keycloak.example.com/realms/sigstore",
+								ClientID: "trusted-artifact-signer",
+								Type:     "email",
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			ss.SetGroupVersionKind(securesignGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-securesign", Namespace: architectNamespace}, ss)).To(Succeed())
+
+			fulcioEnabled, _, _ := unstructured.NestedBool(ss.Object, "spec", "fulcio", "enabled")
+			Expect(fulcioEnabled).To(BeTrue())
+			rekorEnabled, _, _ := unstructured.NestedBool(ss.Object, "spec", "rekor", "enabled")
+			Expect(rekorEnabled).To(BeTrue())
+		})
+
+		It("is idempotent — does not error when SecureSign already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-securesign",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Issuer:   "https://keycloak.example.com/realms/sigstore",
+								ClientID: "tas",
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("uses managed Keycloak OIDC when managed config is set", func() {
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Ingress",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"spec":       map[string]interface{}{"domain": "apps.test.example.com"},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{
+									Enabled: true,
+									Realm:   "custom-realm",
+								},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ingress).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			ss.SetGroupVersionKind(securesignGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-securesign", Namespace: architectNamespace}, ss)).To(Succeed())
+
+			issuers, _, _ := unstructured.NestedSlice(ss.Object, "spec", "fulcio", "config", "OIDCIssuers")
+			Expect(len(issuers)).To(Equal(1))
+			issuer := issuers[0].(map[string]interface{})
+			Expect(issuer["Issuer"]).To(Equal("https://keycloak.apps.test.example.com/realms/custom-realm"))
+			Expect(issuer["ClientID"]).To(Equal("trusted-artifact-signer"))
+		})
+
+		It("includes database config when specified", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Issuer:   "https://keycloak.example.com/realms/sigstore",
+								ClientID: "tas",
+							},
+							Database: &mirrorv1.RHTASDatabaseConfig{
+								Host:     "db.example.com",
+								Name:     "sigstore",
+								Port:     5432,
+								Username: "admin",
+								Password: "secret",
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			ss.SetGroupVersionKind(securesignGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-securesign", Namespace: architectNamespace}, ss)).To(Succeed())
+
+			dbHost, _, _ := unstructured.NestedString(ss.Object, "spec", "trillian", "database", "host")
+			Expect(dbHost).To(Equal("db.example.com"))
+			dbName, _, _ := unstructured.NestedString(ss.Object, "spec", "rekor", "database", "name")
+			Expect(dbName).To(Equal("sigstore"))
+		})
+
+		It("returns error when issuer and clientID are empty", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTASConfig(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("OIDC issuer and clientID are required"))
+		})
+	})
+
+	Describe("deleteRHTASConfig", func() {
+		It("deletes SecureSign and ConfigMap without error", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+			}}
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "rhtas-trusted-root", Namespace: architectNamespace},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss, cm).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTASConfig(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(securesignGVK)
+			err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-securesign", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			checkCM := &corev1.ConfigMap{}
+			err = r.Get(ctx, client.ObjectKey{Name: "rhtas-trusted-root", Namespace: architectNamespace}, checkCM)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTASConfig(ctx)
+		})
+	})
+
+	Describe("extractRHTASRootKeys", func() {
+		It("creates ConfigMap with Fulcio and Rekor keys from TUF status", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "True"},
+					},
+					"tuf": map[string]interface{}{
+						"url": "http://tuf.mirror-operator-system.svc",
+					},
+				},
+			}}
+			tuf := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Tuf",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"keys": []interface{}{
+						map[string]interface{}{
+							"name":      "fulcio_v1.crt.pem",
+							"secretRef": map[string]interface{}{"name": "fulcio-root-secret", "key": "cert"},
+						},
+						map[string]interface{}{
+							"name":      "rekor.pub",
+							"secretRef": map[string]interface{}{"name": "rekor-pub-secret", "key": "public"},
+						},
+					},
+				},
+			}}
+			fulcioSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "fulcio-root-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{"cert": []byte("-----BEGIN CERTIFICATE-----\nFULCIO\n-----END CERTIFICATE-----")},
+			}
+			rekorSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "rekor-pub-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{"public": []byte("-----BEGIN PUBLIC KEY-----\nREKOR\n-----END PUBLIC KEY-----")},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Status:     mirrorv1.DisconnectedPlatformStatus{},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss, tuf, fulcioSecret, rekorSecret).Build(),
+				Scheme: testScheme,
+			}
+			err := r.extractRHTASRootKeys(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtas-trusted-root", Namespace: architectNamespace}, cm)).To(Succeed())
+			Expect(cm.Data["fulcio-root.pem"]).To(ContainSubstring("FULCIO"))
+			Expect(cm.Data["rekor-public-key.pem"]).To(ContainSubstring("REKOR"))
+			Expect(cm.Data["tuf-repository-url"]).To(Equal("http://tuf.mirror-operator-system.svc"))
+
+			Expect(platform.Status.RHTASRootKeys).NotTo(BeNil())
+			Expect(platform.Status.RHTASRootKeys.ConfigMap).To(Equal("rhtas-trusted-root"))
+			Expect(platform.Status.RHTASRootKeys.TUFRepositoryURL).To(Equal("http://tuf.mirror-operator-system.svc"))
+		})
+
+		It("returns error when SecureSign not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.extractRHTASRootKeys(ctx, platform)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("returns error when SecureSign is not ready", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "False"},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss).Build(),
+				Scheme: testScheme,
+			}
+			err := r.extractRHTASRootKeys(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not ready"))
+		})
+
+		It("returns error when Fulcio or Rekor secret refs are missing from TUF status", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "True"},
+					},
+					"tuf": map[string]interface{}{"url": "http://tuf.svc"},
+				},
+			}}
+			tuf := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Tuf",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"keys": []interface{}{
+						map[string]interface{}{"name": "other-key"},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss, tuf).Build(),
+				Scheme: testScheme,
+			}
+			err := r.extractRHTASRootKeys(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Fulcio or Rekor secret references not found"))
+		})
+	})
+
+	Describe("ensureKeycloakOIDCClient", func() {
+		It("returns cached secret when it already exists", func() {
+			cache := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sigstore-client-secret-cache",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{"secret": []byte("cached-secret-value")},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cache).Build(),
+				Scheme: testScheme,
+			}
+			secret, err := r.ensureKeycloakOIDCClient(ctx, "keycloak.example.com", "sigstore", "admin", "pass", "tas")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secret).To(Equal("cached-secret-value"))
+		})
+
+		It("generates and caches a new secret when none exists", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			secret, err := r.ensureKeycloakOIDCClient(ctx, "keycloak.example.com", "sigstore", "admin", "pass", "tas")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secret).To(HaveLen(32))
+
+			cache := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "sigstore-client-secret-cache", Namespace: architectNamespace}, cache)).To(Succeed())
+			cachedValue := string(cache.Data["secret"])
+			if cachedValue == "" {
+				cachedValue = cache.StringData["secret"]
+			}
+			Expect(cachedValue).To(Equal(secret))
+		})
+	})
+
+	Describe("ensureKeycloakTLS", func() {
+		It("returns error when certIssuer is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureKeycloakTLS(ctx, platform, "keycloak.example.com", "keycloak-tls")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("certIssuer must be specified"))
+		})
+
+		It("creates Certificate CR with correct spec", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						CertIssuer: &mirrorv1.CertIssuerReference{
+							Name: "letsencrypt-prod",
+							Kind: "ClusterIssuer",
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureKeycloakTLS(ctx, platform, "keycloak.example.com", "keycloak-tls")
+			Expect(err).NotTo(HaveOccurred())
+
+			cert := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			cert.SetGroupVersionKind(certificateGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "keycloak-certificate", Namespace: architectNamespace}, cert)).To(Succeed())
+
+			secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
+			Expect(secretName).To(Equal("keycloak-tls"))
+			commonName, _, _ := unstructured.NestedString(cert.Object, "spec", "commonName")
+			Expect(commonName).To(Equal("keycloak.example.com"))
+			issuerName, _, _ := unstructured.NestedString(cert.Object, "spec", "issuerRef", "name")
+			Expect(issuerName).To(Equal("letsencrypt-prod"))
+		})
+
+		It("is idempotent — skips when certificate already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "cert-manager.io/v1",
+				"kind":       "Certificate",
+				"metadata":   map[string]interface{}{"name": "keycloak-certificate", "namespace": architectNamespace},
+				"spec":       map[string]interface{}{"secretName": "keycloak-tls"},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						CertIssuer: &mirrorv1.CertIssuerReference{Name: "letsencrypt-prod"},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureKeycloakTLS(ctx, platform, "keycloak.example.com", "keycloak-tls")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("deleteManagedKeycloak", func() {
+		It("deletes Keycloak, RealmImport, and Certificate resources", func() {
+			realm := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "k8s.keycloak.org/v2alpha1",
+				"kind":       "KeycloakRealmImport",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-keycloak-realm", "namespace": architectNamespace},
+			}}
+			kc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "k8s.keycloak.org/v2alpha1",
+				"kind":       "Keycloak",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-keycloak", "namespace": architectNamespace},
+			}}
+			cert := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "cert-manager.io/v1",
+				"kind":       "Certificate",
+				"metadata":   map[string]interface{}{"name": "keycloak-certificate", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(realm, kc, cert).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteManagedKeycloak(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(keycloakGVK)
+			err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-keycloak", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			check2 := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check2.SetGroupVersionKind(keycloakRealmGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-keycloak-realm", Namespace: architectNamespace}, check2)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteManagedKeycloak(ctx)
+		})
+	})
+
+	Describe("resolveQuayS3Credentials", func() {
+		It("returns explicit credentials from storage config", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			storage := &mirrorv1.QuayStorageConfig{
+				S3Endpoint:  "s3.example.com:9000",
+				S3Bucket:    "test-bucket",
+				S3AccessKey: "mykey",
+				S3SecretKey: "mysecret",
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			creds, err := r.resolveQuayS3Credentials(ctx, platform, storage)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(creds.Hostname).To(Equal("s3.example.com"))
+			Expect(creds.Port).To(Equal(9000))
+			Expect(creds.IsSecure).To(BeFalse())
+			Expect(creds.Bucket).To(Equal("test-bucket"))
+		})
+
+		It("falls back to OBC when no explicit credentials", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test",
+					Namespace: architectNamespace,
+					UID:       "uid-123",
+				},
+			}
+			storage := &mirrorv1.QuayStorageConfig{}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			creds, err := r.resolveQuayS3Credentials(ctx, platform, storage)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(creds).To(BeNil())
+		})
+	})
+
+	Describe("getClusterIngressDomain", func() {
+		It("returns domain from cluster Ingress resource", func() {
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Ingress",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"spec":       map[string]interface{}{"domain": "apps.mycluster.example.com"},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ingress).Build(),
+				Scheme: testScheme,
+			}
+			domain, err := r.getClusterIngressDomain(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(domain).To(Equal("apps.mycluster.example.com"))
+		})
+
+		It("returns error when Ingress not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.getClusterIngressDomain(ctx)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("addOpenShiftIdentityProvider", func() {
+		It("creates OAuthClient and identity provider when neither exists", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					body, _ := io.ReadAll(r.Body)
+					var idp map[string]interface{}
+					json.Unmarshal(body, &idp)
+					Expect(idp["alias"]).To(Equal("openshift"))
+					Expect(idp["providerId"]).To(Equal("openshift-v4"))
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/test-realm/authentication/flows/first%20broker%20login/executions", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := reconciler.addOpenShiftIdentityProvider(ctx, keycloakHost, "test-realm", "https://api.cluster.example.com:6443", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+
+			oauthClient := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			oauthClient.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "oauth.openshift.io", Version: "v1", Kind: "OAuthClient",
+			})
+			Expect(reconciler.Get(ctx, client.ObjectKey{Name: "keycloak-test-realm"}, oauthClient)).To(Succeed())
+			secret, _, _ := unstructured.NestedString(oauthClient.Object, "secret")
+			Expect(secret).NotTo(BeEmpty())
+		})
+
+		It("updates existing identity provider when it already exists", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode([]map[string]interface{}{
+						{"alias": "openshift", "config": map[string]interface{}{"clientSecret": "old-secret"}},
+					})
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances/openshift", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"alias":  "openshift",
+						"config": map[string]interface{}{"clientSecret": "old-secret", "baseUrl": "https://old.api"},
+					})
+					return
+				}
+				if r.Method == "PUT" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/test-realm/authentication/flows/first%20broker%20login/executions", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			oauthClient := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "oauth.openshift.io/v1",
+				"kind":       "OAuthClient",
+				"metadata":   map[string]interface{}{"name": "keycloak-test-realm"},
+				"secret":     "existing-secret",
+			}}
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(oauthClient).Build(),
+				Scheme: testScheme,
+			}
+
+			err := reconciler.addOpenShiftIdentityProvider(ctx, keycloakHost, "test-realm", "https://api.cluster.example.com:6443", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns error when OAuthClient secret is empty", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			oauthClient := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "oauth.openshift.io/v1",
+				"kind":       "OAuthClient",
+				"metadata":   map[string]interface{}{"name": "keycloak-test-realm"},
+			}}
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(oauthClient).Build(),
+				Scheme: testScheme,
+			}
+
+			err := reconciler.addOpenShiftIdentityProvider(ctx, keycloakHost, "test-realm", "https://api.cluster.example.com:6443", "test-token", ts.Client())
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("OAuthClient secret is empty"))
+		})
+	})
+
+	Describe("configureCollectionPipelineSigning", func() {
+		It("returns nil when RHTAS config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.configureCollectionPipelineSigning(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when managed OIDC is not enabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Issuer:   "https://external.keycloak.com",
+								ClientID: "tas",
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.configureCollectionPipelineSigning(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureAWSLoadBalancerTimeout", func() {
+		It("returns nil when platform is not AWS", func() {
+			infra := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Infrastructure",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"platformStatus": map[string]interface{}{"type": "vSphere"},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(infra).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAWSLoadBalancerTimeout(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("sets idle timeout to 5m on AWS", func() {
+			infra := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Infrastructure",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status":     map[string]interface{}{"platformStatus": map[string]interface{}{"type": "AWS"}},
+			}}
+			ic := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.openshift.io/v1",
+				"kind":       "IngressController",
+				"metadata":   map[string]interface{}{"name": "default", "namespace": "openshift-ingress-operator"},
+				"spec": map[string]interface{}{
+					"endpointPublishingStrategy": map[string]interface{}{
+						"type": "LoadBalancerService",
+						"loadBalancer": map[string]interface{}{
+							"scope": "External",
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(infra, ic).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAWSLoadBalancerTimeout(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{Group: "operator.openshift.io", Version: "v1", Kind: "IngressController"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "default", Namespace: "openshift-ingress-operator"}, updated)).To(Succeed())
+			timeout, _, _ := unstructured.NestedString(updated.Object,
+				"spec", "endpointPublishingStrategy", "loadBalancer", "providerParameters", "aws", "classicLoadBalancer", "connectionIdleTimeout")
+			Expect(timeout).To(Equal("5m0s"))
+		})
+
+		It("is idempotent when timeout already set", func() {
+			infra := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Infrastructure",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status":     map[string]interface{}{"platformStatus": map[string]interface{}{"type": "AWS"}},
+			}}
+			ic := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.openshift.io/v1",
+				"kind":       "IngressController",
+				"metadata":   map[string]interface{}{"name": "default", "namespace": "openshift-ingress-operator"},
+				"spec": map[string]interface{}{
+					"endpointPublishingStrategy": map[string]interface{}{
+						"type": "LoadBalancerService",
+						"loadBalancer": map[string]interface{}{
+							"scope": "External",
+							"providerParameters": map[string]interface{}{
+								"type": "AWS",
+								"aws": map[string]interface{}{
+									"type": "Classic",
+									"classicLoadBalancer": map[string]interface{}{
+										"connectionIdleTimeout": "5m0s",
+									},
+								},
+							},
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(infra, ic).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAWSLoadBalancerTimeout(ctx)
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
