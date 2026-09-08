@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1511,6 +1512,446 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		It("uses errors.Is for comparison", func() {
 			err := fmt.Errorf("wrapped: %w", errors.New("inner"))
 			Expect(errors.Is(err, err)).To(BeTrue())
+		})
+	})
+
+	Describe("ensureOperatorGroup", func() {
+		It("skips creation for openshift-operators namespace", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "openshift-operators"}
+			err := r.ensureOperatorGroup(ctx, op)
+			Expect(err).NotTo(HaveOccurred())
+
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(operatorGroupGVK)
+			Expect(r.List(ctx, list, client.InNamespace("openshift-operators"))).To(Succeed())
+			Expect(list.Items).To(BeEmpty())
+		})
+
+		It("skips creation when an OperatorGroup already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1",
+				"kind":       "OperatorGroup",
+				"metadata": map[string]interface{}{
+					"name":      "existing-og",
+					"namespace": "test-ns",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			err := r.ensureOperatorGroup(ctx, op)
+			Expect(err).NotTo(HaveOccurred())
+
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(operatorGroupGVK)
+			Expect(r.List(ctx, list, client.InNamespace("test-ns"))).To(Succeed())
+			Expect(list.Items).To(HaveLen(1))
+			Expect(list.Items[0].GetName()).To(Equal("existing-og"))
+		})
+
+		It("creates an OperatorGroup when none exists", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			err := r.ensureOperatorGroup(ctx, op)
+			Expect(err).NotTo(HaveOccurred())
+
+			og := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			og.SetGroupVersionKind(operatorGroupGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-test-op", Namespace: "test-ns"}, og)
+			Expect(err).NotTo(HaveOccurred())
+
+			targetNS, _, _ := unstructured.NestedStringSlice(og.Object, "spec", "targetNamespaces")
+			Expect(targetNS).To(ConsistOf("test-ns"))
+		})
+	})
+
+	Describe("ensureSubscription", func() {
+		It("creates a subscription with correct fields from operatorDef defaults", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{
+				name:      "test-op",
+				pkg:       "test-package",
+				channel:   "stable",
+				catalog:   "redhat-operators",
+				catalogNS: "openshift-marketplace",
+				ns:        "test-ns",
+			}
+			err := r.ensureSubscription(ctx, op, nil)
+			Expect(err).NotTo(HaveOccurred())
+
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			sub.SetGroupVersionKind(subscriptionGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-test-op", Namespace: "test-ns"}, sub)
+			Expect(err).NotTo(HaveOccurred())
+
+			name, _, _ := unstructured.NestedString(sub.Object, "spec", "name")
+			Expect(name).To(Equal("test-package"))
+			channel, _, _ := unstructured.NestedString(sub.Object, "spec", "channel")
+			Expect(channel).To(Equal("stable"))
+			source, _, _ := unstructured.NestedString(sub.Object, "spec", "source")
+			Expect(source).To(Equal("redhat-operators"))
+			sourceNS, _, _ := unstructured.NestedString(sub.Object, "spec", "sourceNamespace")
+			Expect(sourceNS).To(Equal("openshift-marketplace"))
+			approval, _, _ := unstructured.NestedString(sub.Object, "spec", "installPlanApproval")
+			Expect(approval).To(Equal("Automatic"))
+		})
+
+		It("skips creation when subscription already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-test-op",
+					"namespace": "test-ns",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			err := r.ensureSubscription(ctx, op, nil)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("respects OLMSubscriptionConfig overrides", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{
+				name:      "test-op",
+				pkg:       "test-package",
+				channel:   "stable",
+				catalog:   "redhat-operators",
+				catalogNS: "openshift-marketplace",
+				ns:        "test-ns",
+			}
+			cfg := &mirrorv1.OLMSubscriptionConfig{
+				Channel:          "fast",
+				CatalogSource:    "custom-catalog",
+				CatalogSourceNS:  "custom-ns",
+				ApprovalStrategy: "Manual",
+				StartingCSV:      "test-operator.v1.0.0",
+			}
+			err := r.ensureSubscription(ctx, op, cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			sub.SetGroupVersionKind(subscriptionGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-test-op", Namespace: "test-ns"}, sub)
+			Expect(err).NotTo(HaveOccurred())
+
+			channel, _, _ := unstructured.NestedString(sub.Object, "spec", "channel")
+			Expect(channel).To(Equal("fast"))
+			source, _, _ := unstructured.NestedString(sub.Object, "spec", "source")
+			Expect(source).To(Equal("custom-catalog"))
+			sourceNS, _, _ := unstructured.NestedString(sub.Object, "spec", "sourceNamespace")
+			Expect(sourceNS).To(Equal("custom-ns"))
+			approval, _, _ := unstructured.NestedString(sub.Object, "spec", "installPlanApproval")
+			Expect(approval).To(Equal("Manual"))
+			startingCSV, _, _ := unstructured.NestedString(sub.Object, "spec", "startingCSV")
+			Expect(startingCSV).To(Equal("test-operator.v1.0.0"))
+		})
+	})
+
+	Describe("csvStatus", func() {
+		It("returns phase when CSV exists", func() {
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-test-op",
+					"namespace": "test-ns",
+				},
+				"status": map[string]interface{}{
+					"currentCSV": "test-op.v1.0.0",
+				},
+			}}
+			csv := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "ClusterServiceVersion",
+				"metadata": map[string]interface{}{
+					"name":      "test-op.v1.0.0",
+					"namespace": "test-ns",
+				},
+				"status": map[string]interface{}{
+					"phase": "Succeeded",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sub, csv).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			Expect(r.csvStatus(ctx, op)).To(Equal("Succeeded"))
+		})
+
+		It("returns empty when subscription is missing", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			Expect(r.csvStatus(ctx, op)).To(BeEmpty())
+		})
+
+		It("returns empty when CSV name is empty in subscription status", func() {
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-test-op",
+					"namespace": "test-ns",
+				},
+				"status": map[string]interface{}{},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sub).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			Expect(r.csvStatus(ctx, op)).To(BeEmpty())
+		})
+
+		It("returns empty when CSV does not exist", func() {
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-test-op",
+					"namespace": "test-ns",
+				},
+				"status": map[string]interface{}{
+					"currentCSV": "missing-csv.v1.0.0",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sub).Build(),
+				Scheme: testScheme,
+			}
+			op := operatorDef{name: "test-op", ns: "test-ns"}
+			Expect(r.csvStatus(ctx, op)).To(BeEmpty())
+		})
+	})
+
+	Describe("ensureArchitectServiceAccount", func() {
+		It("creates ServiceAccount, Role, and RoleBinding", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureArchitectServiceAccount(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			sa := &corev1.ServiceAccount{}
+			err = r.Get(ctx, client.ObjectKey{Name: "airgap-architect-backend", Namespace: architectNamespace}, sa)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sa.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "airgap-architect"))
+			Expect(sa.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "backend"))
+
+			role := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			role.SetGroupVersionKind(schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"})
+			err = r.Get(ctx, client.ObjectKey{Name: "airgap-architect-backend", Namespace: architectNamespace}, role)
+			Expect(err).NotTo(HaveOccurred())
+
+			rb := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			rb.SetGroupVersionKind(schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"})
+			err = r.Get(ctx, client.ObjectKey{Name: "airgap-architect-backend", Namespace: architectNamespace}, rb)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("is idempotent — does not error when resources already exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			Expect(r.ensureArchitectServiceAccount(ctx, platform)).To(Succeed())
+			Expect(r.ensureArchitectServiceAccount(ctx, platform)).To(Succeed())
+		})
+	})
+
+	Describe("ensureArchitectBackend", func() {
+		It("creates backend deployment when it does not exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			labels := architectComponentLabels("backend")
+
+			err := r.ensureArchitectBackend(ctx, platform, "test-backend", "quay.io/test/backend:v1", 1, labels, "pull-secret", "openshift-config")
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			dep.SetGroupVersionKind(deploymentGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "test-backend", Namespace: architectNamespace}, dep)
+			Expect(err).NotTo(HaveOccurred())
+
+			containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+			Expect(containers).To(HaveLen(1))
+			container := containers[0].(map[string]interface{})
+			Expect(container["image"]).To(Equal("quay.io/test/backend:v1"))
+		})
+	})
+
+	Describe("ensureArchitectFrontend", func() {
+		It("creates frontend deployment when it does not exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			labels := architectComponentLabels("frontend")
+
+			err := r.ensureArchitectFrontend(ctx, platform, "test-frontend", "quay.io/test/frontend:v1", 1, labels, "backend.example.com", "frontend.example.com")
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			dep.SetGroupVersionKind(deploymentGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "test-frontend", Namespace: architectNamespace}, dep)
+			Expect(err).NotTo(HaveOccurred())
+
+			containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+			Expect(containers).To(HaveLen(1))
+			container := containers[0].(map[string]interface{})
+			Expect(container["image"]).To(Equal("quay.io/test/frontend:v1"))
+		})
+	})
+
+	Describe("deleteArchitectResources", func() {
+		It("deletes backend and frontend deployments, services, and routes", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+
+			backendName := architectResourceName(platform, "airgap-architect-backend")
+			frontendName := architectResourceName(platform, "airgap-architect-frontend")
+
+			backendDep := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "apps/v1", "kind": "Deployment",
+				"metadata": map[string]interface{}{"name": backendName, "namespace": architectNamespace},
+			}}
+			frontendDep := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "apps/v1", "kind": "Deployment",
+				"metadata": map[string]interface{}{"name": frontendName, "namespace": architectNamespace},
+			}}
+			backendSvc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "v1", "kind": "Service",
+				"metadata": map[string]interface{}{"name": backendName, "namespace": architectNamespace},
+			}}
+			frontendSvc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "v1", "kind": "Service",
+				"metadata": map[string]interface{}{"name": frontendName, "namespace": architectNamespace},
+			}}
+			apiRoute := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1", "kind": "Route",
+				"metadata": map[string]interface{}{"name": "airgap-architect-api", "namespace": architectNamespace},
+			}}
+			uiRoute := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1", "kind": "Route",
+				"metadata": map[string]interface{}{"name": "airgap-architect", "namespace": architectNamespace},
+			}}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(
+					backendDep, frontendDep, backendSvc, frontendSvc, apiRoute, uiRoute,
+				).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.deleteArchitectResources(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(deploymentGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: backendName, Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.deleteArchitectResources(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("deleteResource", func() {
+		It("deletes an existing resource", func() {
+			dep := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "apps/v1", "kind": "Deployment",
+				"metadata": map[string]interface{}{"name": "to-delete", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(dep).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.deleteResource(ctx, deploymentGVK, "to-delete")
+			Expect(err).NotTo(HaveOccurred())
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(deploymentGVK)
+			err = r.Get(ctx, client.ObjectKey{Name: "to-delete", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("returns nil when resource does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.deleteResource(ctx, deploymentGVK, "nonexistent")
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 })
