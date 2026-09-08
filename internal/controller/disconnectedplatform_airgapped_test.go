@@ -218,7 +218,7 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 			us.SetGroupVersionKind(schema.GroupVersionKind{
 				Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
 			})
-			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-update-service", Namespace: architectNamespace}, us)
+			err = r.Get(ctx, client.ObjectKey{Name: "update-service-oc-mirror", Namespace: "openshift-update-service"}, us)
 			Expect(err).NotTo(HaveOccurred())
 
 			graphImage, _, _ := unstructured.NestedString(us.Object, "spec", "graphDataImage")
@@ -254,7 +254,7 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 			us.SetGroupVersionKind(schema.GroupVersionKind{
 				Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
 			})
-			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-update-service", Namespace: architectNamespace}, us)
+			err = r.Get(ctx, client.ObjectKey{Name: "update-service-oc-mirror", Namespace: "openshift-update-service"}, us)
 			Expect(err).NotTo(HaveOccurred())
 
 			graphImage, _, _ := unstructured.NestedString(us.Object, "spec", "graphDataImage")

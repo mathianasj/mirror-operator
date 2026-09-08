@@ -1339,7 +1339,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 
 	Describe("taskRunSucceeded", func() {
 		It("returns true when Succeeded condition is True", func() {
-			u := &unstructured.Unstructured{}
+			u := &unstructured.Unstructured{Object: map[string]interface{}{}}
 			unstructured.SetNestedSlice(u.Object, []interface{}{
 				map[string]interface{}{
 					"type":   "Succeeded",
@@ -1350,7 +1350,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		})
 
 		It("returns false when Succeeded condition is False", func() {
-			u := &unstructured.Unstructured{}
+			u := &unstructured.Unstructured{Object: map[string]interface{}{}}
 			unstructured.SetNestedSlice(u.Object, []interface{}{
 				map[string]interface{}{
 					"type":   "Succeeded",
@@ -1366,7 +1366,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		})
 
 		It("returns false when Succeeded condition is missing", func() {
-			u := &unstructured.Unstructured{}
+			u := &unstructured.Unstructured{Object: map[string]interface{}{}}
 			unstructured.SetNestedSlice(u.Object, []interface{}{
 				map[string]interface{}{
 					"type":   "Running",
@@ -1645,8 +1645,8 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				em := e.(map[string]interface{})
 				envMap[em["name"].(string)] = em["value"].(string)
 			}
-			Expect(envMap).To(HaveKey("VITE_API_URL"))
-			Expect(envMap["VITE_API_URL"]).To(ContainSubstring("backend.apps.example.com"))
+			Expect(envMap).To(HaveKey("VITE_API_BASE"))
+			Expect(envMap["VITE_API_BASE"]).To(ContainSubstring("backend.apps.example.com"))
 		})
 	})
 
