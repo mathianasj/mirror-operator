@@ -3408,4 +3408,598 @@ notifier:
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
+
+	Describe("saveQuayRobotCredentials", func() {
+		It("creates secret when none exists", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.saveQuayRobotCredentials(ctx, "mirror+bot", "my-token")
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "quay-robot-credentials", Namespace: architectNamespace}, secret)).To(Succeed())
+			Expect(string(secret.Data["username"])).To(Equal("mirror+bot"))
+			Expect(string(secret.Data["token"])).To(Equal("my-token"))
+		})
+
+		It("updates existing secret", func() {
+			existing := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "quay-robot-credentials", Namespace: architectNamespace},
+				Data: map[string][]byte{
+					"username": []byte("old-user"),
+					"token":    []byte("old-token"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.saveQuayRobotCredentials(ctx, "mirror+bot", "new-token")
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "quay-robot-credentials", Namespace: architectNamespace}, secret)).To(Succeed())
+			Expect(string(secret.Data["token"])).To(Equal("new-token"))
+		})
+	})
+
+	Describe("getQuayRobotCredentials", func() {
+		It("returns cached credentials from secret", func() {
+			cache := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "quay-robot-credentials", Namespace: architectNamespace},
+				Data: map[string][]byte{
+					"username": []byte("mirror+mirroroperator"),
+					"token":    []byte("cached-token-value"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cache).Build(),
+				Scheme: testScheme,
+			}
+			robot, token, err := r.getQuayRobotCredentials(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(robot).To(Equal("mirror+mirroroperator"))
+			Expect(token).To(Equal("cached-token-value"))
+		})
+	})
+
+	Describe("deleteRHTPAConfig", func() {
+		It("deletes TrustedProfileAnalyzer CR", func() {
+			tpa := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtpa.io/v1",
+				"kind":       "TrustedProfileAnalyzer",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-trusted-profile-analyzer", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(tpa).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAConfig(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(schema.GroupVersionKind{Group: "rhtpa.io", Version: "v1", Kind: "TrustedProfileAnalyzer"})
+			err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-trusted-profile-analyzer", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when TPA does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAConfig(ctx)
+		})
+	})
+
+	Describe("reconcileRHTPAConfig", func() {
+		It("returns nil when RHTPA config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTPAConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when RHTPA storage is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTPA: &mirrorv1.RHTPAInstallerConfig{},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileRHTPAConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("updateStatusFromSecuresignHealth", func() {
+		It("returns nil when SecureSign not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateStatusFromSecuresignHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when no conditions in status", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status":     map[string]interface{}{},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateStatusFromSecuresignHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("sets degraded condition when HealthCheckPassed is False", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":    "HealthCheckPassed",
+							"status":  "False",
+							"reason":  "HealthCheckFailed",
+							"message": "Fulcio is unreachable",
+						},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateStatusFromSecuresignHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			hasDegraded := false
+			for _, cond := range platform.Status.Conditions {
+				if cond.Type == "Degraded" && cond.Status == metav1.ConditionTrue {
+					hasDegraded = true
+					Expect(cond.Message).To(ContainSubstring("Fulcio is unreachable"))
+				}
+			}
+			Expect(hasDegraded).To(BeTrue())
+		})
+
+		It("clears degraded condition when HealthCheckPassed is True", func() {
+			ss := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{
+							"type":   "HealthCheckPassed",
+							"status": "True",
+						},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Status: mirrorv1.DisconnectedPlatformStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    "Degraded",
+							Status:  metav1.ConditionTrue,
+							Reason:  "HealthCheckFailed",
+							Message: "old failure",
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ss).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateStatusFromSecuresignHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureUpdateService", func() {
+		It("returns nil when QuayRegistry not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureUpdateService(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when Quay hostname not available", func() {
+			quay := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-quay", "namespace": architectNamespace},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureUpdateService(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates UpdateService CR with correct spec", func() {
+			quay := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-quay", "namespace": architectNamespace},
+				"status":     map[string]interface{}{"registryEndpoint": "https://quay.example.com"},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureUpdateService(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			us := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			us.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
+			})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "update-service-oc-mirror", Namespace: "openshift-update-service"}, us)).To(Succeed())
+			graphImage, _, _ := unstructured.NestedString(us.Object, "spec", "graphDataImage")
+			Expect(graphImage).To(Equal("quay.example.com/mirror/openshift/graph-image:latest"))
+			releases, _, _ := unstructured.NestedString(us.Object, "spec", "releases")
+			Expect(releases).To(Equal("quay.example.com/mirror/openshift/release-images"))
+		})
+
+		It("is idempotent — skips update when spec matches", func() {
+			quay := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-quay", "namespace": architectNamespace},
+				"status":     map[string]interface{}{"registryEndpoint": "https://quay.example.com"},
+			}}
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "updateservice.operator.openshift.io/v1",
+				"kind":       "UpdateService",
+				"metadata":   map[string]interface{}{"name": "update-service-oc-mirror", "namespace": "openshift-update-service"},
+				"spec": map[string]interface{}{
+					"graphDataImage": "quay.example.com/mirror/openshift/graph-image:latest",
+					"releases":       "quay.example.com/mirror/openshift/release-images",
+					"replicas":       int64(2),
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay, existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureUpdateService(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensurePullSecret", func() {
+		It("returns nil when source namespace is operator namespace", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensurePullSecret(ctx, "pull-secret", architectNamespace)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("copies pull secret from source namespace to operator namespace", func() {
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(source).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensurePullSecret(ctx, "pull-secret", "openshift-config")
+			Expect(err).NotTo(HaveOccurred())
+
+			target := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: architectNamespace}, target)).To(Succeed())
+			Expect(target.Type).To(Equal(corev1.SecretTypeDockerConfigJson))
+		})
+
+		It("returns error when source secret not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensurePullSecret(ctx, "pull-secret", "openshift-config")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to get pull secret"))
+		})
+	})
+
+	Describe("addOpenShiftAttributeMappers", func() {
+		It("creates username mapper via Keycloak API", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances/openshift/mappers", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "POST" {
+					body, _ := io.ReadAll(r.Body)
+					var mapper map[string]interface{}
+					json.Unmarshal(body, &mapper)
+					Expect(mapper["name"]).To(Equal("username-mapper"))
+					Expect(mapper["identityProviderMapper"]).To(Equal("oidc-username-idp-mapper"))
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.addOpenShiftAttributeMappers(ctx, keycloakHost, "test-realm", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("continues when mapper already exists (409 Conflict)", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/identity-provider/instances/openshift/mappers", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.addOpenShiftAttributeMappers(ctx, keycloakHost, "test-realm", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("configureRealmProfileSettings", func() {
+		It("disables Review Profile execution", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/authentication/flows/first%20broker%20login/executions", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode([]map[string]interface{}{
+						{
+							"id":          "exec-1",
+							"displayName": "Review Profile",
+							"requirement": "REQUIRED",
+						},
+					})
+					return
+				}
+				if r.Method == "PUT" {
+					body, _ := io.ReadAll(r.Body)
+					var exec map[string]interface{}
+					json.Unmarshal(body, &exec)
+					Expect(exec["requirement"]).To(Equal("DISABLED"))
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.configureRealmProfileSettings(ctx, keycloakHost, "test-realm", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("skips when Review Profile already disabled", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/authentication/flows/first%20broker%20login/executions", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{
+						"id":          "exec-1",
+						"displayName": "Review Profile",
+						"requirement": "DISABLED",
+					},
+				})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.configureRealmProfileSettings(ctx, keycloakHost, "test-realm", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("addQuayCredentialsIfNeeded", func() {
+		It("returns unchanged when no QuayRegistry exists", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			input := []byte(`{"auths":{}}`)
+			result, changed, err := r.addQuayCredentialsIfNeeded(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(changed).To(BeFalse())
+			Expect(result).To(Equal(input))
+		})
+
+		It("returns unchanged when Quay hostname is empty", func() {
+			quay := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-quay", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay).Build(),
+				Scheme: testScheme,
+			}
+			input := []byte(`{"auths":{}}`)
+			result, changed, err := r.addQuayCredentialsIfNeeded(ctx, input)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(changed).To(BeFalse())
+			Expect(result).To(Equal(input))
+		})
+	})
+
+	Describe("ensureOSUSPullSecret", func() {
+		It("copies pull secret from operator namespace to openshift-update-service", func() {
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			sa := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "openshift-update-service"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(source, sa).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureOSUSPullSecret(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			target := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "openshift-update-service"}, target)).To(Succeed())
+
+			updatedSA := &corev1.ServiceAccount{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "default", Namespace: "openshift-update-service"}, updatedSA)).To(Succeed())
+			found := false
+			for _, s := range updatedSA.ImagePullSecrets {
+				if s.Name == "pull-secret" {
+					found = true
+				}
+			}
+			Expect(found).To(BeTrue())
+		})
+
+		It("returns error when source pull secret not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureOSUSPullSecret(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to get pull-secret"))
+		})
+	})
+
+	Describe("ensureQuayTLSCertificate", func() {
+		It("returns error when certIssuer is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureQuayTLSCertificate(ctx, platform, "quay.example.com")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("certIssuer must be specified"))
+		})
+	})
+
+	Describe("mergePullSecrets", func() {
+		It("merges two dockerconfig JSONs", func() {
+			existing := []byte(`{"auths":{"registry.a.com":{"auth":"dXNlcjE6cGFzczE="}}}`)
+			source := []byte(`{"auths":{"registry.b.com":{"auth":"dXNlcjI6cGFzczI="}}}`)
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			result, changed, err := r.mergePullSecrets(existing, source)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(changed).To(BeTrue())
+
+			var cfg map[string]interface{}
+			Expect(json.Unmarshal(result, &cfg)).To(Succeed())
+			auths := cfg["auths"].(map[string]interface{})
+			Expect(auths).To(HaveKey("registry.a.com"))
+			Expect(auths).To(HaveKey("registry.b.com"))
+		})
+
+		It("returns unchanged when source is already merged", func() {
+			existing := []byte(`{"auths":{"registry.a.com":{"auth":"dXNlcjE6cGFzczE="}}}`)
+			source := []byte(`{"auths":{"registry.a.com":{"auth":"dXNlcjE6cGFzczE="}}}`)
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			_, changed, err := r.mergePullSecrets(existing, source)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(changed).To(BeFalse())
+		})
+	})
 })
