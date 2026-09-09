@@ -363,21 +363,34 @@ type RHTPAOIDCConfig struct {
 }
 
 type MirrorRegistryConfig struct {
-	// Storage path for Quay data
-	// +kubebuilder:default="/opt/quay"
+	// Storage path for registry data on each node
+	// +kubebuilder:default="/opt/mirror-registry"
 	// +optional
 	DataPath string `json:"dataPath,omitempty"`
-	// Quay service port
-	// +kubebuilder:default=8443
+	// Registry service port
+	// +kubebuilder:default=5000
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Port int32 `json:"port,omitempty"`
+	// Number of master nodes to run the registry on (minimum 2 for HA)
+	// +kubebuilder:default=2
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+	// TLS certificate secret name containing tls.crt and tls.key for the registry
+	// If not provided, the operator will generate self-signed certificates
+	// +optional
+	TLSSecret *corev1.LocalObjectReference `json:"tlsSecret,omitempty"`
+	// Registry container image to use for the podman-hosted mirror registry
+	// +kubebuilder:default="docker.io/library/registry:2"
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 type AirgappedQuayConfig struct {
 	// Deploy and manage a Quay registry on the airgapped cluster
 	// +optional
-	// +kubebuilder:default=true
+	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 	// Quay organization name for mirrored content
 	// +kubebuilder:default="mirror"
