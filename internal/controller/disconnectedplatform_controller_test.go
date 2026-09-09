@@ -4002,4 +4002,253 @@ notifier:
 			Expect(changed).To(BeFalse())
 		})
 	})
+
+	Describe("ensureTrustifyReadOnlyScope", func() {
+		It("creates read:document scope when it does not exist", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					body, _ := io.ReadAll(r.Body)
+					var scope map[string]interface{}
+					json.Unmarshal(body, &scope)
+					Expect(scope["name"]).To(Equal("read:document"))
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.ensureTrustifyReadOnlyScope(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("skips creation when scope already exists", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-1", "name": "read:document"},
+				})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.ensureTrustifyReadOnlyScope(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureTrustifyCreateScope", func() {
+		It("creates create:document scope when it does not exist", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					body, _ := io.ReadAll(r.Body)
+					var scope map[string]interface{}
+					json.Unmarshal(body, &scope)
+					Expect(scope["name"]).To(Equal("create:document"))
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.ensureTrustifyCreateScope(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureTrustifyManagerRole", func() {
+		It("creates role when it does not exist (404)", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/roles/trustify-manager", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			})
+			mux.HandleFunc("/admin/realms/trustify/roles", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "POST" {
+					body, _ := io.ReadAll(r.Body)
+					var role map[string]interface{}
+					json.Unmarshal(body, &role)
+					Expect(role["name"]).To(Equal("trustify-manager"))
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.ensureTrustifyManagerRole(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when role already exists", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/roles/trustify-manager", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{"name": "trustify-manager"})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.ensureTrustifyManagerRole(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("assignScopeToClient", func() {
+		It("assigns scope to client by UUID", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-uuid-123", "name": "read:document"},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/client-uuid-456/default-client-scopes/scope-uuid-123", func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.Method).To(Equal("PUT"))
+				w.WriteHeader(http.StatusNoContent)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.assignScopeToClient(ctx, keycloakHost, "trustify", "client-uuid-456", "read:document", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns error when scope not found", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode([]map[string]interface{}{})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+			reconciler := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := reconciler.assignScopeToClient(ctx, keycloakHost, "trustify", "client-uuid", "read:document", "test-token", ts.Client())
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("scope not found"))
+		})
+	})
+
+	Describe("discoverPackageInfo", func() {
+		It("returns catalog info from PackageManifest status", func() {
+			pm := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "packages.operators.coreos.com/v1",
+				"kind":       "PackageManifest",
+				"metadata":   map[string]interface{}{"name": "test-operator", "namespace": "openshift-marketplace"},
+				"status": map[string]interface{}{
+					"catalogSource":          "community-operators",
+					"catalogSourceNamespace": "openshift-marketplace",
+					"defaultChannel":         "stable",
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pm).Build(),
+				Scheme: testScheme,
+			}
+			catalog, catalogNS, channel, err := r.discoverPackageInfo(ctx, "test-operator")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(catalog).To(Equal("community-operators"))
+			Expect(catalogNS).To(Equal("openshift-marketplace"))
+			Expect(channel).To(Equal("stable"))
+		})
+
+		It("returns error when PackageManifest not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			_, _, _, err := r.discoverPackageInfo(ctx, "nonexistent-operator")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not found"))
+		})
+	})
+
+	Describe("reconcileAirgappedSubscriptions", func() {
+		It("does nothing when airgapped is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.reconcileAirgappedSubscriptions(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureNamespace", func() {
+		It("creates namespace when it does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureNamespace(ctx, "test-ns")
+			Expect(err).NotTo(HaveOccurred())
+
+			ns := &corev1.Namespace{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "test-ns"}, ns)).To(Succeed())
+		})
+
+		It("returns nil when namespace already exists", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "existing-ns"}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureNamespace(ctx, "existing-ns")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
 })

@@ -1185,4 +1185,486 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 			Expect(when[0]["input"]).To(Equal("$(params.verify-enabled)"))
 		})
 	})
+
+	Describe("ensureACMPullSecret", func() {
+		It("copies pull secret from operator namespace to open-cluster-management", func() {
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(source).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMPullSecret(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			target := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "open-cluster-management"}, target)).To(Succeed())
+			Expect(target.Type).To(Equal(corev1.SecretTypeDockerConfigJson))
+		})
+
+		It("updates existing secret when data differs", func() {
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{"new":"data"}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			existing := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "open-cluster-management"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{"old":"data"}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(source, existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMPullSecret(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "open-cluster-management"}, updated)).To(Succeed())
+			Expect(string(updated.Data[".dockerconfigjson"])).To(ContainSubstring("new"))
+		})
+
+		It("returns error when source secret not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMPullSecret(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to get pull-secret"))
+		})
+	})
+
+	Describe("ensureMultiClusterHub", func() {
+		It("returns nil when MultiClusterHub already exists", func() {
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.open-cluster-management.io/v1",
+				"kind":       "MultiClusterHub",
+				"metadata":   map[string]interface{}{"name": "multiclusterhub", "namespace": "open-cluster-management"},
+				"status":     map[string]interface{}{"phase": "Running"},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(mch).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureMultiClusterHub(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			found := false
+			for _, c := range platform.Status.Components {
+				if c.Name == "multiclusterhub" && c.Status == "Running" {
+					found = true
+				}
+			}
+			Expect(found).To(BeTrue())
+		})
+
+		It("creates MultiClusterHub with default pull secret", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureMultiClusterHub(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			mch.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+			})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "multiclusterhub", Namespace: "open-cluster-management"}, mch)).To(Succeed())
+			pullSecret, _, _ := unstructured.NestedString(mch.Object, "spec", "imagePullSecret")
+			Expect(pullSecret).To(Equal("pull-secret"))
+		})
+
+		It("creates MultiClusterHub with custom pull secret and CA", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							MultiClusterHub: &mirrorv1.MultiClusterHubConfig{
+								ImagePullSecret:          &corev1.LocalObjectReference{Name: "custom-secret"},
+								CustomCAConfigMap:        "custom-ca",
+								DisableHubSelfManagement: true,
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureMultiClusterHub(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			mch.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+			})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "multiclusterhub", Namespace: "open-cluster-management"}, mch)).To(Succeed())
+			pullSecret, _, _ := unstructured.NestedString(mch.Object, "spec", "imagePullSecret")
+			Expect(pullSecret).To(Equal("custom-secret"))
+			ca, _, _ := unstructured.NestedString(mch.Object, "spec", "customCAConfigmap")
+			Expect(ca).To(Equal("custom-ca"))
+			disabled, _, _ := unstructured.NestedBool(mch.Object, "spec", "disableHubSelfManagement")
+			Expect(disabled).To(BeTrue())
+		})
+	})
+
+	Describe("ensureProvisioningConfiguration", func() {
+		It("creates Provisioning CR when not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureProvisioningConfiguration(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			prov := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			prov.SetGroupVersionKind(schema.GroupVersionKind{Group: "metal3.io", Version: "v1alpha1", Kind: "Provisioning"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "provisioning-configuration"}, prov)).To(Succeed())
+			net, _, _ := unstructured.NestedString(prov.Object, "spec", "provisioningNetwork")
+			Expect(net).To(Equal("Disabled"))
+			watchAll, _, _ := unstructured.NestedBool(prov.Object, "spec", "watchAllNamespaces")
+			Expect(watchAll).To(BeTrue())
+		})
+
+		It("updates existing Provisioning CR when settings differ", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "metal3.io/v1alpha1",
+				"kind":       "Provisioning",
+				"metadata":   map[string]interface{}{"name": "provisioning-configuration"},
+				"spec": map[string]interface{}{
+					"provisioningNetwork": "Managed",
+					"watchAllNamespaces":  false,
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureProvisioningConfiguration(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{Group: "metal3.io", Version: "v1alpha1", Kind: "Provisioning"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "provisioning-configuration"}, updated)).To(Succeed())
+			net, _, _ := unstructured.NestedString(updated.Object, "spec", "provisioningNetwork")
+			Expect(net).To(Equal("Disabled"))
+		})
+
+		It("is idempotent when already configured correctly", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "metal3.io/v1alpha1",
+				"kind":       "Provisioning",
+				"metadata":   map[string]interface{}{"name": "provisioning-configuration"},
+				"spec": map[string]interface{}{
+					"provisioningNetwork": "Disabled",
+					"watchAllNamespaces":  true,
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureProvisioningConfiguration(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureAgentServiceConfig", func() {
+		It("creates AgentServiceConfig with correct storage and OS images", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "mirror.example.com:8443",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:             true,
+								DatabaseStorageSize: "100Gi",
+								StorageClass:        "fast-storage",
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12", CpuArchitecture: "x86_64"},
+								},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAgentServiceConfig(ctx, platform, "http://rhcos-server.mirror-operator-system.svc:8080")
+			Expect(err).NotTo(HaveOccurred())
+
+			asc := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			asc.SetGroupVersionKind(schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentServiceConfig"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "agent"}, asc)).To(Succeed())
+
+			osImages, _, _ := unstructured.NestedSlice(asc.Object, "spec", "osImages")
+			Expect(len(osImages)).To(Equal(1))
+			osImage := osImages[0].(map[string]interface{})
+			Expect(osImage["openshiftVersion"]).To(Equal("4.18.12"))
+		})
+
+		It("is idempotent — returns nil when AgentServiceConfig already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "agent-install.openshift.io/v1beta1",
+				"kind":       "AgentServiceConfig",
+				"metadata":   map[string]interface{}{"name": "agent"},
+				"spec":       map[string]interface{}{},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAgentServiceConfig(ctx, platform, "http://rhcos.svc:8080")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureInfraEnv", func() {
+		It("returns nil when InfraEnv config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when InfraEnv is not enabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:  true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{Enabled: false},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("is idempotent — returns nil when InfraEnv already exists", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "agent-install.openshift.io/v1beta1",
+				"kind":       "InfraEnv",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-infraenv", "namespace": architectNamespace},
+				"spec":       map[string]interface{}{},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:  true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureACMCredential", func() {
+		It("returns nil when credential config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{Enabled: true},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMCredential(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when credential is not enabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:    true,
+								Credential: &mirrorv1.CredentialConfig{Enabled: false},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMCredential(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates credential secret with pull secret data", func() {
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Credential: &mirrorv1.CredentialConfig{
+									Enabled:    true,
+									BaseDomain: "example.com",
+								},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pullSecret).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMCredential(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cred := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-credential", Namespace: "multicluster-engine"}, cred)).To(Succeed())
+			pullSecretValue := cred.StringData["pullSecret"]
+			if pullSecretValue == "" {
+				pullSecretValue = string(cred.Data["pullSecret"])
+			}
+		})
+
+		It("is idempotent — returns nil when credential already exists", func() {
+			existing := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-credential", Namespace: "multicluster-engine"},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Credential: &mirrorv1.CredentialConfig{
+									Enabled: true,
+								},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureACMCredential(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
 })
