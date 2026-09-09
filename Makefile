@@ -58,7 +58,7 @@ MIRROR_IMG ?= quay.io/mathianasj/oc-mirror:v2
 ARCHITECT_FRONTEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-frontend:latest
 ARCHITECT_BACKEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-backend:latest
 ARCHITECT_CONSOLE_PLUGIN_IMG ?= quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
-SKOPEO_IMG ?= registry.access.redhat.com/ubi9/skopeo:1.18.0
+SKOPEO_IMG ?= registry.access.redhat.com/rhel9/skopeo:9.8-1788328795
 UBI9_IMG ?= registry.access.redhat.com/ubi9/ubi:latest
 UBI9_MINIMAL_IMG ?= registry.access.redhat.com/ubi9/ubi-minimal:latest
 
@@ -328,6 +328,14 @@ bundle-related-images: yq ## Resolve image digests and inject relatedImages + en
 	$(eval SKOPEO_BASE := $(firstword $(subst :, ,$(SKOPEO_IMG))))
 	$(eval UBI9_BASE := $(firstword $(subst :, ,$(UBI9_IMG))))
 	$(eval UBI9_MINIMAL_BASE := $(firstword $(subst :, ,$(UBI9_MINIMAL_IMG))))
+	@$(if $(IMG_DIGEST),,$(error Failed to resolve digest for $(IMG)))
+	@$(if $(MIRROR_DIGEST),,$(error Failed to resolve digest for $(MIRROR_IMG)))
+	@$(if $(FRONTEND_DIGEST),,$(error Failed to resolve digest for $(ARCHITECT_FRONTEND_IMG)))
+	@$(if $(BACKEND_DIGEST),,$(error Failed to resolve digest for $(ARCHITECT_BACKEND_IMG)))
+	@$(if $(CONSOLE_PLUGIN_DIGEST),,$(error Failed to resolve digest for $(ARCHITECT_CONSOLE_PLUGIN_IMG)))
+	@$(if $(SKOPEO_DIGEST),,$(error Failed to resolve digest for $(SKOPEO_IMG)))
+	@$(if $(UBI9_DIGEST),,$(error Failed to resolve digest for $(UBI9_IMG)))
+	@$(if $(UBI9_MINIMAL_DIGEST),,$(error Failed to resolve digest for $(UBI9_MINIMAL_IMG)))
 	@echo "Injecting relatedImages into CSV..."
 	$(YQ) -i '.spec.relatedImages = [{"name": "manager", "image": "$(IMG_BASE)@$(IMG_DIGEST)"}, {"name": "oc-mirror", "image": "$(MIRROR_BASE)@$(MIRROR_DIGEST)"}, {"name": "architect-frontend", "image": "$(FRONTEND_BASE)@$(FRONTEND_DIGEST)"}, {"name": "architect-backend", "image": "$(BACKEND_BASE)@$(BACKEND_DIGEST)"}, {"name": "architect-console-plugin", "image": "$(CONSOLE_PLUGIN_BASE)@$(CONSOLE_PLUGIN_DIGEST)"}, {"name": "skopeo", "image": "$(SKOPEO_BASE)@$(SKOPEO_DIGEST)"}, {"name": "ubi9", "image": "$(UBI9_BASE)@$(UBI9_DIGEST)"}, {"name": "ubi9-minimal", "image": "$(UBI9_MINIMAL_BASE)@$(UBI9_MINIMAL_DIGEST)"}]' $(CSV_PATH)
 	@echo "Injecting RELATED_IMAGE env vars into CSV..."
