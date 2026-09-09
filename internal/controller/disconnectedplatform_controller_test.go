@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,6 +25,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
@@ -4249,6 +4251,594 @@ notifier:
 			}
 			err := r.ensureNamespace(ctx, "existing-ns")
 			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureTrustifyOIDCClient", func() {
+		It("creates a new public OIDC client", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/clients", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "frontend", "tpa.example.com", "test-token", ts.Client(), true)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("updates an existing confidential client and stores secret", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/clients", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode([]map[string]interface{}{
+						{"id": "uuid-123", "clientId": "cli"},
+					})
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/uuid-123", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "PUT" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/uuid-123/client-secret", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"value": "test-secret"})
+			})
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-uuid", "name": "read:document"},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/uuid-123/default-client-scopes/scope-uuid", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureTrustifyOIDCClient(ctx, keycloakHost, "trustify", "cli", "tpa.example.com", "test-token", ts.Client(), false)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtpa-oidc-cli-secret", Namespace: architectNamespace}, secret)).To(Succeed())
+		})
+	})
+
+	Describe("assignScopeToTrustifyClients", func() {
+		It("assigns scopes to frontend and cli clients", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/clients", func(w http.ResponseWriter, r *http.Request) {
+				clientID := r.URL.Query().Get("clientId")
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "uuid-" + clientID, "clientId": clientID},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-read", "name": "read:document"},
+					{"id": "scope-create", "name": "create:document"},
+				})
+			})
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "PUT" || r.Method == "POST" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if r.Method == "GET" {
+					if strings.Contains(r.URL.Path, "service-account-user") {
+						json.NewEncoder(w).Encode(map[string]interface{}{"id": "sa-uuid"})
+						return
+					}
+					if strings.Contains(r.URL.Path, "/roles/") {
+						json.NewEncoder(w).Encode(map[string]interface{}{"id": "role-uuid", "name": "trustify-manager"})
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignScopeToTrustifyClients(ctx, keycloakHost, "trustify", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("assignReadScopeToClient", func() {
+		It("delegates to assignScopeToClient with read:document", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-read-uuid", "name": "read:document"},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/client-uuid-1/default-client-scopes/scope-read-uuid", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignReadScopeToClient(ctx, keycloakHost, "trustify", "client-uuid-1", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("assignRoleToServiceAccountByClient", func() {
+		It("assigns role to service account by client UUID", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/roles", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/trustify/roles/trustify-manager", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"id": "role-uuid", "name": "trustify-manager"})
+			})
+			mux.HandleFunc("/admin/realms/trustify/clients/client-uuid/service-account-user", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"id": "sa-user-uuid"})
+			})
+			mux.HandleFunc("/admin/realms/trustify/users/sa-user-uuid/role-mappings/realm", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignRoleToServiceAccountByClient(ctx, keycloakHost, "trustify", "client-uuid", "trustify-manager", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("assignRoleToServiceAccount", func() {
+		It("assigns role to service account by username", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/users", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "user-uuid", "username": "service-account-cli"},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/roles/trustify-manager", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"id": "role-uuid", "name": "trustify-manager"})
+			})
+			mux.HandleFunc("/admin/realms/trustify/users/user-uuid/role-mappings/realm", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignRoleToServiceAccount(ctx, keycloakHost, "trustify", "service-account-cli", "trustify-manager", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns error when user not found", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/users", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignRoleToServiceAccount(ctx, keycloakHost, "trustify", "nonexistent-user", "trustify-manager", "test-token", ts.Client())
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not found"))
+		})
+
+		It("handles 409 conflict (already assigned) gracefully", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/trustify/users", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "user-uuid", "username": "service-account-cli"},
+				})
+			})
+			mux.HandleFunc("/admin/realms/trustify/roles/trustify-manager", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"id": "role-uuid", "name": "trustify-manager"})
+			})
+			mux.HandleFunc("/admin/realms/trustify/users/user-uuid/role-mappings/realm", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.assignRoleToServiceAccount(ctx, keycloakHost, "trustify", "service-account-cli", "trustify-manager", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("getClientScopeIDByName", func() {
+		It("returns scope ID when found", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-1", "name": "email"},
+					{"id": "scope-2", "name": "profile"},
+				})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			id, err := r.getClientScopeIDByName(ctx, keycloakHost, "test-realm", "email", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(id).To(Equal("scope-1"))
+		})
+
+		It("returns empty string when scope not found", func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/admin/realms/test-realm/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode([]map[string]interface{}{
+					{"id": "scope-1", "name": "email"},
+				})
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			id, err := r.getClientScopeIDByName(ctx, keycloakHost, "test-realm", "nonexistent", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(id).To(BeEmpty())
+		})
+	})
+
+	Describe("ensureEmailVerifiedClientScope", func() {
+		It("creates scope and mappers when they don't exist", func() {
+			mux := http.NewServeMux()
+			callCount := 0
+			mux.HandleFunc("/admin/realms/test-realm/client-scopes", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					callCount++
+					if callCount == 1 {
+						json.NewEncoder(w).Encode([]map[string]interface{}{})
+					} else {
+						json.NewEncoder(w).Encode([]map[string]interface{}{
+							{"id": "email-scope-id", "name": "email"},
+						})
+					}
+					return
+				}
+				if r.Method == "POST" {
+					w.Header().Set("Location", "/admin/realms/test-realm/client-scopes/new-scope-id")
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			mux.HandleFunc("/admin/realms/test-realm/client-scopes/new-scope-id/protocol-mappers/models", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode([]map[string]interface{}{})
+					return
+				}
+				if r.Method == "POST" {
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			})
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "PUT" || r.Method == "DELETE" {
+					w.WriteHeader(http.StatusNoContent)
+				}
+			})
+			ts := httptest.NewTLSServer(mux)
+			defer ts.Close()
+			keycloakHost := strings.TrimPrefix(ts.URL, "https://")
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureEmailVerifiedClientScope(ctx, keycloakHost, "test-client", "test-realm", "client-uuid", "test-token", ts.Client())
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureRHTPAPostgreSQL", func() {
+		It("creates all PostgreSQL resources on first run", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			host, dbName, user, password, err := r.ensureRHTPAPostgreSQL(ctx, "50Gi", "200Gi")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(host).To(ContainSubstring("rhtpa-postgresql"))
+			Expect(dbName).To(Equal("rhtpadb"))
+			Expect(user).To(Equal("rhtpa"))
+			Expect(password).NotTo(BeEmpty())
+
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtpa-db-credentials", Namespace: architectNamespace}, secret)).To(Succeed())
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql-data", Namespace: architectNamespace}, pvc)).To(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql", Namespace: architectNamespace}, sts)).To(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql", Namespace: architectNamespace}, svc)).To(Succeed())
+		})
+
+		It("reads password from existing secret on subsequent runs", func() {
+			existingSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-db-credentials", Namespace: architectNamespace},
+				Data: map[string][]byte{
+					"username": []byte("rhtpa"),
+					"password": []byte("existing-password"),
+					"database": []byte("rhtpadb"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existingSecret).Build(),
+				Scheme: testScheme,
+			}
+			_, _, _, password, err := r.ensureRHTPAPostgreSQL(ctx, "", "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(password).To(Equal("existing-password"))
+		})
+	})
+
+	Describe("ensureManagedPostgreSQL", func() {
+		It("creates PVC, StatefulSet, and Service for Keycloak", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureManagedPostgreSQL(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql-data", Namespace: architectNamespace}, pvc)).To(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql", Namespace: architectNamespace}, sts)).To(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql", Namespace: architectNamespace}, svc)).To(Succeed())
+		})
+
+		It("is idempotent when resources already exist", func() {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql-data", Namespace: architectNamespace},
+			}
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace},
+			}
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pvc, sts, svc).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureManagedPostgreSQL(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("restartBackendPods", func() {
+		It("deletes backend pods to restart them", func() {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "backend-pod-1",
+					Namespace: architectNamespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/component": "backend",
+						"app.kubernetes.io/part-of":   "mirror-operator",
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pod).Build(),
+				Scheme: testScheme,
+			}
+			err := r.restartBackendPods(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			podList := &corev1.PodList{}
+			Expect(r.List(ctx, podList, client.InNamespace(architectNamespace))).To(Succeed())
+			Expect(podList.Items).To(BeEmpty())
+		})
+
+		It("succeeds when no backend pods exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.restartBackendPods(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("getServiceCACert", func() {
+		It("returns CA cert from ConfigMap", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "signing-cabundle", Namespace: "openshift-service-ca"},
+				Data:       map[string]string{"ca-bundle.crt": "-----BEGIN CERTIFICATE-----\nMIIC..."},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cm).Build(),
+				Scheme: testScheme,
+			}
+			cert, err := r.getServiceCACert(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cert).To(ContainSubstring("BEGIN CERTIFICATE"))
+		})
+
+		It("returns error when ConfigMap not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.getServiceCACert(ctx)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("returns error when ca-bundle.crt key missing", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "signing-cabundle", Namespace: "openshift-service-ca"},
+				Data:       map[string]string{"other-key": "data"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cm).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.getServiceCACert(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("ca-bundle.crt not found"))
+		})
+	})
+
+	Describe("deleteConsolePluginResources", func() {
+		It("deletes ConsolePlugin, Service, and Deployment", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.deleteConsolePluginResources(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("deleteArchitectFrontendResources", func() {
+		It("returns nil when resources don't exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.deleteArchitectFrontendResources(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileArtifactFileServer", func() {
+		It("skips when no completed pipelines exist", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: architectNamespace},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileArtifactFileServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates deployment and service for completed pipelines with bound PVCs", func() {
+			pipeline := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: architectNamespace},
+				Status: mirrorv1.CollectionPipelineStatus{
+					Phase: "Complete",
+				},
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts-test-pipeline", Namespace: architectNamespace},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Phase: corev1.ClaimBound,
+				},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: architectNamespace},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pvc).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileArtifactFileServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "artifact-fileserver", Namespace: architectNamespace}, dep)).To(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "artifact-fileserver", Namespace: architectNamespace}, svc)).To(Succeed())
+		})
+	})
+
+	Describe("autoExpandPVC", func() {
+		It("does not expand when PVC is within capacity limits", func() {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: architectNamespace},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("50Gi"),
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pvc).Build(),
+				Scheme: testScheme,
+			}
+			logger := log.FromContext(ctx)
+			r.autoExpandPVC(ctx, pvc, "200Gi", logger)
 		})
 	})
 })
