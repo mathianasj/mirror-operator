@@ -107,7 +107,7 @@ func main() {
 	var ubi9Image string
 	var ubi9MinimalImage string
 	flag.StringVar(&skopeoImage, "skopeo-image",
-		envOrDefault("RELATED_IMAGE_SKOPEO", "quay.io/skopeo/stable:latest"),
+		envOrDefault("RELATED_IMAGE_SKOPEO", "registry.redhat.io/rhel9/skopeo@sha256:d75fce32774b5d2ddfc840c76af374ddfe0c9ef611f1a5b15b2fe34e46548f9d"),
 		"skopeo container image for image copy tasks")
 	flag.StringVar(&ubi9Image, "ubi9-image",
 		envOrDefault("RELATED_IMAGE_UBI9", "registry.access.redhat.com/ubi9/ubi:latest"),
