@@ -58,7 +58,7 @@ MIRROR_IMG ?= quay.io/mathianasj/oc-mirror:v2
 ARCHITECT_FRONTEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-frontend:latest
 ARCHITECT_BACKEND_IMG ?= quay.io/mathianasj/openshift-airgap-architect-backend:latest
 ARCHITECT_CONSOLE_PLUGIN_IMG ?= quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
-SKOPEO_IMG ?= quay.io/skopeo/stable:latest
+SKOPEO_IMG ?= registry.access.redhat.com/ubi9/skopeo:1.18.0
 UBI9_IMG ?= registry.access.redhat.com/ubi9/ubi:latest
 UBI9_MINIMAL_IMG ?= registry.access.redhat.com/ubi9/ubi-minimal:latest
 
