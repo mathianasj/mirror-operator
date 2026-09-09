@@ -1659,4 +1659,45 @@ mirror:
 			Expect(result).To(BeEmpty())
 		})
 	})
+
+	Describe("getClusterDomain", func() {
+		It("returns domain from cluster Ingress config", func() {
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Ingress",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"spec": map[string]interface{}{
+					"domain": "apps.my-cluster.example.com",
+				},
+			}}
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ingress).Build(),
+				Scheme: testScheme,
+			}
+			domain := r.getClusterDomain(ctx)
+			Expect(domain).To(Equal("apps.my-cluster.example.com"))
+		})
+
+		It("returns fallback when Ingress not found", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			domain := r.getClusterDomain(ctx)
+			Expect(domain).To(Equal("cluster.example.com"))
+		})
+	})
+
+	Describe("getTPAAndKeycloakHosts", func() {
+		It("returns empty strings when no TPA instances exist", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			tpaHost, keycloakHost, realm := r.getTPAAndKeycloakHosts(ctx)
+			Expect(tpaHost).To(BeEmpty())
+			Expect(keycloakHost).To(BeEmpty())
+			Expect(realm).To(BeEmpty())
+		})
+	})
 })
