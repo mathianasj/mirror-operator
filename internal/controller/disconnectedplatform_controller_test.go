@@ -4841,4 +4841,428 @@ notifier:
 			r.autoExpandPVC(ctx, pvc, "200Gi", logger)
 		})
 	})
+
+	Describe("checkKeycloakHealth", func() {
+		It("returns nil when RHTAS config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkKeycloakHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when Keycloak is ready", func() {
+			kc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "k8s.keycloak.org/v2alpha1",
+				"kind":       "Keycloak",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-keycloak", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "True"},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(kc).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkKeycloakHealth(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns error when Keycloak not ready", func() {
+			kc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "k8s.keycloak.org/v2alpha1",
+				"kind":       "Keycloak",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-keycloak", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "False", "message": "initializing"},
+					},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(kc).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkKeycloakHealth(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not ready"))
+		})
+
+		It("returns error when Keycloak resource not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkKeycloakHealth(ctx, platform)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("performRHTASHealthChecks", func() {
+		It("returns nil when RHTAS config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      "connected",
+					Connected: &mirrorv1.ConnectedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.performRHTASHealthChecks(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when managed OIDC is enabled but calls sub-checks", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.performRHTASHealthChecks(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("checkAndFixTUFKeys", func() {
+		It("returns nil when Securesign not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkAndFixTUFKeys(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when TUF keys are clean (no tsa.certchain.pem)", func() {
+			securesign := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"spec": map[string]interface{}{
+					"tuf": map[string]interface{}{
+						"keys": []interface{}{
+							map[string]interface{}{"name": "fulcio_v1.crt.pem"},
+							map[string]interface{}{"name": "rekor.pub"},
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkAndFixTUFKeys(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("removes tsa.certchain.pem from TUF keys", func() {
+			securesign := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+				"spec": map[string]interface{}{
+					"tuf": map[string]interface{}{
+						"keys": []interface{}{
+							map[string]interface{}{"name": "fulcio_v1.crt.pem"},
+							map[string]interface{}{"name": "tsa.certchain.pem"},
+							map[string]interface{}{"name": "rekor.pub"},
+						},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkAndFixTUFKeys(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(securesignGVK)
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-securesign", Namespace: architectNamespace}, updated)).To(Succeed())
+			keys, _, _ := unstructured.NestedSlice(updated.Object, "spec", "tuf", "keys")
+			Expect(len(keys)).To(Equal(2))
+			for _, key := range keys {
+				keyMap := key.(map[string]interface{})
+				Expect(keyMap["name"]).NotTo(Equal("tsa.certchain.pem"))
+			}
+		})
+	})
+
+	Describe("checkFulcioKeycloakConnectivity", func() {
+		It("returns nil when Securesign not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkFulcioKeycloakConnectivity(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when no Fulcio pods exist", func() {
+			securesign := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkFulcioKeycloakConnectivity(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when Fulcio pod has low restart count", func() {
+			securesign := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+			}}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fulcio-pod-1",
+					Namespace: architectNamespace,
+					Labels:    map[string]string{"app": "fulcio-server"},
+				},
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{RestartCount: 1},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign, pod).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkFulcioKeycloakConnectivity(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("restarts Fulcio pod when high restart count and Keycloak is ready", func() {
+			securesign := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtas.redhat.com/v1alpha1",
+				"kind":       "Securesign",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-securesign", "namespace": architectNamespace},
+			}}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fulcio-pod-1",
+					Namespace: architectNamespace,
+					Labels:    map[string]string{"app": "fulcio-server"},
+				},
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{RestartCount: 5},
+					},
+				},
+			}
+			kc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "k8s.keycloak.org/v2alpha1",
+				"kind":       "Keycloak",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-keycloak", "namespace": architectNamespace},
+				"status": map[string]interface{}{
+					"conditions": []interface{}{
+						map[string]interface{}{"type": "Ready", "status": "True"},
+					},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign, pod, kc).Build(),
+				Scheme: testScheme,
+			}
+			err := r.checkFulcioKeycloakConnectivity(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			podList := &corev1.PodList{}
+			Expect(r.List(ctx, podList, client.InNamespace(architectNamespace), client.MatchingLabels{"app": "fulcio-server"})).To(Succeed())
+			Expect(podList.Items).To(BeEmpty())
+		})
+	})
+
+	Describe("updateArchitectRoute", func() {
+		It("updates an existing route", func() {
+			existing := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1",
+				"kind":       "Route",
+				"metadata":   map[string]interface{}{"name": "test-route", "namespace": architectNamespace},
+				"spec": map[string]interface{}{
+					"to": map[string]interface{}{"kind": "Service", "name": "old-service"},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateArchitectRoute(ctx, platform, "test-route", nil, "frontend-svc")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns error when route not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateArchitectRoute(ctx, platform, "nonexistent-route", nil, "frontend-svc")
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("enableConsolePluginInOperator", func() {
+		It("adds plugin to existing console operator", func() {
+			console := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.openshift.io/v1",
+				"kind":       "Console",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"spec":       map[string]interface{}{},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(console).Build(),
+				Scheme: testScheme,
+			}
+			err := r.enableConsolePluginInOperator(ctx, "airgap-architect-plugin")
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{Group: "operator.openshift.io", Version: "v1", Kind: "Console"})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "cluster"}, updated)).To(Succeed())
+			plugins, _, _ := unstructured.NestedStringSlice(updated.Object, "spec", "plugins")
+			Expect(plugins).To(ContainElement("airgap-architect-plugin"))
+		})
+
+		It("is idempotent when plugin already enabled", func() {
+			console := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.openshift.io/v1",
+				"kind":       "Console",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"spec": map[string]interface{}{
+					"plugins": []interface{}{"airgap-architect-plugin"},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(console).Build(),
+				Scheme: testScheme,
+			}
+			err := r.enableConsolePluginInOperator(ctx, "airgap-architect-plugin")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("updateConsolePluginCR", func() {
+		It("updates ConsolePlugin spec with CA cert", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "signing-cabundle", Namespace: "openshift-service-ca"},
+				Data:       map[string]string{"ca-bundle.crt": "-----BEGIN CERTIFICATE-----\ntest-cert"},
+			}
+			consolePlugin := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "console.openshift.io/v1",
+				"kind":       "ConsolePlugin",
+				"metadata":   map[string]interface{}{"name": "airgap-architect-plugin"},
+				"spec": map[string]interface{}{
+					"displayName": "Airgap Architect",
+					"backend":     map[string]interface{}{},
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cm, consolePlugin).Build(),
+				Scheme: testScheme,
+			}
+			err := r.updateConsolePluginCR(ctx, platform, consolePlugin, "airgap-architect-plugin")
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileAirgappedACM", func() {
+		It("returns false when ACM package not available", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			ready, err := r.reconcileAirgappedACM(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+	})
 })
