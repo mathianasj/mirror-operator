@@ -10016,25 +10016,32 @@ AUTHFILE="/workspace/pull-secret/.dockerconfigjson"
 
 # relatedImages are mirrored by digest under the full namespace path
 # (e.g. quay.io/org/image@sha256:abc -> intermediate/org/image@sha256:abc)
-# Strip digest from archive tag so podman load produces a usable RepoTag
-strip_digest() {
-  echo "$1" | sed 's|@sha256:.*||'
+# Strip tag or digest so we can append a clean :latest for the archive
+strip_ref() {
+  local ref="$1"
+  # Remove digest first (@sha256:...)
+  ref="${ref%%@*}"
+  # Remove tag (:latest, :v1, etc) - only after the last /
+  local base="${ref%/*}"
+  local name="${ref##*/}"
+  name="${name%%:*}"
+  echo "${base}/${name}"
 }
 
 echo "Copying frontend image..."
 FRONTEND_PATH=$(echo "$(params.architect-frontend-image)" | sed 's|^[^/]*/||')
-FRONTEND_TAG=$(strip_digest "$(params.architect-frontend-image)")
+FRONTEND_NAME=$(strip_ref "$(params.architect-frontend-image)")
 skopeo copy --authfile="$AUTHFILE" \
   "docker://${INTERMEDIATE_REGISTRY}/${FRONTEND_PATH}" \
-  "docker-archive:/workspace/output/airgap-architect-frontend.tar.gz:${FRONTEND_TAG}:latest"
+  "docker-archive:/workspace/output/airgap-architect-frontend.tar.gz:${FRONTEND_NAME}:latest"
 echo "  ✓ Frontend exported"
 
 echo "Copying backend image..."
 BACKEND_PATH=$(echo "$(params.architect-backend-image)" | sed 's|^[^/]*/||')
-BACKEND_TAG=$(strip_digest "$(params.architect-backend-image)")
+BACKEND_NAME=$(strip_ref "$(params.architect-backend-image)")
 skopeo copy --authfile="$AUTHFILE" \
   "docker://${INTERMEDIATE_REGISTRY}/${BACKEND_PATH}" \
-  "docker-archive:/workspace/output/airgap-architect-backend.tar.gz:${BACKEND_TAG}:latest"
+  "docker-archive:/workspace/output/airgap-architect-backend.tar.gz:${BACKEND_NAME}:latest"
 echo "  ✓ Backend exported"
 
 echo "Images exported successfully:"
