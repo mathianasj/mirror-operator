@@ -9337,6 +9337,45 @@ else
   echo "No ITMS file found"
 fi
 
+# Add per-image entries for additionalImages from the ImageSetConfig.
+# oc-mirror flattens docker.io paths when storing in the intermediate registry
+# (e.g. docker.io/amazon/aws-cli -> mirror/aws-cli), so the top-level docker.io
+# fallback produces the wrong path. These specific entries take precedence.
+echo ""
+echo "=== Adding additionalImages entries from ImageSetConfig ==="
+if [ -f "/workspace/config/imageset-config.yaml" ]; then
+  IN_ADDITIONAL=0
+  while IFS= read -r line; do
+    case "$line" in
+      *additionalImages:*) IN_ADDITIONAL=1 ;;
+      *:*) [ "$IN_ADDITIONAL" -eq 1 ] && case "$line" in *"name:"*) ;; *) IN_ADDITIONAL=0 ;; esac ;;
+    esac
+    if [ "$IN_ADDITIONAL" -eq 1 ]; then
+      IMG_REF=$(echo "$line" | grep "name:" | sed 's/.*name:[[:space:]]*//' | tr -d "'" | tr -d '"')
+      [ -z "$IMG_REF" ] && continue
+
+      # Normalize: add docker.io/ prefix for short-form refs (no dots before first slash)
+      NORMALIZED="$IMG_REF"
+      PREFIX=$(echo "$IMG_REF" | cut -d/ -f1)
+      case "$PREFIX" in
+        *.*|*:*|localhost) ;;
+        *) NORMALIZED="docker.io/$IMG_REF" ;;
+      esac
+
+      # Extract image name (last path component without tag/digest)
+      IMAGE_NAME=$(echo "$NORMALIZED" | sed 's|^[^/]*/||' | sed 's|.*/||' | sed 's|[@:].*||')
+      FULL_SOURCE=$(echo "$NORMALIZED" | sed 's|[@:].*||')
+
+      # Only add if not already covered by IDMS/ITMS entries
+      if ! grep -q "location=\"$FULL_SOURCE\"" "$CONF_FILE" 2>/dev/null; then
+        printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s/%s"\n' \
+          "$FULL_SOURCE" "$INTERMEDIATE_REGISTRY" "$IMAGE_NAME" >> "$CONF_FILE"
+        echo "  Added: $FULL_SOURCE -> $INTERMEDIATE_REGISTRY/$IMAGE_NAME"
+      fi
+    fi
+  done < /workspace/config/imageset-config.yaml
+fi
+
 # Block CDN access that Quay might redirect to
 printf '\n# Block CDN access\n' >> "$CONF_FILE"
 for cdn in cdn01.quay.io cdn02.quay.io cdn03.quay.io; do
@@ -9950,7 +9989,7 @@ fi
 			},
 		},
 
-		// Task 10: export-architect-images (save frontend/backend/plugin images as tarballs from intermediate registry)
+		// Task 10: export-architect-images (save frontend/backend/plugin images as tarballs)
 		{
 			"name":     "export-architect-images",
 			"retries":  2,
@@ -9965,28 +10004,34 @@ fi
 set -ex
 echo "=== Exporting Airgap Architect images from intermediate registry ==="
 
-# Remove old architect image tarballs if they exist (docker-archive doesn't support overwriting)
 rm -f /workspace/output/airgap-architect-frontend.tar.gz
 rm -f /workspace/output/airgap-architect-backend.tar.gz
 
-# Export from intermediate registry (images were mirrored there as additionalImages)
 INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
+AUTHFILE="/workspace/pull-secret/.dockerconfigjson"
 
-# Use skopeo to copy images to docker-archive format (compatible with podman load)
-echo "Copying frontend image from intermediate registry..."
-# oc-mirror strips the source registry from the path (quay.io/mathianasj/... -> mathianasj/...)
+# relatedImages are mirrored by digest under the full namespace path
+# (e.g. quay.io/org/image@sha256:abc -> intermediate/org/image@sha256:abc)
+# Strip digest from archive tag so podman load produces a usable RepoTag
+strip_digest() {
+  echo "$1" | sed 's|@sha256:.*||'
+}
+
+echo "Copying frontend image..."
 FRONTEND_PATH=$(echo "$(params.architect-frontend-image)" | sed 's|^[^/]*/||')
-skopeo copy \
-  --authfile=/workspace/pull-secret/.dockerconfigjson \
-  docker://${INTERMEDIATE_REGISTRY}/${FRONTEND_PATH} \
-  docker-archive:/workspace/output/airgap-architect-frontend.tar.gz:$(params.architect-frontend-image)
+FRONTEND_TAG=$(strip_digest "$(params.architect-frontend-image)")
+skopeo copy --authfile="$AUTHFILE" \
+  "docker://${INTERMEDIATE_REGISTRY}/${FRONTEND_PATH}" \
+  "docker-archive:/workspace/output/airgap-architect-frontend.tar.gz:${FRONTEND_TAG}:latest"
+echo "  ✓ Frontend exported"
 
-echo "Copying backend image from intermediate registry..."
+echo "Copying backend image..."
 BACKEND_PATH=$(echo "$(params.architect-backend-image)" | sed 's|^[^/]*/||')
-skopeo copy \
-  --authfile=/workspace/pull-secret/.dockerconfigjson \
-  docker://${INTERMEDIATE_REGISTRY}/${BACKEND_PATH} \
-  docker-archive:/workspace/output/airgap-architect-backend.tar.gz:$(params.architect-backend-image)
+BACKEND_TAG=$(strip_digest "$(params.architect-backend-image)")
+skopeo copy --authfile="$AUTHFILE" \
+  "docker://${INTERMEDIATE_REGISTRY}/${BACKEND_PATH}" \
+  "docker-archive:/workspace/output/airgap-architect-backend.tar.gz:${BACKEND_TAG}:latest"
+echo "  ✓ Backend exported"
 
 echo "Images exported successfully:"
 ls -lh /workspace/output/airgap-architect-*.tar.gz
