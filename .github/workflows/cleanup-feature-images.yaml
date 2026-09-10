@@ -1,0 +1,40 @@
+name: Cleanup Feature Branch Images
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+jobs:
+  cleanup:
+    if: startsWith(github.head_ref, 'feature/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Derive tag from branch name
+        id: tag
+        run: |
+          BRANCH=$(echo "${{ github.head_ref }}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-20)
+          echo "branch_tag=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete catalog image tag
+        continue-on-error: true
+        run: |
+          REPO="mathianasj/mirror-operator-catalog"
+          TAG="${{ steps.tag.outputs.branch_tag }}"
+          echo "Deleting quay.io/${REPO}:${TAG}"
+          skopeo delete --creds "${{ secrets.QUAY_USERNAME }}:${{ secrets.QUAY_PASSWORD }}" \
+            "docker://quay.io/${REPO}:${TAG}" || echo "Tag not found or already deleted"
+
+      - name: Delete bundle image tags
+        continue-on-error: true
+        run: |
+          REPO="mathianasj/mirror-operator-bundle"
+          TAG_PREFIX="${{ steps.tag.outputs.branch_tag }}"
+          echo "Listing tags matching ${TAG_PREFIX} in quay.io/${REPO}"
+          TAGS=$(skopeo list-tags "docker://quay.io/${REPO}" 2>/dev/null | \
+            jq -r ".Tags[] | select(contains(\"${TAG_PREFIX}\"))" || true)
+          for TAG in $TAGS; do
+            echo "Deleting quay.io/${REPO}:${TAG}"
+            skopeo delete --creds "${{ secrets.QUAY_USERNAME }}:${{ secrets.QUAY_PASSWORD }}" \
+              "docker://quay.io/${REPO}:${TAG}" || echo "Failed to delete ${TAG}"
+          done

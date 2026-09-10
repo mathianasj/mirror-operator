@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'feature/**']
     tags: ['v*']
   pull_request:
     branches: [master]
@@ -129,12 +129,12 @@ jobs:
             MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
             PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
             NEXT_PATCH=$((PATCH + 1))
-            BRANCH=$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-            TIMESTAMP=$(date +%s)
-            DEV_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-${BRANCH}.${TIMESTAMP}"
+            BRANCH=$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-20)
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            DEV_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-${BRANCH}.${SHORT_SHA}"
             echo "version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
             echo "bundle_img=${REPO}-bundle:${DEV_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "catalog_img=${REPO}-catalog:latest" >> "$GITHUB_OUTPUT"
+            echo "catalog_img=${REPO}-catalog:${BRANCH}" >> "$GITHUB_OUTPUT"
             echo "catalog_img_latest=" >> "$GITHUB_OUTPUT"
             echo "dev_channel=${BRANCH}" >> "$GITHUB_OUTPUT"
           fi

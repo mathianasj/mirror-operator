@@ -256,15 +256,43 @@ spec:
                       registry)
                     properties:
                       dataPath:
-                        default: /opt/quay
-                        description: Storage path for Quay data
+                        default: /opt/mirror-registry
+                        description: Storage path for registry data on each node
+                        type: string
+                      image:
+                        default: docker.io/library/registry:2
+                        description: Registry container image to use for the podman-hosted
+                          mirror registry
                         type: string
                       port:
-                        default: 8443
-                        description: Quay service port
+                        default: 5000
+                        description: Registry service port
                         format: int32
                         minimum: 1
                         type: integer
+                      replicas:
+                        default: 2
+                        description: Number of master nodes to run the registry on
+                          (minimum 2 for HA)
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      tlsSecret:
+                        description: |-
+                          TLS certificate secret name containing tls.crt and tls.key for the registry
+                          If not provided, the operator will generate self-signed certificates
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
                     type: object
                   quay:
                     description: Quay registry configuration for the airgapped cluster
@@ -284,7 +312,7 @@ spec:
                             type: boolean
                         type: object
                       enabled:
-                        default: true
+                        default: false
                         description: Deploy and manage a Quay registry on the airgapped
                           cluster
                         type: boolean

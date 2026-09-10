@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
+	"github.com/mathianasj/mirror-operator/internal/controller/mirrorregistry"
 )
 
 func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (needsRequeue bool, err error) {
@@ -89,6 +90,11 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 				},
 			)
 		}
+	}
+
+	if err := r.reconcileMirrorRegistry(ctx, platform); err != nil {
+		logger.Error(err, "failed to reconcile mirror registry MachineConfig")
+		needsRequeue = true
 	}
 
 	if err := r.reconcileAirgappedQuay(ctx, platform); err != nil {
@@ -2246,4 +2252,12 @@ echo "Workspace cleaned"
 			},
 		},
 	}
+}
+
+func (r *DisconnectedPlatformReconciler) reconcileMirrorRegistry(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	mgr := &mirrorregistry.Manager{
+		Client: r.Client,
+		Scheme: r.Scheme,
+	}
+	return mgr.Reconcile(ctx, platform)
 }
