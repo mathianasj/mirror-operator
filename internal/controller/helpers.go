@@ -160,6 +160,10 @@ func (r *DisconnectedPlatformReconciler) getClusterSSHKey(ctx context.Context) s
 	return keys[0]
 }
 
+func boolPtr(b bool) *bool {
+	return &b
+}
+
 func containsString(slice []string, s string) bool {
 	for _, item := range slice {
 		if item == s {
@@ -177,4 +181,32 @@ func removeString(slice []string, s string) []string {
 		}
 	}
 	return out
+}
+
+func injectCABundleIntoTasks(tasks []map[string]interface{}) []map[string]interface{} {
+	for i, task := range tasks {
+		ws, _ := task["workspaces"].([]map[string]interface{})
+		ws = append(ws, map[string]interface{}{"name": "cluster-ca-bundle"})
+		tasks[i]["workspaces"] = ws
+
+		taskSpec, ok := task["taskSpec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		steps, ok := taskSpec["steps"].([]map[string]interface{})
+		if !ok {
+			continue
+		}
+		for j, step := range steps {
+			env, _ := step["env"].([]map[string]interface{})
+			env = append(env, map[string]interface{}{
+				"name":  "SSL_CERT_FILE",
+				"value": "/workspace/cluster-ca-bundle/" + clusterCABundleKey,
+			})
+			steps[j]["env"] = env
+		}
+		taskSpec["steps"] = steps
+		tasks[i]["taskSpec"] = taskSpec
+	}
+	return tasks
 }

@@ -241,6 +241,16 @@ func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, imp
 		})
 	}
 
+	workspaces = append(workspaces, pipelinev1.WorkspaceBinding{
+		Name: "cluster-ca-bundle",
+		ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: clusterCABundleName,
+			},
+			Optional: boolPtr(true),
+		},
+	})
+
 	pr := &pipelinev1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("import-%s-", importCR.Name),

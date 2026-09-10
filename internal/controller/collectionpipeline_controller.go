@@ -1016,6 +1016,16 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		},
 	})
 
+	workspaces = append(workspaces, pipelinev1.WorkspaceBinding{
+		Name: "cluster-ca-bundle",
+		ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: clusterCABundleName,
+			},
+			Optional: boolPtr(true),
+		},
+	})
+
 	// Set timeout
 	timeout := &metav1.Duration{Duration: 12 * time.Hour}
 	if pipeline.Spec.Timeout != nil {

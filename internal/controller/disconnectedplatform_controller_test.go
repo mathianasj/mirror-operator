@@ -699,4 +699,172 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			Expect(updated.Status.ImportHistory).To(BeEmpty())
 		})
 	})
+
+	Describe("cluster CA bundle", func() {
+		It("creates the cluster-ca-bundle ConfigMap with injection label", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureClusterCABundle(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			err = r.Get(ctx, types.NamespacedName{Name: clusterCABundleName, Namespace: architectNamespace}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-ca-bundle", "true"))
+		})
+
+		It("does not error when ConfigMap already exists with correct label", func() {
+			existing := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+					Labels: map[string]string{
+						"config.openshift.io/inject-ca-bundle": "true",
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureClusterCABundle(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("includes CA volume and env in backend deployment", func() {
+			container := makeBackendContainerBuilder("", "connected")("test-backend", "test-image:latest", map[string]string{})
+			mounts := container["volumeMounts"].([]interface{})
+			foundMount := false
+			for _, m := range mounts {
+				mount := m.(map[string]interface{})
+				if mount["name"] == clusterCAVolumeName {
+					foundMount = true
+					Expect(mount["mountPath"]).To(Equal(clusterCAMountPath))
+					Expect(mount["readOnly"]).To(BeTrue())
+				}
+			}
+			Expect(foundMount).To(BeTrue(), "expected cluster-ca-bundle volume mount in backend container")
+
+			envVars := container["env"].([]interface{})
+			foundEnv := false
+			for _, e := range envVars {
+				env := e.(map[string]interface{})
+				if env["name"] == "NODE_EXTRA_CA_CERTS" {
+					foundEnv = true
+					Expect(env["value"]).To(Equal(clusterCAFilePath))
+				}
+			}
+			Expect(foundEnv).To(BeTrue(), "expected NODE_EXTRA_CA_CERTS env in backend container")
+		})
+
+		It("includes CA volume and env in frontend deployment", func() {
+			container := frontendContainer("test-frontend", "test-image:latest", map[string]string{"app.kubernetes.io/component": "frontend"}, "", "")
+			mounts := container["volumeMounts"].([]interface{})
+			foundMount := false
+			for _, m := range mounts {
+				mount := m.(map[string]interface{})
+				if mount["name"] == clusterCAVolumeName {
+					foundMount = true
+					Expect(mount["mountPath"]).To(Equal(clusterCAMountPath))
+					Expect(mount["readOnly"]).To(BeTrue())
+				}
+			}
+			Expect(foundMount).To(BeTrue(), "expected cluster-ca-bundle volume mount in frontend container")
+
+			envVars := container["env"].([]interface{})
+			foundEnv := false
+			for _, e := range envVars {
+				env := e.(map[string]interface{})
+				if env["name"] == "NODE_EXTRA_CA_CERTS" {
+					foundEnv = true
+					Expect(env["value"]).To(Equal(clusterCAFilePath))
+				}
+			}
+			Expect(foundEnv).To(BeTrue(), "expected NODE_EXTRA_CA_CERTS env in frontend container")
+		})
+
+		It("includes CA volume in deployment spec for backend and frontend components", func() {
+			for _, component := range []string{"backend", "frontend"} {
+				spec := architectDeploymentSpec("test", "test:latest", 1, map[string]string{"app.kubernetes.io/component": component}, "pull-secret", "openshift-config", func(name, image string, labels map[string]string) map[string]interface{} {
+					return map[string]interface{}{"name": "test"}
+				})
+				volumes, _, _ := unstructured.NestedSlice(map[string]interface{}{"spec": spec}, "spec", "template", "spec", "volumes")
+				foundVol := false
+				for _, v := range volumes {
+					vol := v.(map[string]interface{})
+					if vol["name"] == clusterCAVolumeName {
+						foundVol = true
+						cmSource := vol["configMap"].(map[string]interface{})
+						Expect(cmSource["name"]).To(Equal(clusterCABundleName))
+						Expect(cmSource["optional"]).To(BeTrue())
+					}
+				}
+				Expect(foundVol).To(BeTrue(), "expected cluster-ca-bundle volume in %s deployment spec", component)
+			}
+		})
+	})
+
+	Describe("injectCABundleIntoTasks", func() {
+		It("adds workspace and env to all tasks", func() {
+			tasks := []map[string]interface{}{
+				{
+					"name": "task1",
+					"taskSpec": map[string]interface{}{
+						"steps": []map[string]interface{}{
+							{"name": "step1", "image": "test:latest"},
+						},
+					},
+					"workspaces": []map[string]interface{}{
+						{"name": "output"},
+					},
+				},
+				{
+					"name": "task2",
+					"taskSpec": map[string]interface{}{
+						"steps": []map[string]interface{}{
+							{
+								"name":  "step2",
+								"image": "test:latest",
+								"env": []map[string]interface{}{
+									{"name": "EXISTING_VAR", "value": "val"},
+								},
+							},
+						},
+					},
+					"workspaces": []map[string]interface{}{
+						{"name": "config"},
+					},
+				},
+			}
+
+			result := injectCABundleIntoTasks(tasks)
+			Expect(result).To(HaveLen(2))
+
+			for _, task := range result {
+				ws := task["workspaces"].([]map[string]interface{})
+				lastWs := ws[len(ws)-1]
+				Expect(lastWs["name"]).To(Equal("cluster-ca-bundle"))
+
+				taskSpec := task["taskSpec"].(map[string]interface{})
+				steps := taskSpec["steps"].([]map[string]interface{})
+				for _, step := range steps {
+					env := step["env"].([]map[string]interface{})
+					lastEnv := env[len(env)-1]
+					Expect(lastEnv["name"]).To(Equal("SSL_CERT_FILE"))
+					Expect(lastEnv["value"]).To(Equal("/workspace/cluster-ca-bundle/" + clusterCABundleKey))
+				}
+			}
+
+			// Verify existing env is preserved in task2
+			task2Spec := result[1]["taskSpec"].(map[string]interface{})
+			task2Steps := task2Spec["steps"].([]map[string]interface{})
+			task2Env := task2Steps[0]["env"].([]map[string]interface{})
+			Expect(task2Env).To(HaveLen(2))
+			Expect(task2Env[0]["name"]).To(Equal("EXISTING_VAR"))
+		})
+	})
 })

@@ -52,6 +52,11 @@ const (
 	pullSecretVolumeName  = "pull-secret"
 	pullSecretMountPath   = "/opt/app-root/src/.openshift"
 	pullSecretKey         = ".dockerconfigjson"
+	clusterCABundleName   = "cluster-ca-bundle"
+	clusterCABundleKey    = "ca-bundle.crt"
+	clusterCAMountPath    = "/etc/pki/ca-trust/extracted/pem"
+	clusterCAFilePath     = clusterCAMountPath + "/" + clusterCABundleKey
+	clusterCAVolumeName   = "cluster-ca-bundle"
 )
 
 var (
@@ -5694,6 +5699,30 @@ func (r *DisconnectedPlatformReconciler) ensurePullSecret(ctx context.Context, s
 	return r.Create(ctx, targetSecret)
 }
 
+func (r *DisconnectedPlatformReconciler) ensureClusterCABundle(ctx context.Context) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterCABundleName,
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"config.openshift.io/inject-ca-bundle": "true",
+			},
+		},
+	}
+
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+		if existing.Labels["config.openshift.io/inject-ca-bundle"] == "true" {
+			return nil
+		}
+		existing.Labels["config.openshift.io/inject-ca-bundle"] = "true"
+		return r.Update(ctx, existing)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	return r.Create(ctx, cm)
+}
+
 // addQuayCredentialsIfNeeded adds Quay robot credentials to dockerconfig if managed Quay is deployed
 func (r *DisconnectedPlatformReconciler) addQuayCredentialsIfNeeded(ctx context.Context, dockerconfigJSON []byte) ([]byte, bool, error) {
 	logger := log.FromContext(ctx)
@@ -6006,6 +6035,10 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 		return err
 	}
 
+	if err := r.ensureClusterCABundle(ctx); err != nil {
+		logger.Error(err, "failed to ensure cluster CA bundle ConfigMap")
+	}
+
 	// Ensure ServiceAccount and RBAC for backend
 	if err := r.ensureArchitectServiceAccount(ctx, platform); err != nil {
 		return err
@@ -6229,7 +6262,17 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 				"mountPath": "/var/serving-cert",
 				"readOnly":  true,
 			},
+			map[string]interface{}{
+				"name":      clusterCAVolumeName,
+				"mountPath": clusterCAMountPath,
+				"readOnly":  true,
+			},
 		}
+
+		env = append(env, map[string]interface{}{
+			"name":  "NODE_EXTRA_CA_CERTS",
+			"value": clusterCAFilePath,
+		})
 
 		// Add TLS environment variables
 		env = append(env, map[string]interface{}{
@@ -6418,6 +6461,10 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 			"value": frontendRouteHostname,
 		})
 	}
+	envVars = append(envVars, map[string]interface{}{
+		"name":  "NODE_EXTRA_CA_CERTS",
+		"value": clusterCAFilePath,
+	})
 	return map[string]interface{}{
 		"name":  "airgap-architect-frontend",
 		"image": image,
@@ -6432,6 +6479,11 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 			map[string]interface{}{
 				"name":      "data",
 				"mountPath": "/app/node_modules/.vite",
+			},
+			map[string]interface{}{
+				"name":      clusterCAVolumeName,
+				"mountPath": clusterCAMountPath,
+				"readOnly":  true,
 			},
 		},
 		"readinessProbe": map[string]interface{}{
@@ -6839,6 +6891,16 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"name": "serving-cert",
 			"secret": map[string]interface{}{
 				"secretName": "airgap-architect-plugin-cert",
+			},
+		})
+	}
+
+	if component == "backend" || component == "frontend" {
+		volumes = append(volumes, map[string]interface{}{
+			"name": clusterCAVolumeName,
+			"configMap": map[string]interface{}{
+				"name":     clusterCABundleName,
+				"optional": true,
 			},
 		})
 	}
@@ -8446,6 +8508,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "tpa-oidc-secret", "description": "TPA OIDC secret for SBOM upload", "optional": true},
 		{"name": "cosign-key", "description": "Cosign private key", "optional": true},
 		{"name": "architect-script", "description": "Airgap Architect import script ConfigMap", "optional": true},
+		{"name": "cluster-ca-bundle", "description": "Cluster CA bundle for trusting internal CAs", "optional": true},
 	}
 
 	// Define pipeline results
@@ -8467,8 +8530,8 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		},
 	}
 
-	// Define tasks - I'll create a simplified version first, then we can expand
-	tasks := r.buildPipelineTasks()
+	// Define tasks - inject cluster CA bundle into all tasks for internal CA trust
+	tasks := injectCABundleIntoTasks(r.buildPipelineTasks())
 
 	pipelineSpec := map[string]interface{}{
 		"params":     params,

@@ -2010,9 +2010,10 @@ func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx con
 		{"name": "config", "description": "ConfigMap with imageset-config.yaml"},
 		{"name": "pull-secret", "description": "Registry pull secret for authentication"},
 		{"name": "cosign-pub", "description": "Cosign public key secret for verification", "optional": true},
+		{"name": "cluster-ca-bundle", "description": "Cluster CA bundle for trusting internal CAs", "optional": true},
 	}
 
-	tasks := r.buildImportPipelineTasks()
+	tasks := injectCABundleIntoTasks(r.buildImportPipelineTasks())
 
 	pipelineSpec := map[string]interface{}{
 		"params":     params,
