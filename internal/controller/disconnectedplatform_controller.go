@@ -9358,6 +9358,11 @@ if [ -f "/workspace/config/imageset-config.yaml" ]; then
       IMG_REF=$(echo "$line" | grep "name:" | sed 's/.*name:[[:space:]]*//' | tr -d "'" | tr -d '"')
       [ -z "$IMG_REF" ] && continue
 
+      # Skip images already in the intermediate registry (e.g. rhcos-server)
+      case "$IMG_REF" in
+        "${INTERMEDIATE_HOST}"/*) echo "  Skipping (already in intermediate): $IMG_REF"; continue ;;
+      esac
+
       # Normalize: add docker.io/ prefix for short-form refs (no dots before first slash)
       NORMALIZED="$IMG_REF"
       PREFIX=$(echo "$IMG_REF" | cut -d/ -f1)
@@ -10014,22 +10019,42 @@ rm -f /workspace/output/airgap-architect-backend.tar.gz
 INTERMEDIATE_REGISTRY="$(params.intermediate-registry)"
 AUTHFILE="/workspace/pull-secret/.dockerconfigjson"
 
-# relatedImages are mirrored by digest under the full namespace path
-# (e.g. quay.io/org/image@sha256:abc -> intermediate/org/image@sha256:abc)
-# Strip tag or digest so we can append a clean :latest for the archive
+# relatedImages are mirrored by digest under the full namespace path.
+# OLM injects digest refs via RELATED_IMAGE_* env vars, but if the operator
+# runs outside OLM the defaults use :latest tags which don't exist in
+# intermediate. In that case, discover the sha256-* tag from the registry.
 strip_ref() {
   local ref="$1"
-  # Remove digest first (@sha256:...)
   ref="${ref%%@*}"
-  # Remove tag (:latest, :v1, etc) - only after the last /
   local base="${ref%/*}"
   local name="${ref##*/}"
   name="${name%%:*}"
   echo "${base}/${name}"
 }
 
+resolve_intermediate_path() {
+  local param="$1"
+  local path=$(echo "$param" | sed 's|^[^/]*/||')
+  case "$path" in
+    *@sha256:*) echo "$path"; return ;;
+  esac
+  # Tag ref — check if the tag exists, otherwise find a sha256-* tag
+  local repo_path=$(echo "$path" | sed 's|:.*||')
+  if ! skopeo inspect --authfile="$AUTHFILE" "docker://${INTERMEDIATE_REGISTRY}/${path}" >/dev/null 2>&1; then
+    local digest_tag=$(skopeo list-tags --authfile="$AUTHFILE" \
+      "docker://${INTERMEDIATE_REGISTRY}/${repo_path}" 2>/dev/null \
+      | grep -o '"sha256-[^"]*"' | head -1 | tr -d '"')
+    if [ -n "$digest_tag" ]; then
+      echo "  Tag not found, using discovered tag: ${digest_tag}" >&2
+      echo "${repo_path}:${digest_tag}"
+      return
+    fi
+  fi
+  echo "$path"
+}
+
 echo "Copying frontend image..."
-FRONTEND_PATH=$(echo "$(params.architect-frontend-image)" | sed 's|^[^/]*/||')
+FRONTEND_PATH=$(resolve_intermediate_path "$(params.architect-frontend-image)")
 FRONTEND_NAME=$(strip_ref "$(params.architect-frontend-image)")
 skopeo copy --authfile="$AUTHFILE" \
   "docker://${INTERMEDIATE_REGISTRY}/${FRONTEND_PATH}" \
@@ -10037,7 +10062,7 @@ skopeo copy --authfile="$AUTHFILE" \
 echo "  ✓ Frontend exported"
 
 echo "Copying backend image..."
-BACKEND_PATH=$(echo "$(params.architect-backend-image)" | sed 's|^[^/]*/||')
+BACKEND_PATH=$(resolve_intermediate_path "$(params.architect-backend-image)")
 BACKEND_NAME=$(strip_ref "$(params.architect-backend-image)")
 skopeo copy --authfile="$AUTHFILE" \
   "docker://${INTERMEDIATE_REGISTRY}/${BACKEND_PATH}" \
