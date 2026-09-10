@@ -8523,6 +8523,7 @@ func (r *DisconnectedPlatformReconciler) buildPipelineTasks() []map[string]inter
 		// Task 1: dry-run (only for m2m workflow, runs after RHCOS server image is pushed so it appears in mapping.txt)
 		{
 			"name":     "dry-run",
+			"retries":  2,
 			"runAfter": []string{"build-rhcos-server"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
@@ -8556,6 +8557,7 @@ oc-mirror \
 		// Task 2: mirror-to-intermediate (only for m2m workflow, waits for RHCOS server image if enabled)
 		{
 			"name":     "mirror-to-intermediate",
+			"retries":  2,
 			"runAfter": []string{"dry-run"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
@@ -9101,7 +9103,8 @@ fi
 
 		// Task 5: oc-mirror (local cache workflow - no intermediate registry)
 		{
-			"name": "oc-mirror",
+			"name":    "oc-mirror",
+			"retries": 2,
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "in", "values": []string{""}},
 			},
@@ -9168,6 +9171,7 @@ oc-mirror \
 		// Task 6: mirror-from-intermediate (pull from intermediate to disk with signatures)
 		{
 			"name":     "mirror-from-intermediate",
+			"retries":  2,
 			"runAfter": []string{"sign-images"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.intermediate-registry)", "operator": "notin", "values": []string{""}},
@@ -10048,6 +10052,7 @@ ls -lh /workspace/output/airgap-architect-*.tar.gz
 		// Task 10.5: download-cli-tools (download OpenShift CLI binaries for airgapped use)
 		{
 			"name":     "download-cli-tools",
+			"retries":  2,
 			"runAfter": []string{"export-architect-images"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.cli-tools-enabled)", "operator": "in", "values": []string{"true"}},
