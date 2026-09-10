@@ -134,7 +134,7 @@ jobs:
             DEV_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-${BRANCH}.${SHORT_SHA}"
             echo "version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
             echo "bundle_img=${REPO}-bundle:${DEV_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "catalog_img=${REPO}-catalog:latest" >> "$GITHUB_OUTPUT"
+            echo "catalog_img=${REPO}-catalog:${BRANCH}" >> "$GITHUB_OUTPUT"
             echo "catalog_img_latest=" >> "$GITHUB_OUTPUT"
             echo "dev_channel=${BRANCH}" >> "$GITHUB_OUTPUT"
           fi
