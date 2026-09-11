@@ -5260,7 +5260,7 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 	sub.SetNamespace(op.ns)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(sub), sub); err == nil {
-		return nil
+		return r.ensureSubscriptionCABundle(ctx, sub)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -5297,15 +5297,76 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 	}
 
 	httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+	envSlice := []interface{}{}
 	if proxyEnv := proxyEnvForSubscription(httpProxy, httpsProxy, noProxy); len(proxyEnv) > 0 {
-		envSlice := make([]interface{}, len(proxyEnv))
-		for i, e := range proxyEnv {
-			envSlice[i] = e
+		for _, e := range proxyEnv {
+			envSlice = append(envSlice, e)
 		}
+	}
+
+	caData, _ := r.getClusterCABundleData(ctx)
+	if len(caData) > 0 {
+		envSlice = append(envSlice, map[string]interface{}{"name": "SSL_CERT_FILE", "value": clusterCAFilePath})
+		unstructured.SetNestedSlice(sub.Object, []interface{}{
+			map[string]interface{}{
+				"name": clusterCAVolumeName,
+				"configMap": map[string]interface{}{
+					"name": clusterCABundleName,
+				},
+			},
+		}, "spec", "config", "volumes")
+		unstructured.SetNestedSlice(sub.Object, []interface{}{
+			map[string]interface{}{
+				"name":      clusterCAVolumeName,
+				"mountPath": clusterCAMountPath,
+				"readOnly":  true,
+			},
+		}, "spec", "config", "volumeMounts")
+	}
+
+	if len(envSlice) > 0 {
 		unstructured.SetNestedSlice(sub.Object, envSlice, "spec", "config", "env")
 	}
 
 	return r.Create(ctx, sub)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureSubscriptionCABundle(ctx context.Context, sub *unstructured.Unstructured) error {
+	caData, _ := r.getClusterCABundleData(ctx)
+	if len(caData) == 0 {
+		return nil
+	}
+
+	volumes, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "volumes")
+	for _, v := range volumes {
+		if vm, ok := v.(map[string]interface{}); ok {
+			if vm["name"] == clusterCAVolumeName {
+				return nil
+			}
+		}
+	}
+
+	envs, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "env")
+	envs = append(envs, map[string]interface{}{"name": "SSL_CERT_FILE", "value": clusterCAFilePath})
+	unstructured.SetNestedSlice(sub.Object, envs, "spec", "config", "env")
+
+	volumes = append(volumes, map[string]interface{}{
+		"name": clusterCAVolumeName,
+		"configMap": map[string]interface{}{
+			"name": clusterCABundleName,
+		},
+	})
+	unstructured.SetNestedSlice(sub.Object, volumes, "spec", "config", "volumes")
+
+	mounts, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "volumeMounts")
+	mounts = append(mounts, map[string]interface{}{
+		"name":      clusterCAVolumeName,
+		"mountPath": clusterCAMountPath,
+		"readOnly":  true,
+	})
+	unstructured.SetNestedSlice(sub.Object, mounts, "spec", "config", "volumeMounts")
+
+	return r.Update(ctx, sub)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {
