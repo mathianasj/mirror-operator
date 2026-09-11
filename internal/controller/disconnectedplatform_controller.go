@@ -54,7 +54,7 @@ const (
 	pullSecretKey         = ".dockerconfigjson"
 	clusterCABundleName   = "cluster-ca-bundle"
 	clusterCABundleKey    = "ca-bundle.crt"
-	clusterCAMountPath    = "/etc/pki/ca-trust/extracted/pem"
+	clusterCAMountPath    = "/etc/pki/ca-trust/custom"
 	clusterCAFilePath     = clusterCAMountPath + "/" + clusterCABundleKey
 	clusterCAVolumeName   = "cluster-ca-bundle"
 )
@@ -6409,6 +6409,10 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string, p
 
 		env = append(env, map[string]interface{}{
 			"name":  "NODE_EXTRA_CA_CERTS",
+			"value": clusterCAFilePath,
+		})
+		env = append(env, map[string]interface{}{
+			"name":  "SSL_CERT_FILE",
 			"value": clusterCAFilePath,
 		})
 

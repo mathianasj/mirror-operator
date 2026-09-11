@@ -373,7 +373,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 				mm := m.(map[string]interface{})
 				if mm["name"] == "cluster-ca-bundle" {
 					hasTrustedCA = true
-					Expect(mm["mountPath"]).To(Equal("/etc/pki/ca-trust/extracted/pem"))
+					Expect(mm["mountPath"]).To(Equal("/etc/pki/ca-trust/custom"))
 					Expect(mm["readOnly"]).To(BeTrue())
 				}
 			}
