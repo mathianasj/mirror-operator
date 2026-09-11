@@ -80,7 +80,8 @@ func RegistryV2ManifestURL(host, path, repository, tag string) string {
 // registryExistsCheckSnippet returns the shell snippet that extracts
 // REGISTRY_HOST and REGISTRY_PATH from an INTERMEDIATE_REGISTRY variable,
 // looks up auth credentials from a pull secret, and checks the V2 manifest
-// endpoint. Used by both download and build tasks for consistency.
+// endpoint using the proper Bearer token auth flow. Used by both download
+// and build tasks for consistency.
 func registryExistsCheckSnippet() string {
 	return `
 REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
@@ -96,13 +97,32 @@ for key in [host, '${INTERMEDIATE_REGISTRY}', 'https://' + host, 'https://${INTE
     print(d['auths'][key].get('auth',''))
     break
 " 2>/dev/null || true)
-AUTH_HEADER=""
+
+MANIFEST_URL="https://${REGISTRY_HOST}/v2/${REGISTRY_PATH:+${REGISTRY_PATH}/}rhcos-server/manifests/${RHCOS_VERSION}"
+HTTP_CODE="000"
+
 if [ -n "$AUTH" ]; then
-  AUTH_HEADER="Authorization: Basic ${AUTH}"
+  # Docker v2 registries require Bearer token auth:
+  # 1. Request the manifest endpoint to get the WWW-Authenticate challenge
+  CHALLENGE=$(curl -sk -D - -o /dev/null "$MANIFEST_URL" 2>/dev/null | grep -i 'www-authenticate')
+  REALM=$(echo "$CHALLENGE" | grep -oP 'realm="\K[^"]+' || true)
+  SERVICE=$(echo "$CHALLENGE" | grep -oP 'service="\K[^"]+' || true)
+  SCOPE=$(echo "$CHALLENGE" | grep -oP 'scope="\K[^"]+' || true)
+
+  if [ -n "$REALM" ]; then
+    # 2. Exchange Basic credentials for a Bearer token at the auth realm
+    CREDS=$(echo "$AUTH" | base64 -d)
+    TOKEN_URL="${REALM}?service=${SERVICE}&scope=${SCOPE}"
+    TOKEN=$(curl -sk -u "$CREDS" "$TOKEN_URL" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || true)
+
+    if [ -n "$TOKEN" ]; then
+      # 3. Retry the manifest request with the Bearer token
+      HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${TOKEN}" \
+        "$MANIFEST_URL" 2>/dev/null || echo "000")
+    fi
+  fi
 fi
-HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
-  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-  "https://${REGISTRY_HOST}/v2/${REGISTRY_PATH:+${REGISTRY_PATH}/}rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || echo "000")
 if [ -z "$HTTP_CODE" ]; then HTTP_CODE="000"; fi
 `
 }
@@ -202,27 +222,9 @@ else
 fi
 
 FULL_IMAGE="${INTERMEDIATE_REGISTRY}/rhcos-server:${RHCOS_VERSION}"
-REGISTRY_HOST=$(echo "$INTERMEDIATE_REGISTRY" | cut -d/ -f1)
-REGISTRY_PATH=$(echo "$INTERMEDIATE_REGISTRY" | cut -sd/ -f2-)
 
 # Check if RHCOS server image already exists in intermediate registry
-AUTH=$(cat /workspace/pull-secret/.dockerconfigjson | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-host = '${INTERMEDIATE_REGISTRY}'.split('/')[0]
-for key in [host, '${INTERMEDIATE_REGISTRY}', 'https://' + host, 'https://${INTERMEDIATE_REGISTRY}']:
-  if key in d.get('auths',{}):
-    print(d['auths'][key].get('auth',''))
-    break
-" 2>/dev/null || true)
-AUTH_HEADER=""
-if [ -n "$AUTH" ]; then
-  AUTH_HEADER="Authorization: Basic ${AUTH}"
-fi
-HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
-  ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-  "https://${REGISTRY_HOST}/v2/${REGISTRY_PATH:+${REGISTRY_PATH}/}rhcos-server/manifests/${RHCOS_VERSION}" 2>/dev/null || true)
-if [ -z "$HTTP_CODE" ]; then HTTP_CODE="000"; fi
+` + registryExistsCheckSnippet() + `
 if [ "$HTTP_CODE" = "200" ]; then
   echo "RHCOS server image already exists: ${FULL_IMAGE} — skipping build"
   exit 0
