@@ -737,7 +737,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 		})
 
 		It("includes CA volume and env in backend deployment", func() {
-			container := makeBackendContainerBuilder("", "connected")("test-backend", "test-image:latest", map[string]string{})
+			container := makeBackendContainerBuilder("", "connected", nil)("test-backend", "test-image:latest", map[string]string{})
 			mounts := container["volumeMounts"].([]interface{})
 			foundMount := false
 			for _, m := range mounts {

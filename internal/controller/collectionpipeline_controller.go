@@ -524,8 +524,32 @@ func (r *CollectionPipelineReconciler) deleteS3Objects(ctx context.Context, pipe
 		jobName = jobName[:63]
 	}
 
+	httpProxy, httpsProxy, noProxy := getClusterProxyFromClient(ctx, r.Client)
+
 	ttl := int32(120)
 	backoff := int32(2)
+	envVars := []corev1.EnvVar{
+		{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
+					Key:                  "AWS_ACCESS_KEY_ID",
+				},
+			},
+		},
+		{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
+					Key:                  "AWS_SECRET_ACCESS_KEY",
+				},
+			},
+		},
+	}
+	envVars = append(envVars, proxyEnvVarsTyped(httpProxy, httpsProxy, noProxy)...)
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -546,26 +570,7 @@ func (r *CollectionPipelineReconciler) deleteS3Objects(ctx context.Context, pipe
 								`aws --endpoint-url %s s3 rm s3://%s/%s/ --recursive && echo "S3 cleanup complete for %s"`,
 								endpoint, bucket, pipeline.Name, pipeline.Name,
 							)},
-							Env: []corev1.EnvVar{
-								{
-									Name: "AWS_ACCESS_KEY_ID",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
-											Key:                  "AWS_ACCESS_KEY_ID",
-										},
-									},
-								},
-								{
-									Name: "AWS_SECRET_ACCESS_KEY",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{Name: "collection-artifacts"},
-											Key:                  "AWS_SECRET_ACCESS_KEY",
-										},
-									},
-								},
-							},
+							Env: envVars,
 						},
 					},
 				},
@@ -936,6 +941,14 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "oc-version", Value: pipelinev1.ParamValue{Type: "string", StringVal: ocVersion}},
 		pipelinev1.Param{Name: "mirror-registry-version", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRegistryVersion}},
 		pipelinev1.Param{Name: "cli-tools-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: "true"}},
+	)
+
+	// Add proxy parameters from cluster proxy config
+	httpProxy, httpsProxy, noProxy := getClusterProxyFromClient(ctx, r.Client)
+	params = append(params,
+		pipelinev1.Param{Name: "http-proxy", Value: pipelinev1.ParamValue{Type: "string", StringVal: httpProxy}},
+		pipelinev1.Param{Name: "https-proxy", Value: pipelinev1.ParamValue{Type: "string", StringVal: httpsProxy}},
+		pipelinev1.Param{Name: "no-proxy", Value: pipelinev1.ParamValue{Type: "string", StringVal: noProxy}},
 	)
 
 	// Add RHCOS collection parameters (enabled by default)

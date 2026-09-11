@@ -247,6 +247,12 @@ LABEL io.openshift.rhcos.version="${RHCOS_VERSION}"
 LABEL io.openshift.mirror-operator/component="rhcos-server"
 CEOF
 
+CERT_DIR_FLAG=""
+if [ -d "/workspace/trusted-ca" ] && [ -f "/workspace/trusted-ca/ca-bundle.crt" ]; then
+  mkdir -p /etc/docker/certs.d
+  CERT_DIR_FLAG="--cert-dir=/workspace/trusted-ca"
+fi
+
 buildah bud --storage-driver=vfs --isolation=chroot \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   -t "$FULL_IMAGE" \
@@ -267,11 +273,15 @@ fi
 AUTH_B64=$(cat /workspace/pull-secret/.dockerconfigjson | \
   grep -o "\"${REGISTRY_HOST}[^\"]*\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1 | \
   grep -o '"auth":"[^"]*"' | cut -d'"' -f4)
+LOGIN_TLS="--tls-verify=false"
+if [ -n "$CERT_DIR_FLAG" ]; then
+  LOGIN_TLS="$CERT_DIR_FLAG"
+fi
 if [ -n "$AUTH_B64" ]; then
   CREDS=$(echo "$AUTH_B64" | base64 -d)
   CRED_USER=$(echo "$CREDS" | cut -d: -f1)
   CRED_PASS=$(echo "$CREDS" | cut -d: -f2-)
-  buildah login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
+  buildah login $LOGIN_TLS -u "$CRED_USER" -p "$CRED_PASS" "$INTERNAL_HOST"
 fi
 
 # Map external hostname to internal service IP so Quay's auth/upload
@@ -280,11 +290,15 @@ INTERNAL_IP=$(getent hosts "$INTERNAL_HOST" | awk '{print $1}' | head -1)
 if [ -n "$INTERNAL_IP" ]; then
   echo "$INTERNAL_IP $REGISTRY_HOST" >> /etc/hosts
   echo "Mapped $REGISTRY_HOST -> $INTERNAL_IP to bypass CLB"
-  buildah login --tls-verify=false -u "$CRED_USER" -p "$CRED_PASS" "$REGISTRY_HOST" 2>/dev/null || true
+  buildah login $LOGIN_TLS -u "$CRED_USER" -p "$CRED_PASS" "$REGISTRY_HOST" 2>/dev/null || true
 fi
 
 echo "Pushing via internal service: ${PUSH_IMAGE}"
-buildah push --storage-driver=vfs --tls-verify=false --retry 3 \
+TLS_FLAG="--tls-verify=false"
+if [ -n "$CERT_DIR_FLAG" ]; then
+  TLS_FLAG="$CERT_DIR_FLAG"
+fi
+buildah push --storage-driver=vfs $TLS_FLAG --retry 3 \
   "$FULL_IMAGE" "docker://${PUSH_IMAGE}"
 
 echo "=== RHCOS server image build and push complete ==="

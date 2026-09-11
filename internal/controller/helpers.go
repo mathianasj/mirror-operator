@@ -4,8 +4,12 @@ import (
 	"context"
 	"os"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -218,4 +222,113 @@ func injectCABundleIntoTasks(tasks []map[string]interface{}) []map[string]interf
 		tasks[i]["taskSpec"] = taskSpec
 	}
 	return tasks
+}
+
+const trustedCAConfigMapName = "trusted-ca-bundle"
+
+func getClusterProxyFromClient(ctx context.Context, c client.Client) (httpProxy, httpsProxy, noProxy string) {
+	logger := log.FromContext(ctx)
+
+	proxy := &unstructured.Unstructured{}
+	proxy.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Proxy",
+	})
+	proxy.SetName("cluster")
+
+	if err := c.Get(ctx, client.ObjectKeyFromObject(proxy), proxy); err != nil {
+		logger.V(1).Info("Could not read Proxy CR", "error", err)
+		return "", "", ""
+	}
+
+	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpProxy")
+	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpsProxy")
+	noProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "noProxy")
+	return
+}
+
+func proxyEnvVarsUnstructured(httpProxy, httpsProxy, noProxy string) []map[string]interface{} {
+	if httpProxy == "" && httpsProxy == "" && noProxy == "" {
+		return nil
+	}
+	var envs []map[string]interface{}
+	for _, pair := range []struct{ k, v string }{
+		{"HTTP_PROXY", httpProxy},
+		{"HTTPS_PROXY", httpsProxy},
+		{"NO_PROXY", noProxy},
+		{"http_proxy", httpProxy},
+		{"https_proxy", httpsProxy},
+		{"no_proxy", noProxy},
+	} {
+		if pair.v != "" {
+			envs = append(envs, map[string]interface{}{"name": pair.k, "value": pair.v})
+		}
+	}
+	return envs
+}
+
+func proxyEnvVarsTyped(httpProxy, httpsProxy, noProxy string) []corev1.EnvVar {
+	if httpProxy == "" && httpsProxy == "" && noProxy == "" {
+		return nil
+	}
+	var envs []corev1.EnvVar
+	for _, pair := range []struct{ k, v string }{
+		{"HTTP_PROXY", httpProxy},
+		{"HTTPS_PROXY", httpsProxy},
+		{"NO_PROXY", noProxy},
+		{"http_proxy", httpProxy},
+		{"https_proxy", httpsProxy},
+		{"no_proxy", noProxy},
+	} {
+		if pair.v != "" {
+			envs = append(envs, corev1.EnvVar{Name: pair.k, Value: pair.v})
+		}
+	}
+	return envs
+}
+
+func proxyEnvForSubscription(httpProxy, httpsProxy, noProxy string) []map[string]interface{} {
+	if httpProxy == "" && httpsProxy == "" && noProxy == "" {
+		return nil
+	}
+	var envs []map[string]interface{}
+	for _, pair := range []struct{ k, v string }{
+		{"HTTP_PROXY", httpProxy},
+		{"HTTPS_PROXY", httpsProxy},
+		{"NO_PROXY", noProxy},
+	} {
+		if pair.v != "" {
+			envs = append(envs, map[string]interface{}{"name": pair.k, "value": pair.v})
+		}
+	}
+	return envs
+}
+
+func (r *DisconnectedPlatformReconciler) reconcileTrustedCAConfigMap(ctx context.Context) error {
+	logger := log.FromContext(ctx)
+
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: trustedCAConfigMapName, Namespace: architectNamespace}, cm)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	cm = &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      trustedCAConfigMapName,
+			Namespace: architectNamespace,
+			Labels: map[string]string{
+				"config.openshift.io/inject-trusted-cabundle": "true",
+			},
+		},
+	}
+	if err := r.Create(ctx, cm); err != nil {
+		return err
+	}
+	logger.Info("Created trusted CA bundle ConfigMap with inject label")
+	return nil
 }
