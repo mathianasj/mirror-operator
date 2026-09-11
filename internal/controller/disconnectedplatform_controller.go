@@ -2614,12 +2614,8 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 				},
 			},
 			{
-				"name":  "spi-truststore-file-file",
+				"name":  "truststore-paths",
 				"value": clusterCAFilePath,
-			},
-			{
-				"name":  "spi-truststore-file-type",
-				"value": "pem",
 			},
 		},
 		"db": map[string]interface{}{
