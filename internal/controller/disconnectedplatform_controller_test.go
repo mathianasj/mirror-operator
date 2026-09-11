@@ -714,7 +714,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			cm := &corev1.ConfigMap{}
 			err = r.Get(ctx, types.NamespacedName{Name: clusterCABundleName, Namespace: architectNamespace}, cm)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-ca-bundle", "true"))
+			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-trusted-cabundle", "true"))
 		})
 
 		It("does not error when ConfigMap already exists with correct label", func() {
@@ -723,7 +723,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					Name:      clusterCABundleName,
 					Namespace: architectNamespace,
 					Labels: map[string]string{
-						"config.openshift.io/inject-ca-bundle": "true",
+						"config.openshift.io/inject-trusted-cabundle": "true",
 					},
 				},
 			}

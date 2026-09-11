@@ -229,7 +229,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 			cm := &corev1.ConfigMap{}
 			err = r.Get(ctx, types.NamespacedName{Name: clusterCABundleName, Namespace: architectNamespace}, cm)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-ca-bundle", "true"))
+			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-trusted-cabundle", "true"))
 		})
 
 		It("does not recreate an existing ConfigMap", func() {
@@ -242,7 +242,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 			existing.SetName(clusterCABundleName)
 			existing.SetNamespace(architectNamespace)
 			existing.SetLabels(map[string]string{
-				"config.openshift.io/inject-ca-bundle": "true",
+				"config.openshift.io/inject-trusted-cabundle": "true",
 			})
 
 			r := &DisconnectedPlatformReconciler{
