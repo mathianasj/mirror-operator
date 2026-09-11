@@ -2608,6 +2608,14 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 					"key":  "password",
 				},
 			},
+			{
+				"name":  "spi-truststore-file-file",
+				"value": clusterCAFilePath,
+			},
+			{
+				"name":  "spi-truststore-file-type",
+				"value": "pem",
+			},
 		},
 		"db": map[string]interface{}{
 			"vendor":   "postgres",
@@ -2621,6 +2629,32 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 			"passwordSecret": map[string]interface{}{
 				"name": "keycloak-db-secret",
 				"key":  "password",
+			},
+		},
+		"unsupported": map[string]interface{}{
+			"podTemplate": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"containers": []map[string]interface{}{
+						{
+							"volumeMounts": []map[string]interface{}{
+								{
+									"name":      clusterCAVolumeName,
+									"mountPath": clusterCAMountPath,
+									"readOnly":  true,
+								},
+							},
+						},
+					},
+					"volumes": []map[string]interface{}{
+						{
+							"name": clusterCAVolumeName,
+							"configMap": map[string]interface{}{
+								"name":     clusterCABundleName,
+								"optional": true,
+							},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -3870,6 +3904,10 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 						logger.Error(err, "failed to update Quay S3 config secret")
 					}
 				}
+			} else {
+				if err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry); err != nil {
+					logger.Error(err, "failed to inject CA into Quay config bundle, will retry on next reconciliation")
+				}
 			}
 
 			if hostname != "" && platform.Spec.Connected.MirrorRegistry != hostname+"/mirror" {
@@ -3973,6 +4011,10 @@ func (r *DisconnectedPlatformReconciler) reconcileQuayConfig(ctx context.Context
 			if err := r.createOrUpdateQuayS3ConfigSecret(ctx, quayRegistry, creds, newQuayHostname); err != nil {
 				logger.Error(err, "failed to create Quay S3 config secret, will retry on next reconciliation")
 			}
+		} else {
+			if err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry); err != nil {
+				logger.Error(err, "failed to inject CA into Quay config bundle, will retry on next reconciliation")
+			}
 		}
 
 		// Create passthrough route
@@ -4052,6 +4094,10 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		data["ssl.key"] = keyPEM
 	} else {
 		logger.V(1).Info("Quay TLS cert not yet available, config bundle will not include TLS keys", "error", err)
+	}
+
+	if caData, err := r.getClusterCABundleData(ctx); err == nil && len(caData) > 0 {
+		data["extra_ca_cert_cluster-ca.crt"] = caData
 	}
 
 	secretName := quayRegistry.GetName() + "-config-bundle"
@@ -4564,6 +4610,17 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Contex
 	securesign.SetNamespace(architectNamespace)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(securesign), securesign); err == nil {
+		annotations := securesign.GetAnnotations()
+		if annotations == nil || annotations["rhtas.redhat.com/trusted-ca"] != clusterCABundleName {
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			annotations["rhtas.redhat.com/trusted-ca"] = clusterCABundleName
+			securesign.SetAnnotations(annotations)
+			if err := r.Update(ctx, securesign); err != nil {
+				log.FromContext(ctx).Error(err, "failed to update Securesign trusted-ca annotation")
+			}
+		}
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -4654,6 +4711,9 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Contex
 	}
 
 	securesign.Object["spec"] = spec
+	securesign.SetAnnotations(map[string]string{
+		"rhtas.redhat.com/trusted-ca": clusterCABundleName,
+	})
 
 	return r.Create(ctx, securesign)
 }
@@ -5721,6 +5781,66 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundle(ctx context.Conte
 		return err
 	}
 	return r.Create(ctx, cm)
+}
+
+func (r *DisconnectedPlatformReconciler) getClusterCABundleData(ctx context.Context) ([]byte, error) {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: clusterCABundleName, Namespace: architectNamespace}, cm); err != nil {
+		return nil, err
+	}
+	caData, ok := cm.Data[clusterCABundleKey]
+	if !ok || caData == "" {
+		return nil, fmt.Errorf("cluster CA bundle ConfigMap has no %s key", clusterCABundleKey)
+	}
+	return []byte(caData), nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureQuayCAInConfigBundle(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	caData, err := r.getClusterCABundleData(ctx)
+	if err != nil || len(caData) == 0 {
+		logger.V(1).Info("Cluster CA bundle not yet available for Quay config bundle")
+		return nil
+	}
+
+	secretName := quayRegistry.GetName() + "-config-bundle"
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: quayRegistry.GetNamespace()}, existing); err == nil {
+		if bytes.Equal(existing.Data["extra_ca_cert_cluster-ca.crt"], caData) {
+			return nil
+		}
+		if existing.Data == nil {
+			existing.Data = make(map[string][]byte)
+		}
+		existing.Data["extra_ca_cert_cluster-ca.crt"] = caData
+		return r.Update(ctx, existing)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: quayRegistry.GetNamespace(),
+		},
+		Data: map[string][]byte{
+			"extra_ca_cert_cluster-ca.crt": caData,
+		},
+		Type: corev1.SecretTypeOpaque,
+	}
+	if quayRegistry.GetUID() != "" {
+		secret.SetOwnerReferences([]metav1.OwnerReference{
+			{
+				APIVersion: quayRegistry.GetAPIVersion(),
+				Kind:       quayRegistry.GetKind(),
+				Name:       quayRegistry.GetName(),
+				UID:        quayRegistry.GetUID(),
+				Controller: func() *bool { b := true; return &b }(),
+			},
+		})
+	}
+	return r.Create(ctx, secret)
 }
 
 // addQuayCredentialsIfNeeded adds Quay robot credentials to dockerconfig if managed Quay is deployed
@@ -8538,7 +8658,7 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		"workspaces": workspaces,
 		"results":    results,
 		"tasks":      tasks,
-		"finally":    r.buildPipelineFinallyTasks(),
+		"finally":    injectCABundleIntoTasks(r.buildPipelineFinallyTasks()),
 	}
 
 	// Marshal to JSON and back to convert []map[string]interface{} into a format unstructured can handle

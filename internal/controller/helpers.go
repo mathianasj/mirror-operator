@@ -197,11 +197,20 @@ func injectCABundleIntoTasks(tasks []map[string]interface{}) []map[string]interf
 		if !ok {
 			continue
 		}
+		caPath := "/workspace/cluster-ca-bundle/" + clusterCABundleKey
 		for j, step := range steps {
 			env, _ := step["env"].([]map[string]interface{})
 			env = append(env, map[string]interface{}{
 				"name":  "SSL_CERT_FILE",
-				"value": "/workspace/cluster-ca-bundle/" + clusterCABundleKey,
+				"value": caPath,
+			})
+			env = append(env, map[string]interface{}{
+				"name":  "AWS_CA_BUNDLE",
+				"value": caPath,
+			})
+			env = append(env, map[string]interface{}{
+				"name":  "REQUESTS_CA_BUNDLE",
+				"value": caPath,
 			})
 			steps[j]["env"] = env
 		}

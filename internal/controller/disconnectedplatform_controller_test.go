@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -844,6 +845,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			result := injectCABundleIntoTasks(tasks)
 			Expect(result).To(HaveLen(2))
 
+			caPath := "/workspace/cluster-ca-bundle/" + clusterCABundleKey
 			for _, task := range result {
 				ws := task["workspaces"].([]map[string]interface{})
 				lastWs := ws[len(ws)-1]
@@ -853,9 +855,13 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				steps := taskSpec["steps"].([]map[string]interface{})
 				for _, step := range steps {
 					env := step["env"].([]map[string]interface{})
-					lastEnv := env[len(env)-1]
-					Expect(lastEnv["name"]).To(Equal("SSL_CERT_FILE"))
-					Expect(lastEnv["value"]).To(Equal("/workspace/cluster-ca-bundle/" + clusterCABundleKey))
+					envNames := make(map[string]string)
+					for _, e := range env {
+						envNames[e["name"].(string)] = e["value"].(string)
+					}
+					Expect(envNames).To(HaveKeyWithValue("SSL_CERT_FILE", caPath))
+					Expect(envNames).To(HaveKeyWithValue("AWS_CA_BUNDLE", caPath))
+					Expect(envNames).To(HaveKeyWithValue("REQUESTS_CA_BUNDLE", caPath))
 				}
 			}
 
@@ -863,8 +869,177 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			task2Spec := result[1]["taskSpec"].(map[string]interface{})
 			task2Steps := task2Spec["steps"].([]map[string]interface{})
 			task2Env := task2Steps[0]["env"].([]map[string]interface{})
-			Expect(task2Env).To(HaveLen(2))
+			Expect(task2Env).To(HaveLen(4))
 			Expect(task2Env[0]["name"]).To(Equal("EXISTING_VAR"))
+		})
+	})
+
+	Describe("Quay CA injection", func() {
+		It("injects CA bundle into config bundle secret when ConfigMap exists", func() {
+			caCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{
+					clusterCABundleKey: "-----BEGIN CERTIFICATE-----\ntest-ca-data\n-----END CERTIFICATE-----",
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(caCM).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			err = r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay-config-bundle", Namespace: architectNamespace}, secret)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secret.Data).To(HaveKey("extra_ca_cert_cluster-ca.crt"))
+			Expect(string(secret.Data["extra_ca_cert_cluster-ca.crt"])).To(ContainSubstring("test-ca-data"))
+		})
+
+		It("skips silently when CA ConfigMap does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("updates existing config bundle secret with CA data", func() {
+			caCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{
+					clusterCABundleKey: "new-ca-data",
+				},
+			}
+			existingSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "mirror-operator-quay-config-bundle",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{
+					"config.yaml": []byte("existing-config"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(caCM, existingSecret).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			err = r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay-config-bundle", Namespace: architectNamespace}, secret)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(secret.Data["extra_ca_cert_cluster-ca.crt"])).To(Equal("new-ca-data"))
+			Expect(string(secret.Data["config.yaml"])).To(Equal("existing-config"))
+		})
+	})
+
+	Describe("Keycloak CA injection", func() {
+		It("includes unsupported.podTemplate with CA volume in kcSpec", func() {
+			kcSpec := map[string]interface{}{
+				"instances": int64(1),
+				"hostname": map[string]interface{}{
+					"hostname": "keycloak.example.com",
+				},
+				"http": map[string]interface{}{
+					"tlsSecret": "test-tls",
+				},
+				"additionalOptions": []map[string]interface{}{
+					{"name": "KEYCLOAK_ADMIN", "value": "admin"},
+					{"name": "spi-truststore-file-file", "value": clusterCAFilePath},
+					{"name": "spi-truststore-file-type", "value": "pem"},
+				},
+				"unsupported": map[string]interface{}{
+					"podTemplate": map[string]interface{}{
+						"spec": map[string]interface{}{
+							"containers": []map[string]interface{}{
+								{
+									"volumeMounts": []map[string]interface{}{
+										{
+											"name":      clusterCAVolumeName,
+											"mountPath": clusterCAMountPath,
+											"readOnly":  true,
+										},
+									},
+								},
+							},
+							"volumes": []map[string]interface{}{
+								{
+									"name": clusterCAVolumeName,
+									"configMap": map[string]interface{}{
+										"name":     clusterCABundleName,
+										"optional": true,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			// Verify unsupported.podTemplate structure
+			unsupported, ok := kcSpec["unsupported"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			podTemplate, ok := unsupported["podTemplate"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			spec, ok := podTemplate["spec"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+
+			volumes := spec["volumes"].([]map[string]interface{})
+			Expect(volumes).To(HaveLen(1))
+			Expect(volumes[0]["name"]).To(Equal(clusterCAVolumeName))
+			cm := volumes[0]["configMap"].(map[string]interface{})
+			Expect(cm["name"]).To(Equal(clusterCABundleName))
+
+			containers := spec["containers"].([]map[string]interface{})
+			Expect(containers).To(HaveLen(1))
+			mounts := containers[0]["volumeMounts"].([]map[string]interface{})
+			Expect(mounts).To(HaveLen(1))
+			Expect(mounts[0]["name"]).To(Equal(clusterCAVolumeName))
+			Expect(mounts[0]["mountPath"]).To(Equal(clusterCAMountPath))
+
+			// Verify SPI truststore in additionalOptions
+			opts := kcSpec["additionalOptions"].([]map[string]interface{})
+			foundFile := false
+			foundType := false
+			for _, opt := range opts {
+				if opt["name"] == "spi-truststore-file-file" {
+					foundFile = true
+					Expect(opt["value"]).To(Equal(clusterCAFilePath))
+				}
+				if opt["name"] == "spi-truststore-file-type" {
+					foundType = true
+					Expect(opt["value"]).To(Equal("pem"))
+				}
+			}
+			Expect(foundFile).To(BeTrue(), "expected spi-truststore-file-file in additionalOptions")
+			Expect(foundType).To(BeTrue(), "expected spi-truststore-file-type in additionalOptions")
 		})
 	})
 })
