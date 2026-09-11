@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -697,6 +698,348 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			err = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(updated.Status.ImportHistory).To(BeEmpty())
+		})
+	})
+
+	Describe("cluster CA bundle", func() {
+		It("creates the cluster-ca-bundle ConfigMap with injection label", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureClusterCABundle(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			err = r.Get(ctx, types.NamespacedName{Name: clusterCABundleName, Namespace: architectNamespace}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-ca-bundle", "true"))
+		})
+
+		It("does not error when ConfigMap already exists with correct label", func() {
+			existing := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+					Labels: map[string]string{
+						"config.openshift.io/inject-ca-bundle": "true",
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureClusterCABundle(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("includes CA volume and env in backend deployment", func() {
+			container := makeBackendContainerBuilder("", "connected")("test-backend", "test-image:latest", map[string]string{})
+			mounts := container["volumeMounts"].([]interface{})
+			foundMount := false
+			for _, m := range mounts {
+				mount := m.(map[string]interface{})
+				if mount["name"] == clusterCAVolumeName {
+					foundMount = true
+					Expect(mount["mountPath"]).To(Equal(clusterCAMountPath))
+					Expect(mount["readOnly"]).To(BeTrue())
+				}
+			}
+			Expect(foundMount).To(BeTrue(), "expected cluster-ca-bundle volume mount in backend container")
+
+			envVars := container["env"].([]interface{})
+			foundEnv := false
+			for _, e := range envVars {
+				env := e.(map[string]interface{})
+				if env["name"] == "NODE_EXTRA_CA_CERTS" {
+					foundEnv = true
+					Expect(env["value"]).To(Equal(clusterCAFilePath))
+				}
+			}
+			Expect(foundEnv).To(BeTrue(), "expected NODE_EXTRA_CA_CERTS env in backend container")
+		})
+
+		It("includes CA volume and env in frontend deployment", func() {
+			container := frontendContainer("test-frontend", "test-image:latest", map[string]string{"app.kubernetes.io/component": "frontend"}, "", "")
+			mounts := container["volumeMounts"].([]interface{})
+			foundMount := false
+			for _, m := range mounts {
+				mount := m.(map[string]interface{})
+				if mount["name"] == clusterCAVolumeName {
+					foundMount = true
+					Expect(mount["mountPath"]).To(Equal(clusterCAMountPath))
+					Expect(mount["readOnly"]).To(BeTrue())
+				}
+			}
+			Expect(foundMount).To(BeTrue(), "expected cluster-ca-bundle volume mount in frontend container")
+
+			envVars := container["env"].([]interface{})
+			foundEnv := false
+			for _, e := range envVars {
+				env := e.(map[string]interface{})
+				if env["name"] == "NODE_EXTRA_CA_CERTS" {
+					foundEnv = true
+					Expect(env["value"]).To(Equal(clusterCAFilePath))
+				}
+			}
+			Expect(foundEnv).To(BeTrue(), "expected NODE_EXTRA_CA_CERTS env in frontend container")
+		})
+
+		It("includes CA volume in deployment spec for backend and frontend components", func() {
+			for _, component := range []string{"backend", "frontend"} {
+				spec := architectDeploymentSpec("test", "test:latest", 1, map[string]string{"app.kubernetes.io/component": component}, "pull-secret", "openshift-config", func(name, image string, labels map[string]string) map[string]interface{} {
+					return map[string]interface{}{"name": "test"}
+				})
+				volumes, _, _ := unstructured.NestedSlice(map[string]interface{}{"spec": spec}, "spec", "template", "spec", "volumes")
+				foundVol := false
+				for _, v := range volumes {
+					vol := v.(map[string]interface{})
+					if vol["name"] == clusterCAVolumeName {
+						foundVol = true
+						cmSource := vol["configMap"].(map[string]interface{})
+						Expect(cmSource["name"]).To(Equal(clusterCABundleName))
+						Expect(cmSource["optional"]).To(BeTrue())
+					}
+				}
+				Expect(foundVol).To(BeTrue(), "expected cluster-ca-bundle volume in %s deployment spec", component)
+			}
+		})
+	})
+
+	Describe("injectCABundleIntoTasks", func() {
+		It("adds workspace and env to all tasks", func() {
+			tasks := []map[string]interface{}{
+				{
+					"name": "task1",
+					"taskSpec": map[string]interface{}{
+						"steps": []map[string]interface{}{
+							{"name": "step1", "image": "test:latest"},
+						},
+					},
+					"workspaces": []map[string]interface{}{
+						{"name": "output"},
+					},
+				},
+				{
+					"name": "task2",
+					"taskSpec": map[string]interface{}{
+						"steps": []map[string]interface{}{
+							{
+								"name":  "step2",
+								"image": "test:latest",
+								"env": []map[string]interface{}{
+									{"name": "EXISTING_VAR", "value": "val"},
+								},
+							},
+						},
+					},
+					"workspaces": []map[string]interface{}{
+						{"name": "config"},
+					},
+				},
+			}
+
+			result := injectCABundleIntoTasks(tasks)
+			Expect(result).To(HaveLen(2))
+
+			caPath := "/workspace/cluster-ca-bundle/" + clusterCABundleKey
+			for _, task := range result {
+				ws := task["workspaces"].([]map[string]interface{})
+				lastWs := ws[len(ws)-1]
+				Expect(lastWs["name"]).To(Equal("cluster-ca-bundle"))
+
+				taskSpec := task["taskSpec"].(map[string]interface{})
+				steps := taskSpec["steps"].([]map[string]interface{})
+				for _, step := range steps {
+					env := step["env"].([]map[string]interface{})
+					envNames := make(map[string]string)
+					for _, e := range env {
+						envNames[e["name"].(string)] = e["value"].(string)
+					}
+					Expect(envNames).To(HaveKeyWithValue("SSL_CERT_FILE", caPath))
+					Expect(envNames).To(HaveKeyWithValue("AWS_CA_BUNDLE", caPath))
+					Expect(envNames).To(HaveKeyWithValue("REQUESTS_CA_BUNDLE", caPath))
+				}
+			}
+
+			// Verify existing env is preserved in task2
+			task2Spec := result[1]["taskSpec"].(map[string]interface{})
+			task2Steps := task2Spec["steps"].([]map[string]interface{})
+			task2Env := task2Steps[0]["env"].([]map[string]interface{})
+			Expect(task2Env).To(HaveLen(4))
+			Expect(task2Env[0]["name"]).To(Equal("EXISTING_VAR"))
+		})
+	})
+
+	Describe("Quay CA injection", func() {
+		It("injects CA bundle into config bundle secret when ConfigMap exists", func() {
+			caCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{
+					clusterCABundleKey: "-----BEGIN CERTIFICATE-----\ntest-ca-data\n-----END CERTIFICATE-----",
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(caCM).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			err = r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay-config-bundle", Namespace: architectNamespace}, secret)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secret.Data).To(HaveKey("extra_ca_cert_cluster-ca.crt"))
+			Expect(string(secret.Data["extra_ca_cert_cluster-ca.crt"])).To(ContainSubstring("test-ca-data"))
+		})
+
+		It("skips silently when CA ConfigMap does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("updates existing config bundle secret with CA data", func() {
+			caCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{
+					clusterCABundleKey: "new-ca-data",
+				},
+			}
+			existingSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "mirror-operator-quay-config-bundle",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{
+					"config.yaml": []byte("existing-config"),
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(caCM, existingSecret).Build(),
+				Scheme: testScheme,
+			}
+
+			quayRegistry := &unstructured.Unstructured{}
+			quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			quayRegistry.SetName("mirror-operator-quay")
+			quayRegistry.SetNamespace(architectNamespace)
+
+			err := r.ensureQuayCAInConfigBundle(ctx, quayRegistry)
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			err = r.Get(ctx, types.NamespacedName{Name: "mirror-operator-quay-config-bundle", Namespace: architectNamespace}, secret)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(secret.Data["extra_ca_cert_cluster-ca.crt"])).To(Equal("new-ca-data"))
+			Expect(string(secret.Data["config.yaml"])).To(Equal("existing-config"))
+		})
+	})
+
+	Describe("Keycloak CA injection", func() {
+		It("includes unsupported.podTemplate with CA volume in kcSpec", func() {
+			kcSpec := map[string]interface{}{
+				"instances": int64(1),
+				"hostname": map[string]interface{}{
+					"hostname": "keycloak.example.com",
+				},
+				"http": map[string]interface{}{
+					"tlsSecret": "test-tls",
+				},
+				"additionalOptions": []map[string]interface{}{
+					{"name": "KEYCLOAK_ADMIN", "value": "admin"},
+					{"name": "spi-truststore-file-file", "value": clusterCAFilePath},
+					{"name": "spi-truststore-file-type", "value": "pem"},
+				},
+				"unsupported": map[string]interface{}{
+					"podTemplate": map[string]interface{}{
+						"spec": map[string]interface{}{
+							"containers": []map[string]interface{}{
+								{
+									"volumeMounts": []map[string]interface{}{
+										{
+											"name":      clusterCAVolumeName,
+											"mountPath": clusterCAMountPath,
+											"readOnly":  true,
+										},
+									},
+								},
+							},
+							"volumes": []map[string]interface{}{
+								{
+									"name": clusterCAVolumeName,
+									"configMap": map[string]interface{}{
+										"name":     clusterCABundleName,
+										"optional": true,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			// Verify unsupported.podTemplate structure
+			unsupported, ok := kcSpec["unsupported"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			podTemplate, ok := unsupported["podTemplate"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			spec, ok := podTemplate["spec"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+
+			volumes := spec["volumes"].([]map[string]interface{})
+			Expect(volumes).To(HaveLen(1))
+			Expect(volumes[0]["name"]).To(Equal(clusterCAVolumeName))
+			cm := volumes[0]["configMap"].(map[string]interface{})
+			Expect(cm["name"]).To(Equal(clusterCABundleName))
+
+			containers := spec["containers"].([]map[string]interface{})
+			Expect(containers).To(HaveLen(1))
+			mounts := containers[0]["volumeMounts"].([]map[string]interface{})
+			Expect(mounts).To(HaveLen(1))
+			Expect(mounts[0]["name"]).To(Equal(clusterCAVolumeName))
+			Expect(mounts[0]["mountPath"]).To(Equal(clusterCAMountPath))
+
+			// Verify SPI truststore in additionalOptions
+			opts := kcSpec["additionalOptions"].([]map[string]interface{})
+			foundFile := false
+			foundType := false
+			for _, opt := range opts {
+				if opt["name"] == "spi-truststore-file-file" {
+					foundFile = true
+					Expect(opt["value"]).To(Equal(clusterCAFilePath))
+				}
+				if opt["name"] == "spi-truststore-file-type" {
+					foundType = true
+					Expect(opt["value"]).To(Equal("pem"))
+				}
+			}
+			Expect(foundFile).To(BeTrue(), "expected spi-truststore-file-file in additionalOptions")
+			Expect(foundType).To(BeTrue(), "expected spi-truststore-file-type in additionalOptions")
 		})
 	})
 })
