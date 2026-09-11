@@ -220,6 +220,11 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
+	// Ensure the cluster CA bundle ConfigMap exists with the OpenShift inject label
+	if err := r.ensureClusterCABundle(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "failed to ensure cluster CA bundle ConfigMap")
+	}
+
 	// Reconcile Airgap Architect UI early so it's not blocked by downstream components
 	if err := r.reconcileArchitect(ctx, platform); err != nil {
 		log.FromContext(ctx).Error(err, "failed to reconcile airgap-architect")
@@ -5295,6 +5300,15 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 		unstructured.SetNestedField(sub.Object, cfg.StartingCSV, "spec", "startingCSV")
 	}
 
+	httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+	if proxyEnv := proxyEnvForSubscription(httpProxy, httpsProxy, noProxy); len(proxyEnv) > 0 {
+		envSlice := make([]interface{}, len(proxyEnv))
+		for i, e := range proxyEnv {
+			envSlice[i] = e
+		}
+		unstructured.SetNestedSlice(sub.Object, envSlice, "spec", "config", "env")
+	}
+
 	return r.Create(ctx, sub)
 }
 
@@ -6310,8 +6324,12 @@ func (r *DisconnectedPlatformReconciler) ensureArchitectBackend(ctx context.Cont
 		deploymentSide = "disconnected"
 	}
 
-	// Create container builder with GitHub token secret and deployment side
-	containerBuilder := makeBackendContainerBuilder(githubTokenSecretName, deploymentSide)
+	// Get cluster proxy settings
+	httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+	proxyEnvs := proxyEnvVarsUnstructured(httpProxy, httpsProxy, noProxy)
+
+	// Create container builder with GitHub token secret, deployment side, and proxy env vars
+	containerBuilder := makeBackendContainerBuilder(githubTokenSecretName, deploymentSide, proxyEnvs)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
 		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, containerBuilder)
@@ -6334,7 +6352,7 @@ func architectBackendDeployment(name, image string, replicas int32, labels map[s
 }
 
 // makeBackendContainerBuilder creates a container builder function with GitHub token secret support
-func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) containerBuilder {
+func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string, proxyEnvs []map[string]interface{}) containerBuilder {
 	return func(name, image string, labels map[string]string) map[string]interface{} {
 		env := []interface{}{
 			map[string]interface{}{
@@ -6417,6 +6435,24 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			})
 		}
 
+		// Add proxy env vars
+		for _, pe := range proxyEnvs {
+			env = append(env, pe)
+		}
+
+		// Add NODE_EXTRA_CA_CERTS for the CA bundle
+		env = append(env, map[string]interface{}{
+			"name":  "NODE_EXTRA_CA_CERTS",
+			"value": "/etc/pki/ca-trust/extracted/pem/ca-bundle.crt",
+		})
+
+		// Add trusted CA volume mount
+		volumeMounts = append(volumeMounts, map[string]interface{}{
+			"name":      clusterCAVolumeName,
+			"mountPath": "/etc/pki/ca-trust/extracted/pem",
+			"readOnly":  true,
+		})
+
 		return map[string]interface{}{
 			"name":            "airgap-architect-backend",
 			"image":           image,
@@ -6451,10 +6487,6 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string) c
 			},
 		}
 	}
-}
-
-func backendContainer(name, image string, labels map[string]string) map[string]interface{} {
-	return makeBackendContainerBuilder("", "connected")(name, image, labels)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureArchitectService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name string, port int32, labels map[string]string) error {
@@ -7001,6 +7033,13 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 			"name": "tls-cert",
 			"secret": map[string]interface{}{
 				"secretName": name + "-cert",
+			},
+		})
+		volumes = append(volumes, map[string]interface{}{
+			"name": clusterCAVolumeName,
+			"configMap": map[string]interface{}{
+				"name":     clusterCABundleName,
+				"optional": true,
 			},
 		})
 	}
@@ -8617,6 +8656,9 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "sbom-parallel-jobs", "type": "string", "default": "8", "description": "Number of parallel syft SBOM scans"},
 		{"name": "rhcos-download-enabled", "type": "string", "default": "true", "description": "Download RHCOS boot images for ACM host inventory"},
 		{"name": "rhcos-server-base-image", "type": "string", "default": "registry.access.redhat.com/ubi9/nginx-122:latest", "description": "Base image for RHCOS server container"},
+		{"name": "http-proxy", "type": "string", "default": "", "description": "HTTP proxy URL from cluster config"},
+		{"name": "https-proxy", "type": "string", "default": "", "description": "HTTPS proxy URL from cluster config"},
+		{"name": "no-proxy", "type": "string", "default": "", "description": "No-proxy hosts from cluster config"},
 	}
 
 	// Define workspaces
@@ -8699,10 +8741,46 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 	return nil
 }
 
+func pipelineProxyEnvVars() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"name": "HTTP_PROXY", "value": "$(params.http-proxy)"},
+		{"name": "HTTPS_PROXY", "value": "$(params.https-proxy)"},
+		{"name": "NO_PROXY", "value": "$(params.no-proxy)"},
+		{"name": "http_proxy", "value": "$(params.http-proxy)"},
+		{"name": "https_proxy", "value": "$(params.https-proxy)"},
+		{"name": "no_proxy", "value": "$(params.no-proxy)"},
+	}
+}
+
+func appendEnvVars(existing []map[string]interface{}, extra []map[string]interface{}) []map[string]interface{} {
+	return append(existing, extra...)
+}
+
+func injectProxyAndCAIntoTask(task map[string]interface{}, needsProxy, needsCA bool) map[string]interface{} {
+	if !needsProxy {
+		return task
+	}
+
+	taskSpec, ok := task["taskSpec"].(map[string]interface{})
+	if !ok {
+		return task
+	}
+
+	steps, ok := taskSpec["steps"].([]map[string]interface{})
+	if ok {
+		for i, step := range steps {
+			existing, _ := step["env"].([]map[string]interface{})
+			steps[i]["env"] = appendEnvVars(existing, pipelineProxyEnvVars())
+		}
+	}
+
+	return task
+}
+
 // buildPipelineTasks constructs the task definitions for the collection pipeline
 // All tasks are defined with 'when' expressions - Tekton will skip tasks based on params
 func (r *DisconnectedPlatformReconciler) buildPipelineTasks() []map[string]interface{} {
-	return []map[string]interface{}{
+	tasks := []map[string]interface{}{
 		// Task 1: dry-run (only for m2m workflow, runs after RHCOS server image is pushed so it appears in mapping.txt)
 		{
 			"name":     "dry-run",
@@ -10737,6 +10815,25 @@ fi
 			},
 		},
 	}
+
+	proxyTasks := map[string]bool{
+		"dry-run": true, "mirror-to-intermediate": true, "syft-sbom": true,
+		"sign-images": true, "oc-mirror": true, "mirror-from-intermediate": true,
+		"download-cli-tools": true, "upload-to-s3": true, "upload-sbom": true,
+		"download-rhcos-images": true, "export-architect-images": true,
+	}
+	caTasks := map[string]bool{
+		"dry-run": true, "mirror-to-intermediate": true, "syft-sbom": true,
+		"sign-images": true, "oc-mirror": true, "mirror-from-intermediate": true,
+		"build-rhcos-server": true, "export-architect-images": true,
+	}
+
+	for i, task := range tasks {
+		name, _ := task["name"].(string)
+		tasks[i] = injectProxyAndCAIntoTask(task, proxyTasks[name], caTasks[name])
+	}
+
+	return tasks
 }
 
 func (r *DisconnectedPlatformReconciler) buildPipelineFinallyTasks() []map[string]interface{} {
