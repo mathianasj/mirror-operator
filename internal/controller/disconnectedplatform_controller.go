@@ -5779,17 +5779,17 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundle(ctx context.Conte
 			Name:      clusterCABundleName,
 			Namespace: architectNamespace,
 			Labels: map[string]string{
-				"config.openshift.io/inject-ca-bundle": "true",
+				"config.openshift.io/inject-trusted-cabundle": "true",
 			},
 		},
 	}
 
 	existing := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
-		if existing.Labels["config.openshift.io/inject-ca-bundle"] == "true" {
+		if existing.Labels["config.openshift.io/inject-trusted-cabundle"] == "true" {
 			return nil
 		}
-		existing.Labels["config.openshift.io/inject-ca-bundle"] = "true"
+		existing.Labels["config.openshift.io/inject-trusted-cabundle"] = "true"
 		return r.Update(ctx, existing)
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -6440,19 +6440,6 @@ func makeBackendContainerBuilder(githubTokenSecretName, deploymentSide string, p
 			env = append(env, pe)
 		}
 
-		// Add NODE_EXTRA_CA_CERTS for the CA bundle
-		env = append(env, map[string]interface{}{
-			"name":  "NODE_EXTRA_CA_CERTS",
-			"value": "/etc/pki/ca-trust/extracted/pem/ca-bundle.crt",
-		})
-
-		// Add trusted CA volume mount
-		volumeMounts = append(volumeMounts, map[string]interface{}{
-			"name":      clusterCAVolumeName,
-			"mountPath": "/etc/pki/ca-trust/extracted/pem",
-			"readOnly":  true,
-		})
-
 		return map[string]interface{}{
 			"name":            "airgap-architect-backend",
 			"image":           image,
@@ -7035,13 +7022,6 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 				"secretName": name + "-cert",
 			},
 		})
-		volumes = append(volumes, map[string]interface{}{
-			"name": clusterCAVolumeName,
-			"configMap": map[string]interface{}{
-				"name":     clusterCABundleName,
-				"optional": true,
-			},
-		})
 	}
 
 	// Add serving cert volume for console plugin component
@@ -7054,6 +7034,7 @@ func architectDeploymentSpec(name, image string, replicas int32, labels map[stri
 		})
 	}
 
+	// Add cluster CA bundle volume for backend and frontend
 	if component == "backend" || component == "frontend" {
 		volumes = append(volumes, map[string]interface{}{
 			"name": clusterCAVolumeName,
