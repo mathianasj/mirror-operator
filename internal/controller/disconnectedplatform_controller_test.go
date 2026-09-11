@@ -972,8 +972,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				},
 				"additionalOptions": []map[string]interface{}{
 					{"name": "KEYCLOAK_ADMIN", "value": "admin"},
-					{"name": "spi-truststore-file-file", "value": clusterCAFilePath},
-					{"name": "spi-truststore-file-type", "value": "pem"},
+					{"name": "truststore-paths", "value": clusterCAFilePath},
 				},
 				"unsupported": map[string]interface{}{
 					"podTemplate": map[string]interface{}{
@@ -1024,22 +1023,16 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			Expect(mounts[0]["name"]).To(Equal(clusterCAVolumeName))
 			Expect(mounts[0]["mountPath"]).To(Equal(clusterCAMountPath))
 
-			// Verify SPI truststore in additionalOptions
+			// Verify truststore-paths in additionalOptions
 			opts := kcSpec["additionalOptions"].([]map[string]interface{})
-			foundFile := false
-			foundType := false
+			foundPaths := false
 			for _, opt := range opts {
-				if opt["name"] == "spi-truststore-file-file" {
-					foundFile = true
+				if opt["name"] == "truststore-paths" {
+					foundPaths = true
 					Expect(opt["value"]).To(Equal(clusterCAFilePath))
 				}
-				if opt["name"] == "spi-truststore-file-type" {
-					foundType = true
-					Expect(opt["value"]).To(Equal("pem"))
-				}
 			}
-			Expect(foundFile).To(BeTrue(), "expected spi-truststore-file-file in additionalOptions")
-			Expect(foundType).To(BeTrue(), "expected spi-truststore-file-type in additionalOptions")
+			Expect(foundPaths).To(BeTrue(), "expected truststore-paths in additionalOptions")
 		})
 	})
 })
