@@ -209,6 +209,10 @@ func injectCABundleIntoTasks(tasks []map[string]interface{}) []map[string]interf
 				"value": caPath,
 			})
 			env = append(env, map[string]interface{}{
+				"name":  "CURL_CA_BUNDLE",
+				"value": caPath,
+			})
+			env = append(env, map[string]interface{}{
 				"name":  "AWS_CA_BUNDLE",
 				"value": caPath,
 			})

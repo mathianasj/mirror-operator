@@ -860,6 +860,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 						envNames[e["name"].(string)] = e["value"].(string)
 					}
 					Expect(envNames).To(HaveKeyWithValue("SSL_CERT_FILE", caPath))
+					Expect(envNames).To(HaveKeyWithValue("CURL_CA_BUNDLE", caPath))
 					Expect(envNames).To(HaveKeyWithValue("AWS_CA_BUNDLE", caPath))
 					Expect(envNames).To(HaveKeyWithValue("REQUESTS_CA_BUNDLE", caPath))
 				}
@@ -869,7 +870,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			task2Spec := result[1]["taskSpec"].(map[string]interface{})
 			task2Steps := task2Spec["steps"].([]map[string]interface{})
 			task2Env := task2Steps[0]["env"].([]map[string]interface{})
-			Expect(task2Env).To(HaveLen(4))
+			Expect(task2Env).To(HaveLen(5))
 			Expect(task2Env[0]["name"]).To(Equal("EXISTING_VAR"))
 		})
 	})
