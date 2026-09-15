@@ -231,54 +231,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	if tektonAvailable {
-		if err = (&controller.CollectionPipelineReconciler{
+	collectionSetup := func() error {
+		return (&controller.CollectionPipelineReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
 			MirrorImage: mirrorImage,
 			ClientSet:   clientSet,
-		}).SetupWithManager(mgr); err != nil {
+		}).SetupWithManager(mgr)
+	}
+	mirrorImportSetup := func() error {
+		return (&controller.MirrorImportReconciler{
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			MirrorImage: mirrorImage,
+		}).SetupWithManager(mgr)
+	}
+
+	if tektonAvailable {
+		if err = collectionSetup(); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "CollectionPipeline")
 			os.Exit(1)
 		}
-	} else {
-		setupLog.Info("Tekton CRDs not available, CollectionPipeline controller will be registered when CRDs appear")
-		if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-ticker.C:
-					if isAPIGroupAvailable(clientSet, "tekton.dev/v1") {
-						setupLog.Info("Tekton CRDs detected, registering CollectionPipeline controller")
-						if err := (&controller.CollectionPipelineReconciler{
-							Client:      mgr.GetClient(),
-							Scheme:      mgr.GetScheme(),
-							MirrorImage: mirrorImage,
-							ClientSet:   clientSet,
-						}).SetupWithManager(mgr); err != nil {
-							setupLog.Error(err, "failed to register CollectionPipeline controller dynamically")
-							continue
-						}
-						return nil
-					}
-				}
-			}
-		})); err != nil {
-			setupLog.Error(err, "unable to add Tekton CRD watcher")
+		if err = mirrorImportSetup(); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "MirrorImport")
 			os.Exit(1)
 		}
-	}
-
-	if err = (&controller.MirrorImportReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		MirrorImage: mirrorImage,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "MirrorImport")
-		os.Exit(1)
+	} else {
+		if err = registerWhenCRDAvailable(mgr, clientSet, "tekton.dev/v1", "CollectionPipeline", collectionSetup); err != nil {
+			setupLog.Error(err, "unable to add Tekton CRD watcher for CollectionPipeline")
+			os.Exit(1)
+		}
+		if err = registerWhenCRDAvailable(mgr, clientSet, "tekton.dev/v1", "MirrorImport", mirrorImportSetup); err != nil {
+			setupLog.Error(err, "unable to add Tekton CRD watcher for MirrorImport")
+			os.Exit(1)
+		}
 	}
 	if err = (&controller.ClusterBootstrapReconciler{
 		Client: mgr.GetClient(),
@@ -288,36 +274,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	if securesignAvailable {
-		if err = (&controller.RHTASHealthCheckReconciler{
+	rhtasSetup := func() error {
+		return (&controller.RHTASHealthCheckReconciler{
 			Client: mgr.GetClient(),
-		}).SetupWithManager(mgr); err != nil {
+		}).SetupWithManager(mgr)
+	}
+	if securesignAvailable {
+		if err = rhtasSetup(); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "RHTASHealthCheck")
 			os.Exit(1)
 		}
 	} else {
-		setupLog.Info("Securesign CRDs not available, RHTASHealthCheck controller will be registered when CRDs appear")
-		if err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-ticker.C:
-					if isAPIGroupAvailable(clientSet, "rhtas.redhat.com/v1alpha1") {
-						setupLog.Info("Securesign CRDs detected, registering RHTASHealthCheck controller")
-						if err := (&controller.RHTASHealthCheckReconciler{
-							Client: mgr.GetClient(),
-						}).SetupWithManager(mgr); err != nil {
-							setupLog.Error(err, "failed to register RHTASHealthCheck controller dynamically")
-							continue
-						}
-						return nil
-					}
-				}
-			}
-		})); err != nil {
+		if err = registerWhenCRDAvailable(mgr, clientSet, "rhtas.redhat.com/v1alpha1", "RHTASHealthCheck", rhtasSetup); err != nil {
 			setupLog.Error(err, "unable to add Securesign CRD watcher")
 			os.Exit(1)
 		}
@@ -343,4 +311,27 @@ func main() {
 func isAPIGroupAvailable(clientSet kubernetes.Interface, groupVersion string) bool {
 	_, err := clientSet.Discovery().ServerResourcesForGroupVersion(groupVersion)
 	return err == nil
+}
+
+func registerWhenCRDAvailable(mgr manager.Manager, clientSet kubernetes.Interface, apiGroup string, controllerName string, setup func() error) error {
+	setupLog.Info(apiGroup + " CRDs not available, " + controllerName + " controller will be registered when CRDs appear")
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				if isAPIGroupAvailable(clientSet, apiGroup) {
+					setupLog.Info(apiGroup + " CRDs detected, registering " + controllerName + " controller")
+					if err := setup(); err != nil {
+						setupLog.Error(err, "failed to register "+controllerName+" controller dynamically")
+						continue
+					}
+					return nil
+				}
+			}
+		}
+	}))
 }
