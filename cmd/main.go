@@ -216,6 +216,7 @@ func main() {
 	if err = (&controller.DisconnectedPlatformReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
+		Recorder:                    mgr.GetEventRecorderFor("disconnectedplatform-controller"),
 		MirrorImage:                 mirrorImage,
 		ArchitectFrontendImage:      architectFrontendImage,
 		ArchitectBackendImage:       architectBackendImage,

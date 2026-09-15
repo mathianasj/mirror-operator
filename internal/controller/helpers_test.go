@@ -662,6 +662,174 @@ var _ = Describe("Proxy and CA helpers", func() {
 		})
 	})
 
+	Describe("validateProxyConfig", func() {
+		It("returns no warnings when no proxy is configured", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(BeEmpty())
+		})
+
+		It("returns no warnings when proxy has correct noProxy entries", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, ".svc,.svc.cluster.local,.apps.cluster.example.com", "spec", "noProxy")
+
+			ingressCR := &unstructured.Unstructured{}
+			ingressCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Ingress",
+			})
+			ingressCR.SetName("cluster")
+			unstructured.SetNestedField(ingressCR.Object, "apps.cluster.example.com", "spec", "domain")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR, ingressCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(BeEmpty())
+		})
+
+		It("returns warning when apps domain is missing from noProxy", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, ".svc,.svc.cluster.local", "spec", "noProxy")
+
+			ingressCR := &unstructured.Unstructured{}
+			ingressCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Ingress",
+			})
+			ingressCR.SetName("cluster")
+			unstructured.SetNestedField(ingressCR.Object, "apps.cluster.example.com", "spec", "domain")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR, ingressCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(HaveLen(1))
+			Expect(warnings[0]).To(ContainSubstring(".apps.cluster.example.com"))
+		})
+
+		It("returns warning when .svc is missing from noProxy", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "spec", "httpsProxy")
+			unstructured.SetNestedField(proxyCR.Object, ".svc.cluster.local", "spec", "noProxy")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(HaveLen(1))
+			Expect(warnings[0]).To(ContainSubstring(".svc"))
+		})
+
+		It("returns no warnings when noProxy is wildcard *", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, "*", "spec", "noProxy")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(BeEmpty())
+		})
+
+		It("returns multiple warnings for missing .svc and apps domain", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, "10.0.0.0/8", "spec", "noProxy")
+
+			ingressCR := &unstructured.Unstructured{}
+			ingressCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Ingress",
+			})
+			ingressCR.SetName("cluster")
+			unstructured.SetNestedField(ingressCR.Object, "apps.mycluster.example.com", "spec", "domain")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR, ingressCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(HaveLen(3))
+		})
+
+		It("accepts apps domain without leading dot", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+
+			proxyCR := &unstructured.Unstructured{}
+			proxyCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+			})
+			proxyCR.SetName("cluster")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, ".svc,.svc.cluster.local,apps.cluster.example.com", "spec", "noProxy")
+
+			ingressCR := &unstructured.Unstructured{}
+			ingressCR.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "config.openshift.io", Version: "v1", Kind: "Ingress",
+			})
+			ingressCR.SetName("cluster")
+			unstructured.SetNestedField(ingressCR.Object, "apps.cluster.example.com", "spec", "domain")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR, ingressCR).Build()
+			warnings := validateProxyConfig(ctx, c)
+			Expect(warnings).To(BeEmpty())
+		})
+	})
+
+	Describe("noProxyContains", func() {
+		It("matches exact entry", func() {
+			Expect(noProxyContains([]string{".svc", ".local"}, ".svc")).To(BeTrue())
+		})
+
+		It("matches domain without leading dot", func() {
+			Expect(noProxyContains([]string{"apps.example.com"}, ".apps.example.com")).To(BeTrue())
+		})
+
+		It("returns false for missing entry", func() {
+			Expect(noProxyContains([]string{".svc"}, ".apps.example.com")).To(BeFalse())
+		})
+
+		It("matches via parent domain wildcard", func() {
+			Expect(noProxyContains([]string{".example.com"}, ".apps.example.com")).To(BeTrue())
+		})
+	})
+
 	Describe("containsString and removeString", func() {
 		It("containsString works correctly", func() {
 			Expect(containsString([]string{"a", "b", "c"}, "b")).To(BeTrue())

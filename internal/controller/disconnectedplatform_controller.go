@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -110,6 +111,7 @@ var (
 type DisconnectedPlatformReconciler struct {
 	client.Client
 	Scheme                      *runtime.Scheme
+	Recorder                    record.EventRecorder
 	MirrorImage                 string
 	ArchitectFrontendImage      string
 	ArchitectBackendImage       string
@@ -179,6 +181,7 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=metal3.io,resources=provisionings,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agentserviceconfigs,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=proxies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch
@@ -211,6 +214,19 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 
 	platform.Status.Phase = mirrorv1.PlatformPhaseReady
 	platform.Status.Components = nil
+
+	if warnings := validateProxyConfig(ctx, r.Client); len(warnings) > 0 {
+		logger := log.FromContext(ctx)
+		msg := fmt.Sprintf("NO_PROXY is missing: %s", strings.Join(warnings, "; "))
+		logger.Info("Proxy misconfiguration detected", "warnings", warnings)
+		for _, w := range warnings {
+			r.Recorder.Eventf(platform, corev1.EventTypeWarning, "ProxyMisconfigured",
+				"NO_PROXY is missing %s — internal traffic may be incorrectly routed through the proxy", w)
+		}
+		r.updateDegradedCondition(ctx, platform, "ProxyMisconfigured", msg)
+	} else {
+		r.clearDegradedCondition(ctx, platform, "ProxyMisconfigured")
+	}
 
 	if platform.Spec.Mode == mirrorv1.PlatformModeConnected {
 		if err := r.reconcileSubscriptions(ctx, platform); err != nil {

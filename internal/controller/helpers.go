@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -335,4 +337,90 @@ func (r *DisconnectedPlatformReconciler) reconcileTrustedCAConfigMap(ctx context
 	}
 	logger.Info("Created trusted CA bundle ConfigMap with inject label")
 	return nil
+}
+
+func validateProxyConfig(ctx context.Context, c client.Client) []string {
+	logger := log.FromContext(ctx)
+
+	proxy := &unstructured.Unstructured{}
+	proxy.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Proxy",
+	})
+	proxy.SetName("cluster")
+
+	if err := c.Get(ctx, client.ObjectKeyFromObject(proxy), proxy); err != nil {
+		logger.V(1).Info("Could not read Proxy CR for validation", "error", err)
+		return nil
+	}
+
+	httpProxy, _, _ := unstructured.NestedString(proxy.Object, "spec", "httpProxy")
+	httpsProxy, _, _ := unstructured.NestedString(proxy.Object, "spec", "httpsProxy")
+	if httpProxy == "" && httpsProxy == "" {
+		return nil
+	}
+
+	noProxy, _, _ := unstructured.NestedString(proxy.Object, "spec", "noProxy")
+	if noProxy == "*" {
+		return nil
+	}
+
+	noProxyEntries := strings.Split(noProxy, ",")
+	for i := range noProxyEntries {
+		noProxyEntries[i] = strings.TrimSpace(noProxyEntries[i])
+	}
+
+	var warnings []string
+
+	requiredSuffixes := []struct {
+		entry  string
+		reason string
+	}{
+		{".svc", "in-cluster service communication"},
+		{".svc.cluster.local", "in-cluster service FQDN resolution"},
+	}
+
+	for _, req := range requiredSuffixes {
+		if !noProxyContains(noProxyEntries, req.entry) {
+			warnings = append(warnings, fmt.Sprintf("%s (required for %s)", req.entry, req.reason))
+		}
+	}
+
+	ingress := &unstructured.Unstructured{}
+	ingress.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Ingress",
+	})
+	ingress.SetName("cluster")
+
+	if err := c.Get(ctx, client.ObjectKeyFromObject(ingress), ingress); err == nil {
+		domain, found, _ := unstructured.NestedString(ingress.Object, "spec", "domain")
+		if found && domain != "" {
+			dotDomain := "." + domain
+			if !noProxyContains(noProxyEntries, dotDomain) && !noProxyContains(noProxyEntries, domain) {
+				warnings = append(warnings, fmt.Sprintf("%s (required for route traffic to Quay, Keycloak, Architect UI)", dotDomain))
+			}
+		}
+	} else {
+		logger.V(1).Info("Could not read Ingress CR for proxy validation", "error", err)
+	}
+
+	return warnings
+}
+
+func noProxyContains(entries []string, target string) bool {
+	for _, e := range entries {
+		if e == target {
+			return true
+		}
+		if strings.HasPrefix(target, ".") && e == target[1:] {
+			return true
+		}
+		if strings.HasPrefix(e, ".") && strings.HasSuffix(target, e) {
+			return true
+		}
+	}
+	return false
 }
