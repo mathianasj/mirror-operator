@@ -29,7 +29,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           use_vertex: "true"
-          model: "claude-opus-4-6"
+          claude_args: "--model claude-opus-4-6"
+          show_full_output: "true"
           trigger_phrase: "@claude"
         env:
           CLOUD_ML_REGION: ${{ secrets.GCP_REGION }}
