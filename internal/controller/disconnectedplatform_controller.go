@@ -945,11 +945,18 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
 						map[string]interface{}{
 							"name":      clusterCAVolumeName,
-							"mountPath": "/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-							"subPath":   clusterCABundleKey,
+							"mountPath": clusterCAMountPath,
 							"readOnly":  true,
 						},
 					}, "spec", "extraVolumeMounts"); err == nil {
+						needsUpdate = true
+					}
+					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
+						map[string]interface{}{
+							"name":  "CLIENT_TLS_CA_CERTIFICATES",
+							"value": clusterCAFilePath,
+						},
+					}, "spec", "extraEnv"); err == nil {
 						needsUpdate = true
 					}
 
@@ -1041,9 +1048,14 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		"extraVolumeMounts": []interface{}{
 			map[string]interface{}{
 				"name":      clusterCAVolumeName,
-				"mountPath": "/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-				"subPath":   clusterCABundleKey,
+				"mountPath": clusterCAMountPath,
 				"readOnly":  true,
+			},
+		},
+		"extraEnv": []interface{}{
+			map[string]interface{}{
+				"name":  "CLIENT_TLS_CA_CERTIFICATES",
+				"value": clusterCAFilePath,
 			},
 		},
 		"database": map[string]interface{}{
