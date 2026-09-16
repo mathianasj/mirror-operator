@@ -57,6 +57,9 @@ const (
 	clusterCAMountPath    = "/etc/pki/ca-trust/custom"
 	clusterCAFilePath     = clusterCAMountPath + "/" + clusterCABundleKey
 	clusterCAVolumeName   = "cluster-ca-bundle"
+	serviceCAConfigMap    = "config-service-cabundle"
+	serviceCAKey          = "service-ca.crt"
+	combinedCABundleName  = "combined-ca-bundle"
 )
 
 var (
@@ -223,6 +226,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	// Ensure the cluster CA bundle ConfigMap exists with the OpenShift inject label
 	if err := r.ensureClusterCABundle(ctx); err != nil {
 		log.FromContext(ctx).Error(err, "failed to ensure cluster CA bundle ConfigMap")
+	}
+
+	if err := r.ensureCombinedCABundle(ctx); err != nil {
+		log.FromContext(ctx).V(1).Info("combined CA bundle not yet available", "error", err)
 	}
 
 	// Reconcile Airgap Architect UI early so it's not blocked by downstream components
@@ -4655,11 +4662,11 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Contex
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(securesign), securesign); err == nil {
 		annotations := securesign.GetAnnotations()
-		if annotations == nil || annotations["rhtas.redhat.com/trusted-ca"] != clusterCABundleName {
+		if annotations == nil || annotations["rhtas.redhat.com/trusted-ca"] != combinedCABundleName {
 			if annotations == nil {
 				annotations = make(map[string]string)
 			}
-			annotations["rhtas.redhat.com/trusted-ca"] = clusterCABundleName
+			annotations["rhtas.redhat.com/trusted-ca"] = combinedCABundleName
 			securesign.SetAnnotations(annotations)
 			if err := r.Update(ctx, securesign); err != nil {
 				log.FromContext(ctx).Error(err, "failed to update Securesign trusted-ca annotation")
@@ -4756,7 +4763,7 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTASConfig(ctx context.Contex
 
 	securesign.Object["spec"] = spec
 	securesign.SetAnnotations(map[string]string{
-		"rhtas.redhat.com/trusted-ca": clusterCABundleName,
+		"rhtas.redhat.com/trusted-ca": combinedCABundleName,
 	})
 
 	return r.Create(ctx, securesign)
@@ -5918,6 +5925,83 @@ func (r *DisconnectedPlatformReconciler) getClusterCABundleData(ctx context.Cont
 		return nil, fmt.Errorf("cluster CA bundle ConfigMap has no %s key", clusterCABundleKey)
 	}
 	return []byte(caData), nil
+}
+
+func (r *DisconnectedPlatformReconciler) ensureServiceCAConfigMap(ctx context.Context) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceCAConfigMap,
+			Namespace: architectNamespace,
+			Annotations: map[string]string{
+				"service.beta.openshift.io/inject-cabundle": "true",
+			},
+		},
+	}
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+		if existing.Annotations["service.beta.openshift.io/inject-cabundle"] == "true" {
+			return nil
+		}
+		if existing.Annotations == nil {
+			existing.Annotations = make(map[string]string)
+		}
+		existing.Annotations["service.beta.openshift.io/inject-cabundle"] = "true"
+		return r.Update(ctx, existing)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	return r.Create(ctx, cm)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureCombinedCABundle(ctx context.Context) error {
+	logger := log.FromContext(ctx)
+
+	if err := r.ensureServiceCAConfigMap(ctx); err != nil {
+		logger.V(1).Info("service CA ConfigMap not yet available", "error", err)
+	}
+
+	clusterCA, _ := r.getClusterCABundleData(ctx)
+	serviceCA := ""
+	serviceCACM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: serviceCAConfigMap, Namespace: architectNamespace}, serviceCACM); err == nil {
+		serviceCA = serviceCACM.Data[serviceCAKey]
+	}
+
+	combined := string(clusterCA)
+	if serviceCA != "" {
+		if combined != "" {
+			combined += "\n"
+		}
+		combined += serviceCA
+	}
+
+	if combined == "" {
+		return nil
+	}
+
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: combinedCABundleName, Namespace: architectNamespace}, existing); err == nil {
+		if existing.Data[clusterCABundleKey] == combined {
+			return nil
+		}
+		existing.Data[clusterCABundleKey] = combined
+		logger.Info("Updating combined CA bundle ConfigMap")
+		return r.Update(ctx, existing)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      combinedCABundleName,
+			Namespace: architectNamespace,
+		},
+		Data: map[string]string{
+			clusterCABundleKey: combined,
+		},
+	}
+	logger.Info("Creating combined CA bundle ConfigMap")
+	return r.Create(ctx, cm)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureQuayCAInConfigBundle(ctx context.Context, quayRegistry *unstructured.Unstructured) error {
