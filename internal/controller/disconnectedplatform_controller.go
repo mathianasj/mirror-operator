@@ -931,6 +931,28 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 						needsUpdate = true
 					}
 
+					// Ensure extraVolumes/extraVolumeMounts for cluster CA bundle
+					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
+						map[string]interface{}{
+							"name": clusterCAVolumeName,
+							"configMap": map[string]interface{}{
+								"name": clusterCABundleName,
+							},
+						},
+					}, "spec", "extraVolumes"); err == nil {
+						needsUpdate = true
+					}
+					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
+						map[string]interface{}{
+							"name":      clusterCAVolumeName,
+							"mountPath": "/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+							"subPath":   clusterCABundleKey,
+							"readOnly":  true,
+						},
+					}, "spec", "extraVolumeMounts"); err == nil {
+						needsUpdate = true
+					}
+
 					if needsUpdate {
 						if updateErr := r.Update(ctx, existingTPA); updateErr != nil {
 							log.FromContext(ctx).Error(updateErr, "Failed to update TPA")
@@ -1007,6 +1029,22 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		"appDomain": appDomain,
 		"openshift": map[string]interface{}{
 			"useServiceCa": true,
+		},
+		"extraVolumes": []interface{}{
+			map[string]interface{}{
+				"name": clusterCAVolumeName,
+				"configMap": map[string]interface{}{
+					"name": clusterCABundleName,
+				},
+			},
+		},
+		"extraVolumeMounts": []interface{}{
+			map[string]interface{}{
+				"name":      clusterCAVolumeName,
+				"mountPath": "/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+				"subPath":   clusterCABundleKey,
+				"readOnly":  true,
+			},
 		},
 		"database": map[string]interface{}{
 			"host":     dbHost,
