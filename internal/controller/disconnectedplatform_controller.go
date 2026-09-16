@@ -5349,6 +5349,9 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 
 	caData, _ := r.getClusterCABundleData(ctx)
 	if len(caData) > 0 {
+		if err := r.ensureClusterCABundleInNamespace(ctx, op.ns); err != nil {
+			return fmt.Errorf("ensuring cluster CA bundle in %s: %w", op.ns, err)
+		}
 		envSlice = append(envSlice, map[string]interface{}{"name": "SSL_CERT_FILE", "value": clusterCAFilePath})
 		unstructured.SetNestedSlice(sub.Object, []interface{}{
 			map[string]interface{}{
@@ -5387,6 +5390,10 @@ func (r *DisconnectedPlatformReconciler) ensureSubscriptionCABundle(ctx context.
 				return nil
 			}
 		}
+	}
+
+	if err := r.ensureClusterCABundleInNamespace(ctx, sub.GetNamespace()); err != nil {
+		return fmt.Errorf("ensuring cluster CA bundle in %s: %w", sub.GetNamespace(), err)
 	}
 
 	envs, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "env")
@@ -5874,10 +5881,14 @@ func (r *DisconnectedPlatformReconciler) ensurePullSecret(ctx context.Context, s
 }
 
 func (r *DisconnectedPlatformReconciler) ensureClusterCABundle(ctx context.Context) error {
+	return r.ensureClusterCABundleInNamespace(ctx, architectNamespace)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureClusterCABundleInNamespace(ctx context.Context, namespace string) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      clusterCABundleName,
-			Namespace: architectNamespace,
+			Namespace: namespace,
 			Labels: map[string]string{
 				"config.openshift.io/inject-trusted-cabundle": "true",
 			},
