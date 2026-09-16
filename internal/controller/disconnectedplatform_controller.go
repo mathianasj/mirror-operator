@@ -45,18 +45,23 @@ import (
 )
 
 const (
-	platformFinalizer     = "mirror.mathianasj.github.com/platform-finalizer"
-	architectNamespace    = "mirror-operator-system"
-	defaultPullSecretName = "pull-secret"
-	defaultPullSecretNS   = "openshift-config"
-	pullSecretVolumeName  = "pull-secret"
-	pullSecretMountPath   = "/opt/app-root/src/.openshift"
-	pullSecretKey         = ".dockerconfigjson"
-	clusterCABundleName   = "cluster-ca-bundle"
-	clusterCABundleKey    = "ca-bundle.crt"
-	clusterCAMountPath    = "/etc/pki/ca-trust/custom"
-	clusterCAFilePath     = clusterCAMountPath + "/" + clusterCABundleKey
-	clusterCAVolumeName   = "cluster-ca-bundle"
+	platformFinalizer      = "mirror.mathianasj.github.com/platform-finalizer"
+	architectNamespace     = "mirror-operator-system"
+	defaultPullSecretName  = "pull-secret"
+	defaultPullSecretNS    = "openshift-config"
+	pullSecretVolumeName   = "pull-secret"
+	pullSecretMountPath    = "/opt/app-root/src/.openshift"
+	pullSecretKey          = ".dockerconfigjson"
+	clusterCABundleName    = "cluster-ca-bundle"
+	clusterCABundleKey     = "ca-bundle.crt"
+	clusterCAMountPath     = "/etc/pki/ca-trust/custom"
+	clusterCAFilePath      = clusterCAMountPath + "/" + clusterCABundleKey
+	clusterCAVolumeName    = "cluster-ca-bundle"
+	combinedCAName         = "trustify-combined-ca"
+	combinedCAKey          = "service-ca.crt"
+	combinedCAVolumeName   = "combined-ca"
+	serviceCAConfigMapName = "openshift-service-ca.crt"
+	serviceCAKey           = "service-ca.crt"
 )
 
 var (
@@ -931,12 +936,15 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 						needsUpdate = true
 					}
 
-					// Ensure extraVolumes/extraVolumeMounts for cluster CA bundle
+					// Ensure combined CA bundle for Trustify TLS trust
+					if err := r.ensureCombinedCABundle(ctx); err != nil {
+						log.FromContext(ctx).Error(err, "Failed to ensure combined CA bundle")
+					}
 					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
 						map[string]interface{}{
-							"name": clusterCAVolumeName,
+							"name": combinedCAVolumeName,
 							"configMap": map[string]interface{}{
-								"name": clusterCABundleName,
+								"name": combinedCAName,
 							},
 						},
 					}, "spec", "extraVolumes"); err == nil {
@@ -944,21 +952,15 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 					}
 					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
 						map[string]interface{}{
-							"name":      clusterCAVolumeName,
-							"mountPath": clusterCAMountPath,
+							"name":      combinedCAVolumeName,
+							"mountPath": "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+							"subPath":   combinedCAKey,
 							"readOnly":  true,
 						},
 					}, "spec", "extraVolumeMounts"); err == nil {
 						needsUpdate = true
 					}
-					if err := unstructured.SetNestedSlice(existingTPA.Object, []interface{}{
-						map[string]interface{}{
-							"name":  "CLIENT_TLS_CA_CERTIFICATES",
-							"value": clusterCAFilePath,
-						},
-					}, "spec", "extraEnv"); err == nil {
-						needsUpdate = true
-					}
+					unstructured.RemoveNestedField(existingTPA.Object, "spec", "extraEnv")
 
 					if needsUpdate {
 						if updateErr := r.Update(ctx, existingTPA); updateErr != nil {
@@ -1039,23 +1041,18 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 		},
 		"extraVolumes": []interface{}{
 			map[string]interface{}{
-				"name": clusterCAVolumeName,
+				"name": combinedCAVolumeName,
 				"configMap": map[string]interface{}{
-					"name": clusterCABundleName,
+					"name": combinedCAName,
 				},
 			},
 		},
 		"extraVolumeMounts": []interface{}{
 			map[string]interface{}{
-				"name":      clusterCAVolumeName,
-				"mountPath": clusterCAMountPath,
+				"name":      combinedCAVolumeName,
+				"mountPath": "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
+				"subPath":   combinedCAKey,
 				"readOnly":  true,
-			},
-		},
-		"extraEnv": []interface{}{
-			map[string]interface{}{
-				"name":  "CLIENT_TLS_CA_CERTIFICATES",
-				"value": clusterCAFilePath,
 			},
 		},
 		"database": map[string]interface{}{
@@ -1212,6 +1209,10 @@ func (r *DisconnectedPlatformReconciler) reconcileRHTPAConfig(ctx context.Contex
 	newTPA.SetName("mirror-operator-trusted-profile-analyzer")
 	newTPA.SetNamespace(architectNamespace)
 	newTPA.Object["spec"] = spec
+
+	if err := r.ensureCombinedCABundle(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to ensure combined CA bundle for TPA creation")
+	}
 
 	// Create or update TPA
 	currentTPA := &unstructured.Unstructured{}
@@ -5902,6 +5903,41 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundle(ctx context.Conte
 		return err
 	}
 	return r.Create(ctx, cm)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureCombinedCABundle(ctx context.Context) error {
+	serviceCACM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: serviceCAConfigMapName, Namespace: architectNamespace}, serviceCACM); err != nil {
+		return fmt.Errorf("reading service CA ConfigMap: %w", err)
+	}
+	serviceCA := serviceCACM.Data[serviceCAKey]
+
+	clusterCACM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: clusterCABundleName, Namespace: architectNamespace}, clusterCACM); err != nil {
+		return fmt.Errorf("reading cluster CA bundle ConfigMap: %w", err)
+	}
+	clusterCA := clusterCACM.Data[clusterCABundleKey]
+
+	combined := serviceCA + "\n" + clusterCA
+
+	existing := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: combinedCAName, Namespace: architectNamespace}, existing); err == nil {
+		if existing.Data[combinedCAKey] == combined {
+			return nil
+		}
+		existing.Data[combinedCAKey] = combined
+		return r.Update(ctx, existing)
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	return r.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      combinedCAName,
+			Namespace: architectNamespace,
+		},
+		Data: map[string]string{combinedCAKey: combined},
+	})
 }
 
 func (r *DisconnectedPlatformReconciler) getClusterCABundleData(ctx context.Context) ([]byte, error) {
