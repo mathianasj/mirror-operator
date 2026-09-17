@@ -64,6 +64,68 @@ No internet connectivity is required. All traffic is internal:
 | Mirror registry (e.g., `quay.airgap.local`) | Destination for imported images |
 | PVC mount path (e.g., `/mnt/physical-media`) | Source for bundle imports |
 
+## Importer Machine Requirements
+
+The importer machine (bastion host) runs the `import-airgap-architect.sh` script in the airgapped environment. It installs a mirror-registry (Quay), mirrors images from the bundle archives, and runs the Airgap Architect UI containers via podman.
+
+### Compute
+
+| Resource | Recommended |
+|----------|-------------|
+| **CPU** | 8 cores |
+| **RAM** | 32 GB |
+| **OS** | RHEL 9 |
+| **Software** | podman, openssl |
+
+### Storage — Non-STIG Machine
+
+Assumes a 150 GB bundle: download tar to `/opt/bundle`, extract, delete tar, then run the script.
+
+| Mount | Contents | Peak | Steady-State | Recommended |
+|-------|----------|------|-------------|-------------|
+| `/opt` | Bundle (150 GB) + Quay data at `/opt/quay` (150 GB) + oc-mirror workspace (75 GB temp) | 375 GB | 300 GB | **500 GB** |
+| `/home` | Podman container images (`~/.local/share/containers/storage`) + CLI tools (`~/.local/bin`) | 7 GB | 7 GB | **20 GB** |
+| `/` | OS base | 20 GB | 20 GB | **50 GB** |
+| **Total** | | | | **570 GB** |
+
+### Storage — STIG Machine
+
+Same assumptions. STIG adds separate partitions and relocates CLI tools to `/usr/local/bin`.
+
+| Mount | Contents | Peak | Steady-State | Recommended |
+|-------|----------|------|-------------|-------------|
+| `/opt` | Bundle (150 GB) + Quay data at `/opt/quay` (150 GB) + oc-mirror workspace (75 GB temp) | 375 GB | 300 GB | **500 GB** |
+| `/home` | Podman container images (`~/.local/share/containers/storage`); noexec OK for storage | 5 GB | 5 GB | **20 GB** |
+| `/var` | Podman runtime data, logs | 5 GB | 3 GB | **20 GB** |
+| `/var/tmp` | oc-mirror temp files (set `TMPDIR=/opt/bundle/tmp` to avoid this) | 10 GB | 0 | **10 GB** |
+| `/tmp` | General temp; STIG mounts noexec, nosuid | 2 GB | 0 | **5 GB** |
+| `/usr` | CLI tools at `/usr/local/bin` (oc, oc-mirror, openshift-install) | 2 GB | 2 GB | **+2 GB** over base |
+| `/` | OS base | 15 GB | 15 GB | **30 GB** |
+| **Total** | | | | **~587 GB** |
+
+### Peak Storage Timeline at `/opt`
+
+```
+Step 1: Download tar           -> 150 GB  (tar file)
+Step 2: Extract bundle         -> 300 GB  (tar + extracted)       <- PEAK during extraction
+Step 3: Delete tar             -> 150 GB  (extracted only)
+Step 4: Script starts mirror   -> 375 GB  (bundle + workspace + Quay filling)  <- PEAK during operation
+Step 5: Mirror complete        -> 300 GB  (bundle + Quay data)
+Step 6: Optional bundle delete -> 150 GB  (Quay data only, if bundle no longer needed)
+```
+
+> **STIG note**: On STIG machines with small `/tmp` and `/var/tmp`, set `TMPDIR=/opt/bundle/tmp` before running the script to keep oc-mirror temp files on the large `/opt` partition.
+
+### Scaling the Estimates
+
+The storage formula scales linearly with bundle size:
+
+- **`/opt` recommended** = `bundle size x 2.5 + 125 GB`
+- **Peak at `/opt`** = `bundle size x 2.5`
+- **Steady-state at `/opt`** = `bundle size x 2`
+
+All other partition sizes remain constant regardless of bundle size.
+
 ## CLI Tools
 
 | Tool | Required | Purpose |
