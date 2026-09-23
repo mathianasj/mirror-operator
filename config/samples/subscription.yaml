@@ -1,0 +1,33 @@
+# Mirror Operator Subscription with CA bundle and proxy configuration.
+# Adjust proxy values and CA ConfigMap name for your environment.
+# The operator will self-configure these if omitted, but including them
+# avoids a one-time OLM restart on first reconcile.
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: mirror-operator
+  namespace: mirror-operator-system
+spec:
+  channel: alpha
+  installPlanApproval: Automatic
+  name: mirror-operator
+  source: community-operators
+  sourceNamespace: openshift-marketplace
+  config:
+    env:
+      - name: HTTP_PROXY
+        value: ""
+      - name: HTTPS_PROXY
+        value: ""
+      - name: NO_PROXY
+        value: ""
+      - name: SSL_CERT_FILE
+        value: /etc/pki/ca-trust/custom/ca-bundle.crt
+    volumes:
+      - name: cluster-ca-bundle
+        configMap:
+          name: cluster-ca-bundle
+    volumeMounts:
+      - name: cluster-ca-bundle
+        mountPath: /etc/pki/ca-trust/custom
+        readOnly: true

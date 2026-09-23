@@ -228,6 +228,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		log.FromContext(ctx).Error(err, "failed to ensure cluster CA bundle ConfigMap")
 	}
 
+	if err := r.ensureOwnSubscriptionConfig(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "failed to ensure own subscription config")
+	}
+
 	if err := r.ensureCombinedCABundle(ctx); err != nil {
 		log.FromContext(ctx).V(1).Info("combined CA bundle not yet available", "error", err)
 	}
@@ -5424,6 +5428,57 @@ func (r *DisconnectedPlatformReconciler) ensureSubscriptionCABundle(ctx context.
 	unstructured.SetNestedSlice(sub.Object, mounts, "spec", "config", "volumeMounts")
 
 	return r.Update(ctx, sub)
+}
+
+func (r *DisconnectedPlatformReconciler) ensureOwnSubscriptionConfig(ctx context.Context) error {
+	logger := log.FromContext(ctx)
+
+	subList := &unstructured.UnstructuredList{}
+	subList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   subscriptionGVK.Group,
+		Version: subscriptionGVK.Version,
+		Kind:    subscriptionGVK.Kind + "List",
+	})
+	if err := r.List(ctx, subList, client.InNamespace(architectNamespace)); err != nil {
+		return fmt.Errorf("listing subscriptions: %w", err)
+	}
+
+	for i := range subList.Items {
+		sub := &subList.Items[i]
+		pkgName, _, _ := unstructured.NestedString(sub.Object, "spec", "name")
+		if pkgName != "mirror-operator" {
+			continue
+		}
+
+		if err := r.ensureSubscriptionCABundle(ctx, sub); err != nil {
+			return fmt.Errorf("ensuring CA bundle on own subscription: %w", err)
+		}
+
+		httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+		proxyEnvs := proxyEnvForSubscription(httpProxy, httpsProxy, noProxy)
+		if len(proxyEnvs) == 0 {
+			return nil
+		}
+
+		envs, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "env")
+		for _, e := range envs {
+			if em, ok := e.(map[string]interface{}); ok {
+				if em["name"] == "HTTP_PROXY" {
+					return nil
+				}
+			}
+		}
+
+		for _, pe := range proxyEnvs {
+			envs = append(envs, pe)
+		}
+		unstructured.SetNestedSlice(sub.Object, envs, "spec", "config", "env")
+
+		logger.Info("Adding proxy config to own subscription")
+		return r.Update(ctx, sub)
+	}
+
+	return nil
 }
 
 func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {
