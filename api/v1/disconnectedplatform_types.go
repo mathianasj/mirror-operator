@@ -363,15 +363,27 @@ type RHTPAOIDCConfig struct {
 }
 
 type MirrorRegistryConfig struct {
-	// Storage path for Quay data
+	// Storage path for registry data on each node (e.g. dedicated disk mount)
 	// +kubebuilder:default="/opt/quay"
 	// +optional
 	DataPath string `json:"dataPath,omitempty"`
-	// Quay service port
+	// Quay HTTPS service port
 	// +kubebuilder:default=8443
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Port int32 `json:"port,omitempty"`
+	// Quay container image (must be pre-pushed to the bastion registry)
+	// +optional
+	QuayImage string `json:"quayImage,omitempty"`
+	// Redis container image (must be pre-pushed to the bastion registry)
+	// +optional
+	RedisImage string `json:"redisImage,omitempty"`
+	// Pause (infra) container image for the podman pod
+	// +optional
+	PauseImage string `json:"pauseImage,omitempty"`
+	// Reference to a Secret containing registry credentials for pulling mirror-registry images on nodes
+	// +optional
+	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
 }
 
 type AirgappedQuayConfig struct {

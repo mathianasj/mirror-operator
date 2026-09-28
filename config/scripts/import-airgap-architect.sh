@@ -1825,6 +1825,77 @@ wait_for_mirror_registry() {
     return 1
 }
 
+push_mirror_registry_images() {
+    if [ "${MIRROR_REGISTRY_INSTALL}" != "true" ]; then
+        return 0
+    fi
+
+    log ""
+    log "=== Pushing Mirror-Registry Images to Bastion Registry ==="
+    log "These images are needed by cluster nodes to run their own mirror registries."
+    log ""
+
+    local registry="${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}"
+    local repo_prefix="${registry}/mirror-registry"
+
+    podman login --tls-verify=false "${registry}" \
+        -u init -p "${MIRROR_REGISTRY_INIT_PASSWORD}" 2>/dev/null || true
+
+    local images_pushed=0
+    local images_failed=0
+
+    # Discover mirror-registry images from local podman
+    # These are extracted by the mirror-registry installer
+    local quay_image redis_image pause_image
+
+    quay_image=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep 'quay-rhel8' | head -1)
+    redis_image=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep 'redis-6' | head -1)
+    pause_image=$(podman images --format '{{.Repository}}:{{.Tag}}' | grep -E 'pause:[0-9]' | head -1)
+
+    for src_image in "${quay_image}" "${redis_image}" "${pause_image}"; do
+        if [ -z "${src_image}" ]; then
+            continue
+        fi
+
+        # Extract the image name and tag (e.g., quay-rhel8:v3.12.21)
+        local name_tag
+        name_tag=$(echo "${src_image}" | sed 's|.*/||')
+
+        local dest_image="${repo_prefix}/${name_tag}"
+
+        log "  Tagging ${src_image} -> ${dest_image}"
+        if ! podman tag "${src_image}" "${dest_image}"; then
+            log "  WARNING: Failed to tag ${src_image}"
+            images_failed=$((images_failed + 1))
+            continue
+        fi
+
+        log "  Pushing ${dest_image}..."
+        if podman push --tls-verify=false "${dest_image}" 2>/dev/null; then
+            log "  ✓ Pushed ${name_tag}"
+            images_pushed=$((images_pushed + 1))
+        else
+            log "  WARNING: Failed to push ${dest_image}"
+            images_failed=$((images_failed + 1))
+        fi
+    done
+
+    log ""
+    if [ ${images_pushed} -gt 0 ]; then
+        log "✓ Pushed ${images_pushed} mirror-registry images to ${repo_prefix}/"
+    fi
+    if [ ${images_failed} -gt 0 ]; then
+        log "WARNING: ${images_failed} images failed to push"
+    fi
+    if [ ${images_pushed} -eq 0 ] && [ ${images_failed} -eq 0 ]; then
+        log "WARNING: No mirror-registry images found in local podman storage"
+        log "  Expected images: quay-rhel8, redis-6, pause"
+        log "  Run 'podman images' to check available images"
+    fi
+
+    return 0
+}
+
 start_containers() {
     log "Starting Airgap Architect containers..."
 
@@ -1864,6 +1935,10 @@ start_containers() {
 
     # Wait for registry to be ready
     wait_for_mirror_registry
+
+    # Push mirror-registry images (quay, redis, pause) into the bastion registry
+    # so cluster nodes can pull them when deploying their own mirror registries
+    push_mirror_registry_images
 
     # Mirror bundle archives to registry if archives exist
     if [ -d "${SCRIPT_DIR}/archives" ] && [ "${SKIP_MIRROR}" != "true" ]; then

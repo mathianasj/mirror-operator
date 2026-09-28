@@ -184,10 +184,12 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=proxies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=imagetagmirrorsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterimagepolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=images,verbs=get;update;patch
 // +kubebuilder:rbac:groups=hive.openshift.io,resources=clusterimagesets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -7618,6 +7620,66 @@ func (h *collectionPipelineEventHandler) triggerPlatformReconcile(ctx context.Co
 	}
 }
 
+type nodeEventHandler struct {
+	client client.Client
+}
+
+func (h *nodeEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *nodeEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	oldNode, oldOk := e.ObjectOld.(*corev1.Node)
+	newNode, newOk := e.ObjectNew.(*corev1.Node)
+	if !oldOk || !newOk {
+		return
+	}
+
+	if _, hasMasterLabel := newNode.Labels["node-role.kubernetes.io/master"]; !hasMasterLabel {
+		return
+	}
+
+	oldReady := nodeReadyStatus(oldNode)
+	newReady := nodeReadyStatus(newNode)
+	if oldReady != newReady {
+		h.triggerPlatformReconcile(ctx, q)
+	}
+}
+
+func (h *nodeEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if node, ok := e.Object.(*corev1.Node); ok {
+		if _, hasMasterLabel := node.Labels["node-role.kubernetes.io/master"]; hasMasterLabel {
+			h.triggerPlatformReconcile(ctx, q)
+		}
+	}
+}
+
+func (h *nodeEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *nodeEventHandler) triggerPlatformReconcile(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	platformList := &mirrorv1.DisconnectedPlatformList{}
+	if err := h.client.List(ctx, platformList); err != nil {
+		return
+	}
+	for _, platform := range platformList.Items {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      platform.Name,
+				Namespace: platform.Namespace,
+			},
+		})
+	}
+}
+
+func nodeReadyStatus(node *corev1.Node) corev1.ConditionStatus {
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status
+		}
+	}
+	return corev1.ConditionUnknown
+}
+
 // taskRunEventHandler watches Tekton TaskRuns for mirror-to-intermediate completion
 // and restarts OSUS pods so they pick up the freshly mirrored graph-data image
 // before the mirror-from-intermediate task begins.
@@ -11416,5 +11478,6 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 	return b.
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
 		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
+		Watches(&corev1.Node{}, &nodeEventHandler{client: r.Client}).
 		Complete(r)
 }

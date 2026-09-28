@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -185,6 +186,41 @@ func importPipelineRunPhase(pr *pipelinev1.PipelineRun) string {
 	return "Pending"
 }
 
+func (r *MirrorImportReconciler) resolveNodeRegistries(ctx context.Context) string {
+	logger := log.FromContext(ctx)
+
+	platform, err := r.findPlatform(ctx)
+	if err != nil || platform == nil {
+		return ""
+	}
+	if platform.Spec.Airgapped.MirrorRegistryConfig == nil {
+		return ""
+	}
+
+	port := int32(8443)
+	if platform.Spec.Airgapped.MirrorRegistryConfig.Port != 0 {
+		port = platform.Spec.Airgapped.MirrorRegistryConfig.Port
+	}
+
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList, client.MatchingLabels{"node-role.kubernetes.io/master": ""}); err != nil {
+		logger.Error(err, "failed to list master nodes for node registry targets")
+		return ""
+	}
+
+	var targets []string
+	for _, node := range nodeList.Items {
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				targets = append(targets, fmt.Sprintf("%s:%d", addr.Address, port))
+				break
+			}
+		}
+	}
+
+	return strings.Join(targets, " ")
+}
+
 func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, importCR *mirrorv1.MirrorImport, configName string) (*pipelinev1.PipelineRun, error) {
 	mirrorImage := r.MirrorImage
 	if mirrorImage == "" {
@@ -198,12 +234,15 @@ func (r *MirrorImportReconciler) buildImportPipelineRun(ctx context.Context, imp
 		cosignPubSecret = importCR.Spec.Verify.PublicKeySecretRef.Name
 	}
 
+	nodeRegistries := r.resolveNodeRegistries(ctx)
+
 	params := []pipelinev1.Param{
 		{Name: "bundle-filename", Value: pipelinev1.ParamValue{Type: "string", StringVal: importCR.Spec.Bundle.Filename}},
 		{Name: "target-registry", Value: pipelinev1.ParamValue{Type: "string", StringVal: importCR.Spec.TargetRegistry.URL}},
 		{Name: "mirror-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorImage}},
 		{Name: "verify-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: verifyEnabled}},
 		{Name: "cosign-pub-secret", Value: pipelinev1.ParamValue{Type: "string", StringVal: cosignPubSecret}},
+		{Name: "node-registries", Value: pipelinev1.ParamValue{Type: "string", StringVal: nodeRegistries}},
 	}
 
 	workspaces := []pipelinev1.WorkspaceBinding{

@@ -1,0 +1,141 @@
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-mirror-registry
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /opt/quay/quay-config/config.yaml
+          mode: 0644
+          overwrite: true
+          contents:
+            source: "data:text/plain;base64,QVVUSEVOVElDQVRJT05fVFlQRTogRGF0YWJhc2UKQlVJTERMT0dTX1JFRElTOgogIGhvc3Q6IGxvY2FsaG9zdAogIHBhc3N3b3JkOiBtaXJyb3ItcmVnaXN0cnktcmVkaXMtcGFzcwogIHBvcnQ6IDYzNzkKREFUQUJBU0VfU0VDUkVUX0tFWTogYldseWNtOXlMWEpsWjJsemRISjVMV1JpTFhObFkzSmxkQzFyWlhrPQpEQl9VUkk6IHNxbGl0ZTovLy8vc3FsaXRlL3F1YXlfc3FsaXRlLmRiCkRFRkFVTFRfVEFHX0VYUElSQVRJT046IDJ3CkRJU1RSSUJVVEVEX1NUT1JBR0VfREVGQVVMVF9MT0NBVElPTlM6IFtdCkRJU1RSSUJVVEVEX1NUT1JBR0VfUFJFRkVSRU5DRToKICAtIGRlZmF1bHQKRElTVFJJQlVURURfU1RPUkFHRV9DT05GSUc6CiAgZGVmYXVsdDoKICAgIC0gTG9jYWxTdG9yYWdlCiAgICAtIHN0b3JhZ2VfcGF0aDogL2RhdGFzdG9yYWdlCkZFQVRVUkVfQU5PTllNT1VTX0FDQ0VTUzogdHJ1ZQpGRUFUVVJFX0JVSUxEX1NVUFBPUlQ6IGZhbHNlCkZFQVRVUkVfRElSRUNUX0xPR0lOOiB0cnVlCkZFQVRVUkVfTUFJTElORzogZmFsc2UKRkVBVFVSRV9TRUNVUklUWV9TQ0FOTkVSOiBmYWxzZQpGRUFUVVJFX1VTRVJfQ1JFQVRJT046IHRydWUKRkVBVFVSRV9VU0VSX0lOSVRJQUxJWkU6IHRydWUKQ1JFQVRFX05BTUVTUEFDRV9PTl9QVVNIOiB0cnVlClBSRUZFUlJFRF9VUkxfU0NIRU1FOiBodHRwcwpSRUdJU1RSWV9USVRMRTogTWlycm9yIFJlZ2lzdHJ5ClNFQ1JFVF9LRVk6IGJXbHljbTl5TFhKbFoybHpkSEo1TFhObFkzSmxkQzFyWlhrPQpTRVJWRVJfSE9TVE5BTUU6IGxvY2FsaG9zdDo4NDQzClNFVFVQX0NPTVBMRVRFOiB0cnVlClNVUEVSX1VTRVJTOgogIC0gYWRtaW4KVVNFUl9FVkVOVFNfUkVESVM6CiAgaG9zdDogbG9jYWxob3N0CiAgcGFzc3dvcmQ6IG1pcnJvci1yZWdpc3RyeS1yZWRpcy1wYXNzCiAgcG9ydDogNjM3OQpVU0VfQ0ROOiBmYWxzZQpXT1JLRVJfQ09VTlRfVU5TVVBQT1JURURfTUlOSU1VTTogMQpXT1JLRVJfQ09VTlQ6IDEK"
+        - path: /opt/quay/auth.json
+          mode: 0600
+          overwrite: true
+          contents:
+            source: "data:text/plain;base64,eyJhdXRocyI6eyJyZWdpc3RyeS5leGFtcGxlLmNvbTo4NDQzIjp7ImF1dGgiOiJkWE5sY2pwd1lYTnpkMjl5WkE9PSJ9fX0="
+        - path: /usr/local/bin/mirror-registry-init.sh
+          mode: 0755
+          overwrite: true
+          contents:
+            source: "data:text/plain;base64,IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKClFVQVlfQ09ORklHX0RJUj0iL29wdC9xdWF5L3F1YXktY29uZmlnIgpta2RpciAtcCAiJHtRVUFZX0NPTkZJR19ESVJ9IgoKIyBHZW5lcmF0ZSBzZWxmLXNpZ25lZCBUTFMgY2VydCBpZiBub3QgcHJlc2VudAppZiBbICEgLWYgIiR7UVVBWV9DT05GSUdfRElSfS9zc2wuY2VydCIgXTsgdGhlbgogICAgZWNobyAiR2VuZXJhdGluZyBzZWxmLXNpZ25lZCBUTFMgY2VydGlmaWNhdGUuLi4iCiAgICBOT0RFX0hPU1ROQU1FPSQoaG9zdG5hbWUpCiAgICBOT0RFX0lQPSQoaXAgLTQgYWRkciBzaG93IHNjb3BlIGdsb2JhbCB8IGdyZXAgLW9QICcoPzw9aW5ldFxzKVxkKyhcLlxkKyl7M30nIHwgaGVhZCAtMSkKCiAgICBjYXQgPiAiJHtRVUFZX0NPTkZJR19ESVJ9L29wZW5zc2wuY25mIiA8PEVPRgpbcmVxXQpkZWZhdWx0X2JpdHMgPSA0MDk2CmRlZmF1bHRfbWQgPSBzaGEyNTYKZGlzdGluZ3Vpc2hlZF9uYW1lID0gcmVxX2Rpc3Rpbmd1aXNoZWRfbmFtZQp4NTA5X2V4dGVuc2lvbnMgPSB2M19yZXEKcHJvbXB0ID0gbm8KW3JlcV9kaXN0aW5ndWlzaGVkX25hbWVdCkNOID0gJHtOT0RFX0hPU1ROQU1FfQpbdjNfcmVxXQprZXlVc2FnZSA9IG5vblJlcHVkaWF0aW9uLCBkaWdpdGFsU2lnbmF0dXJlLCBrZXlFbmNpcGhlcm1lbnQsIGtleUNlcnRTaWduCmV4dGVuZGVkS2V5VXNhZ2UgPSBzZXJ2ZXJBdXRoCnN1YmplY3RBbHROYW1lID0gQGFsdF9uYW1lcwpbYWx0X25hbWVzXQpETlMuMSA9ICR7Tk9ERV9IT1NUTkFNRX0KRE5TLjIgPSBsb2NhbGhvc3QKSVAuMSA9ICR7Tk9ERV9JUH0KSVAuMiA9IDEyNy4wLjAuMQpFT0YKCiAgICBvcGVuc3NsIHJlcSAteDUwOSAtbm9kZXMgLWRheXMgMzY1MCAtbmV3a2V5IHJzYTo0MDk2IFwKICAgICAgICAta2V5b3V0ICIke1FVQVlfQ09ORklHX0RJUn0vc3NsLmtleSIgXAogICAgICAgIC1vdXQgIiR7UVVBWV9DT05GSUdfRElSfS9zc2wuY2VydCIgXAogICAgICAgIC1jb25maWcgIiR7UVVBWV9DT05GSUdfRElSfS9vcGVuc3NsLmNuZiIgXAogICAgICAgIC1leHRlbnNpb25zIHYzX3JlcQoKICAgICMgTWFrZSBjZXJ0IGFuZCBrZXkgcmVhZGFibGUgYnkgUXVheSBjb250YWluZXIgdXNlciAoVUlEIDEwMDEpCiAgICBjaG1vZCA2NDQgIiR7UVVBWV9DT05GSUdfRElSfS9zc2wuY2VydCIgIiR7UVVBWV9DT05GSUdfRElSfS9zc2wua2V5IgoKICAgIGNwICIke1FVQVlfQ09ORklHX0RJUn0vc3NsLmNlcnQiIC9ldGMvcGtpL2NhLXRydXN0L3NvdXJjZS9hbmNob3JzL21pcnJvci1yZWdpc3RyeS5jcnQKICAgIHVwZGF0ZS1jYS10cnVzdAoKICAgIGVjaG8gIlRMUyBjZXJ0aWZpY2F0ZSBnZW5lcmF0ZWQgZm9yICR7Tk9ERV9IT1NUTkFNRX0gLyAke05PREVfSVB9IgpmaQoKIyBDcmVhdGUgcG9kbWFuIHZvbHVtZXMgaWYgdGhleSBkb24ndCBleGlzdApwb2RtYW4gdm9sdW1lIGV4aXN0cyBzcWxpdGUtc3RvcmFnZSAyPi9kZXYvbnVsbCB8fCBwb2RtYW4gdm9sdW1lIGNyZWF0ZSBzcWxpdGUtc3RvcmFnZQpwb2RtYW4gdm9sdW1lIGV4aXN0cyBxdWF5LXN0b3JhZ2UgMj4vZGV2L251bGwgfHwgcG9kbWFuIHZvbHVtZSBjcmVhdGUgcXVheS1zdG9yYWdlCgojIENyZWF0ZSByZWRpcyBwYXNzd29yZCBzZWNyZXQgaWYgaXQgZG9lc24ndCBleGlzdAppZiAhIHBvZG1hbiBzZWNyZXQgaW5zcGVjdCByZWRpc19wYXNzICY+L2Rldi9udWxsOyB0aGVuCiAgICBlY2hvIC1uICJtaXJyb3ItcmVnaXN0cnktcmVkaXMtcGFzcyIgfCBwb2RtYW4gc2VjcmV0IGNyZWF0ZSByZWRpc19wYXNzIC0KZmkKCmVjaG8gIk1pcnJvciByZWdpc3RyeSBpbml0IGNvbXBsZXRlIgo="
+    systemd:
+      units:
+        - name: mirror-registry-init.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Initialize Mirror Registry (TLS, volumes, secrets)
+            After=network-online.target
+            Wants=network-online.target
+            Before=mirror-registry-pod.service
+            ConditionPathExists=!/opt/quay/quay-config/ssl.cert
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/local/bin/mirror-registry-init.sh
+
+            [Install]
+            WantedBy=multi-user.target
+
+        - name: mirror-registry-pod.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Mirror Registry Pod
+            After=network-online.target mirror-registry-init.service
+            Wants=network-online.target
+            Requires=mirror-registry-init.service
+            Before=kubelet.service crio.service
+
+            [Service]
+            Type=simple
+            RemainAfterExit=yes
+            TimeoutStartSec=5m
+            ExecStartPre=-/usr/bin/podman pod stop quay-pod
+            ExecStartPre=-/usr/bin/podman pod rm -f quay-pod
+            ExecStartPre=/usr/bin/podman pull --tls-verify=false --authfile /opt/quay/auth.json registry.example.com:8443/mirror-registry/pause:8.10-5
+            ExecStart=/usr/bin/podman pod create \
+                --name quay-pod \
+                --infra-image registry.example.com:8443/mirror-registry/pause:8.10-5 \
+                --publish 8443:8443 \
+                --replace
+            ExecStop=-/usr/bin/podman pod stop quay-pod -t 10
+            ExecStopPost=-/usr/bin/podman pod rm -f quay-pod
+            Restart=always
+            RestartSec=30
+
+            [Install]
+            WantedBy=multi-user.target
+
+        - name: mirror-registry-redis.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Mirror Registry Redis
+            After=network-online.target mirror-registry-pod.service
+            Wants=network-online.target
+            Requires=mirror-registry-pod.service
+            Before=mirror-registry-app.service kubelet.service crio.service
+
+            [Service]
+            Type=simple
+            TimeoutStartSec=5m
+            ExecStartPre=-/usr/bin/podman stop quay-redis
+            ExecStartPre=-/usr/bin/podman rm -f quay-redis
+            ExecStartPre=/usr/bin/podman pull --tls-verify=false --authfile /opt/quay/auth.json registry.example.com:8443/mirror-registry/redis-6:1-1766406130
+            ExecStart=/usr/bin/podman run \
+                --name quay-redis \
+                --pod=quay-pod \
+                --secret=redis_pass,type=env,target=REDIS_PASSWORD \
+                --replace \
+                registry.example.com:8443/mirror-registry/redis-6:1-1766406130
+            ExecStop=-/usr/bin/podman stop quay-redis -t 10
+            ExecStopPost=-/usr/bin/podman rm -f quay-redis
+            Restart=always
+            RestartSec=30
+
+            [Install]
+            WantedBy=multi-user.target
+
+        - name: mirror-registry-app.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Mirror Registry Quay
+            After=network-online.target mirror-registry-redis.service
+            Wants=network-online.target
+            Requires=mirror-registry-pod.service mirror-registry-redis.service
+            Before=kubelet.service crio.service
+
+            [Service]
+            Type=simple
+            TimeoutStartSec=5m
+            ExecStartPre=-/usr/bin/podman stop quay-app
+            ExecStartPre=-/usr/bin/podman rm -f quay-app
+            ExecStartPre=/usr/bin/podman pull --tls-verify=false --authfile /opt/quay/auth.json registry.example.com:8443/mirror-registry/quay-rhel8:v3.12.21
+            ExecStart=/usr/bin/podman run \
+                --name quay-app \
+                -v /opt/quay/quay-config:/quay-registry/conf/stack \
+                -v sqlite-storage:/sqlite:Z,U \
+                -v quay-storage:/datastorage:Z \
+                --pod=quay-pod \
+                --replace \
+                -e WORKER_COUNT_UNSUPPORTED_MINIMUM=1 \
+                -e WORKER_COUNT=1 \
+                -e PYTHONUSERBASE_SITE_PACKAGE=/opt/app-root/lib/python3.12/site-packages \
+                registry.example.com:8443/mirror-registry/quay-rhel8:v3.12.21 registry
+            ExecStop=-/usr/bin/podman stop quay-app -t 10
+            ExecStopPost=-/usr/bin/podman rm -f quay-app
+            Restart=always
+            RestartSec=30
+
+            [Install]
+            WantedBy=multi-user.target
