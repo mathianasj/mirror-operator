@@ -441,6 +441,31 @@ func (m *Manager) resolvePullSecret(ctx context.Context, platform *mirrorv1.Disc
 	return ""
 }
 
+// GetRegistryAddress returns the primary mirror registry address (<node-ip>:<port>)
+// from the first master node. Other consumers (e.g. RHCOS server image construction)
+// use this to reference content imported to the node-level mirror registry.
+func (m *Manager) GetRegistryAddress(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (string, error) {
+	cfg, err := m.resolveConfig(ctx, platform)
+	if err != nil {
+		return "", fmt.Errorf("resolving mirror registry config: %w", err)
+	}
+
+	masterNodes, err := m.getMasterNodes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("listing master nodes: %w", err)
+	}
+	if len(masterNodes) == 0 {
+		return "", fmt.Errorf("no master nodes found")
+	}
+
+	addr := getNodeInternalAddress(masterNodes[0])
+	if addr == "" {
+		return "", fmt.Errorf("no internal address on first master node")
+	}
+
+	return fmt.Sprintf("%s:%d", addr, cfg.Port), nil
+}
+
 func getNodeInternalAddress(node corev1.Node) string {
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP {
