@@ -6,6 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1034,6 +1035,129 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				}
 			}
 			Expect(foundPaths).To(BeTrue(), "expected truststore-paths in additionalOptions")
+		})
+	})
+
+	Describe("reconcileRHCOSServer", func() {
+		It("uses MirrorRegistry when MirrorRegistryConfig is not set", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.example.com/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			err = r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("quay.example.com/mirror/rhcos-server:4.18.12"))
+		})
+
+		It("uses node mirror registry when MirrorRegistryConfig is set", func() {
+			masterNode := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-0",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+					},
+				},
+			}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.example.com/mirror",
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{
+							Port: 8443,
+						},
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, masterNode).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			err = r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("10.0.0.5:8443/rhcos-server:4.18.12"))
+		})
+
+		It("uses explicit RHCOSImage override regardless of MirrorRegistryConfig", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.example.com/mirror",
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{
+							Port: 8443,
+						},
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:    true,
+								RHCOSImage: "custom-registry:5000/rhcos-server:4.21",
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			err = r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("custom-registry:5000/rhcos-server:4.21"))
 		})
 	})
 })

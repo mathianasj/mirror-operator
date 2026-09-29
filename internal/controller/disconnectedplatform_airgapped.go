@@ -1034,6 +1034,13 @@ func (r *DisconnectedPlatformReconciler) reconcileRHCOSServer(ctx context.Contex
 	rhcosImage := ""
 	if acmConfig.HostInventory.RHCOSImage != "" {
 		rhcosImage = acmConfig.HostInventory.RHCOSImage
+	} else if platform.Spec.Airgapped.MirrorRegistryConfig != nil {
+		mgr := &mirrorregistry.Manager{Client: r.Client, Scheme: r.Scheme}
+		addr, err := mgr.GetRegistryAddress(ctx, platform)
+		if err != nil {
+			return fmt.Errorf("resolving mirror registry address for RHCOS image: %w", err)
+		}
+		rhcosImage = fmt.Sprintf("%s/rhcos-server:%s", addr, rhcosVersion)
 	} else {
 		rhcosImage = fmt.Sprintf("%s/rhcos-server:%s", mirrorRegistry, rhcosVersion)
 	}
