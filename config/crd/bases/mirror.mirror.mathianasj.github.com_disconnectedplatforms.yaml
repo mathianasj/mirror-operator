@@ -257,14 +257,42 @@ spec:
                     properties:
                       dataPath:
                         default: /opt/quay
-                        description: Storage path for Quay data
+                        description: Storage path for registry data on each node (e.g.
+                          dedicated disk mount)
+                        type: string
+                      imagePullSecret:
+                        description: Reference to a Secret containing registry credentials
+                          for pulling mirror-registry images on nodes
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      pauseImage:
+                        description: Pause (infra) container image for the podman
+                          pod
                         type: string
                       port:
                         default: 8443
-                        description: Quay service port
+                        description: Quay HTTPS service port
                         format: int32
                         minimum: 1
                         type: integer
+                      quayImage:
+                        description: Quay container image (must be pre-pushed to the
+                          bastion registry)
+                        type: string
+                      redisImage:
+                        description: Redis container image (must be pre-pushed to
+                          the bastion registry)
+                        type: string
                     type: object
                   quay:
                     description: Quay registry configuration for the airgapped cluster

@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
+	"github.com/mathianasj/mirror-operator/internal/controller/mirrorregistry"
 )
 
 func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) (needsRequeue bool, err error) {
@@ -88,6 +89,13 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgapped(ctx context.Context,
 					Kind: "AgentServiceConfig", APIGroup: "agent-install.openshift.io",
 				},
 			)
+		}
+	}
+
+	if platform.Spec.Airgapped.MirrorRegistryConfig != nil {
+		if err := r.reconcileMirrorRegistry(ctx, platform); err != nil {
+			logger.Error(err, "failed to reconcile mirror registry MachineConfig")
+			needsRequeue = true
 		}
 	}
 
@@ -2003,6 +2011,7 @@ func (r *DisconnectedPlatformReconciler) reconcileImportPipelineTemplate(ctx con
 		{"name": "mirror-image", "type": "string", "default": r.MirrorImage, "description": "oc-mirror container image"},
 		{"name": "verify-enabled", "type": "string", "default": "false", "description": "Enable cosign signature verification"},
 		{"name": "cosign-pub-secret", "type": "string", "default": "", "description": "Secret name containing cosign public key"},
+		{"name": "node-registries", "type": "string", "default": "", "description": "Space-separated list of node registry host:port targets for MachineConfig registries"},
 	}
 
 	workspaces := []map[string]interface{}{
@@ -2176,8 +2185,61 @@ echo "=== Mirror complete ==="
 		},
 
 		{
-			"name":     "apply-manifests",
+			"name":     "mirror-to-nodes",
 			"runAfter": []string{"mirror-content"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.node-registries)", "operator": "notin", "values": []string{""}},
+			},
+			"taskSpec": map[string]interface{}{
+				"steps": []map[string]interface{}{
+					{
+						"name":    "oc-mirror-nodes",
+						"image":   "$(params.mirror-image)",
+						"command": []string{"/bin/bash", "-c"},
+						"args": []string{`
+set -ex
+mkdir -p $HOME/.docker
+cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
+
+NODE_REGISTRIES="$(params.node-registries)"
+echo "=== Mirroring content to node registries: ${NODE_REGISTRIES} ==="
+
+FAILED=0
+for registry in ${NODE_REGISTRIES}; do
+    echo "--- Mirroring to ${registry} ---"
+    if oc-mirror \
+        --config /workspace/config/imageset-config.yaml \
+        --from file:///workspace/bundle-data/archives \
+        docker://${registry} \
+        --dest-skip-tls \
+        --v2; then
+        echo "--- Mirror to ${registry} complete ---"
+    else
+        echo "WARNING: Mirror to ${registry} failed"
+        FAILED=$((FAILED + 1))
+    fi
+done
+
+if [ $FAILED -gt 0 ]; then
+    echo "ERROR: ${FAILED} node registry mirrors failed"
+    exit 1
+fi
+
+echo "=== All node registry mirrors complete ==="
+`},
+					},
+				},
+			},
+			"workspaces": []map[string]interface{}{
+				{"name": "config"},
+				{"name": "bundle-data"},
+				{"name": "pull-secret"},
+			},
+		},
+
+		{
+			"name":     "apply-manifests",
+			"runAfter": []string{"mirror-to-nodes"},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -2247,4 +2309,12 @@ echo "Workspace cleaned"
 			},
 		},
 	}
+}
+
+func (r *DisconnectedPlatformReconciler) reconcileMirrorRegistry(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
+	mgr := &mirrorregistry.Manager{
+		Client: r.Client,
+		Scheme: r.Scheme,
+	}
+	return mgr.Reconcile(ctx, platform)
 }
