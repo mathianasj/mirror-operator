@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1755,6 +1756,933 @@ mirror:
 			Expect(tpaHost).To(BeEmpty())
 			Expect(keycloakHost).To(BeEmpty())
 			Expect(realm).To(BeEmpty())
+		})
+
+		It("returns TPA hostname and OIDC info when TPA and Ingress exist", func() {
+			tpa := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtpa.io/v1",
+				"kind":       "TrustedProfileAnalyzer",
+				"metadata": map[string]interface{}{
+					"name":      "test-tpa",
+					"namespace": "mirror-operator-system",
+					"uid":       "tpa-uid-123",
+				},
+				"spec": map[string]interface{}{
+					"oidc": map[string]interface{}{
+						"issuerUrl": "https://keycloak.apps.example.com/realms/trustify",
+					},
+				},
+			}}
+
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "networking.k8s.io/v1",
+				"kind":       "Ingress",
+				"metadata": map[string]interface{}{
+					"name":      "tpa-ingress",
+					"namespace": "mirror-operator-system",
+					"ownerReferences": []interface{}{
+						map[string]interface{}{
+							"uid": "tpa-uid-123",
+						},
+					},
+				},
+				"spec": map[string]interface{}{
+					"rules": []interface{}{
+						map[string]interface{}{
+							"host": "rhtpa.apps.example.com",
+						},
+					},
+				},
+			}}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(tpa, ingress).Build(),
+				Scheme: testScheme,
+			}
+			tpaHost, oidcIssuer, oidcClientID := r.getTPAAndKeycloakHosts(ctx)
+			Expect(tpaHost).To(Equal("rhtpa.apps.example.com"))
+			Expect(oidcIssuer).To(Equal("https://keycloak.apps.example.com/realms/trustify"))
+			Expect(oidcClientID).To(Equal("cli"))
+		})
+
+		It("returns TPA hostname but empty OIDC when no issuerUrl in spec", func() {
+			tpa := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rhtpa.io/v1",
+				"kind":       "TrustedProfileAnalyzer",
+				"metadata": map[string]interface{}{
+					"name":      "test-tpa",
+					"namespace": "mirror-operator-system",
+					"uid":       "tpa-uid-456",
+				},
+				"spec": map[string]interface{}{},
+			}}
+
+			ingress := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "networking.k8s.io/v1",
+				"kind":       "Ingress",
+				"metadata": map[string]interface{}{
+					"name":      "tpa-ingress",
+					"namespace": "mirror-operator-system",
+					"ownerReferences": []interface{}{
+						map[string]interface{}{
+							"uid": "tpa-uid-456",
+						},
+					},
+				},
+				"spec": map[string]interface{}{
+					"rules": []interface{}{
+						map[string]interface{}{
+							"host": "rhtpa.apps.example.com",
+						},
+					},
+				},
+			}}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(tpa, ingress).Build(),
+				Scheme: testScheme,
+			}
+			tpaHost, oidcIssuer, oidcClientID := r.getTPAAndKeycloakHosts(ctx)
+			Expect(tpaHost).To(Equal("rhtpa.apps.example.com"))
+			Expect(oidcIssuer).To(BeEmpty())
+			Expect(oidcClientID).To(BeEmpty())
+		})
+	})
+
+	Describe("Reconcile", func() {
+		It("returns no error when pipeline does not exist", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			result, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+		})
+
+		It("adds finalizer on first reconcile", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.GetFinalizers()).To(ContainElement(pipelineFinalizer))
+		})
+
+		It("resets status when trigger annotation is present on completed pipeline", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+					Annotations: map[string]string{
+						"mirror.mathianasj.github.com/trigger": "manual-2024",
+					},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			pipeline.Status.PipelineRunRef = "old-run"
+			pipeline.Status.Phase = "Succeeded"
+			pipeline.Status.Version = "v2024.01.01.001-manual"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.PipelineRunRef).To(BeEmpty())
+			Expect(updated.Status.Phase).To(BeEmpty())
+			Expect(updated.Status.Version).To(BeEmpty())
+		})
+
+		It("expands PVC when storageSize exceeds current size", func() {
+			currentSize := resource.MustParse("50Gi")
+			desiredSize := resource.MustParse("100Gi")
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					StorageSize:    &desiredSize,
+				},
+			}
+
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-storage-test-pipeline", Namespace: "default"},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: currentSize},
+					},
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pvc, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			// Reconcile will expand PVC then continue (may error later on missing pipeline template, that's fine)
+			r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+
+			updatedPVC := &corev1.PersistentVolumeClaim{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "collection-storage-test-pipeline", Namespace: "default"}, updatedPVC)).To(Succeed())
+			actualSize := updatedPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+			Expect(actualSize.Cmp(desiredSize)).To(Equal(0))
+		})
+
+		It("fails with parent not found when parent pipeline doesn't exist", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "child-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					ParentPipeline: "nonexistent-parent",
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-child-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "child-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "child-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Failed"))
+			Expect(updated.Status.Conditions).To(HaveLen(1))
+			Expect(updated.Status.Conditions[0].Type).To(Equal("ParentPipelineValid"))
+			Expect(updated.Status.Conditions[0].Reason).To(Equal("ParentNotFound"))
+		})
+
+		It("requeues when parent pipeline is not complete", func() {
+			parent := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "parent-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			parent.Status.Phase = "Running"
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "child-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					ParentPipeline: "parent-pipeline",
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-child-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(parent, pipeline, cm).WithStatusSubresource(parent, pipeline).Build(),
+				Scheme: testScheme,
+			}
+			result, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "child-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		})
+
+		It("fails incremental collection when base version not imported", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+				},
+			}
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "incr-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					Incremental:    true,
+					BaseVersion:    "v2024.01.01.001-manual",
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-incr-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, pipeline, cm).WithStatusSubresource(platform, pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "incr-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "incr-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Failed"))
+		})
+
+		It("updates ConfigMapRef in status when it differs from expected name", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "cfg-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			// Status.ConfigMapRef is empty, so the reconciler should set it
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "cfg-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "cfg-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.ConfigMapRef).To(Equal("mirror-config-cfg-pipeline"))
+		})
+
+		It("tracks existing PipelineRun when PipelineRunRef is set", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-pr", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						StartTime: &now,
+					},
+				},
+			}
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "tracking-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+				},
+			}
+			pipeline.Status.PipelineRunRef = "existing-pr"
+			pipeline.Status.Phase = "Collecting"
+			pipeline.Status.ConfigMapRef = "mirror-config-tracking-pipeline"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-tracking-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pr, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			result, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "tracking-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			// PipelineRun is still running (has StartTime but no CompletionTime), so should requeue
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		})
+
+		It("does not expand PVC when storageSize is smaller than current", func() {
+			currentSize := resource.MustParse("200Gi")
+			desiredSize := resource.MustParse("100Gi")
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "no-shrink-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					StorageSize:    &desiredSize,
+				},
+			}
+
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-storage-no-shrink-pipeline", Namespace: "default"},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: currentSize},
+					},
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-no-shrink-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pvc, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "no-shrink-pipeline", Namespace: "default"},
+			})
+
+			updatedPVC := &corev1.PersistentVolumeClaim{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "collection-storage-no-shrink-pipeline", Namespace: "default"}, updatedPVC)).To(Succeed())
+			// PVC should NOT be shrunk - should remain at 200Gi
+			actualSize := updatedPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+			Expect(actualSize.Cmp(currentSize)).To(Equal(0))
+		})
+
+		It("resets trigger annotation on completed pipeline and clears status", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "triggered-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+					Annotations: map[string]string{
+						"mirror.mathianasj.github.com/trigger": "manual-reset",
+					},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			pipeline.Status.PipelineRunRef = "old-run-123"
+			pipeline.Status.Phase = "Failed"
+			pipeline.Status.Version = "v2025.05.01.001-manual"
+			now := metav1.Now()
+			pipeline.Status.StartTime = &now
+			pipeline.Status.CompletionTime = &now
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-triggered-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "triggered-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "triggered-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.PipelineRunRef).To(BeEmpty())
+			Expect(updated.Status.Phase).To(BeEmpty())
+			Expect(updated.Status.Version).To(BeEmpty())
+			Expect(updated.Annotations).NotTo(HaveKey("mirror.mathianasj.github.com/trigger"))
+		})
+
+		It("captures parent pipeline version when parent is complete", func() {
+			parent := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "parent-v-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+				},
+			}
+			parent.Status.Phase = string(mirrorv1.CollectionPhaseComplete)
+			parent.Status.Version = "v2025.06.01.001-manual"
+			parent.Status.WorkingPVCName = "collection-storage-parent-v-pipeline"
+
+			parentPVC := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-storage-parent-v-pipeline", Namespace: "default"},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("100Gi")},
+					},
+				},
+			}
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "child-v-pipeline",
+					Namespace:  "default",
+					Finalizers: []string{pipelineFinalizer},
+				},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\nmirror:\n  platform:\n    channels:\n    - name: stable-4.18",
+					ParentPipeline: "parent-v-pipeline",
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-child-v-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(parent, parentPVC, pipeline, cm).WithStatusSubresource(parent, pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "child-v-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "child-v-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.ParentPipelineVersion).To(Equal("v2025.06.01.001-manual"))
+		})
+	})
+
+	Describe("trackPipelineRun", func() {
+		It("marks pipeline Stale when PipelineRun not found", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+			pipeline.Status.PipelineRunRef = "missing-run"
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			result, err := r.trackPipelineRun(ctx, pipeline, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Stale"))
+			Expect(updated.Status.PipelineRunRef).To(BeEmpty())
+		})
+
+		It("sets bundle URL from PipelineRun results on completion", func() {
+			completionTime := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-run", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionTrue,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &completionTime,
+						Results: []pipelinev1.PipelineRunResult{
+							{Name: "bundle-url", Value: pipelinev1.ParamValue{Type: pipelinev1.ParamTypeString, StringVal: "https://s3.example.com/bucket/bundle.tar.gz"}},
+							{Name: "signature-url", Value: pipelinev1.ParamValue{Type: pipelinev1.ParamTypeString, StringVal: "https://s3.example.com/bucket/bundle.tar.gz.sig"}},
+							{Name: "sbom-url", Value: pipelinev1.ParamValue{Type: pipelinev1.ParamTypeString, StringVal: "https://tpa.example.com/sbom/view"}},
+						},
+					},
+				},
+			}
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+			pipeline.Status.PipelineRunRef = "test-run"
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pr).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			_, err := r.trackPipelineRun(ctx, pipeline, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.BundleURL).To(Equal("https://s3.example.com/bucket/bundle.tar.gz"))
+			Expect(updated.Status.SignatureURL).To(Equal("https://s3.example.com/bucket/bundle.tar.gz.sig"))
+			Expect(updated.Status.SbomUrl).To(Equal("https://tpa.example.com/sbom/view"))
+		})
+
+		It("requeues when PipelineRun is still running", func() {
+			startTime := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "running-run", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionUnknown,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						StartTime: &startTime,
+					},
+				},
+			}
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+			pipeline.Status.PipelineRunRef = "running-run"
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, pr).WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			result, err := r.trackPipelineRun(ctx, pipeline, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		})
+	})
+
+	Describe("deleteS3Objects", func() {
+		It("creates S3 cleanup job when OBC config exists", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+
+			obcConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data: map[string]string{
+					"BUCKET_NAME": "test-bucket",
+					"BUCKET_HOST": "s3.openshift-storage.svc",
+				},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, obcConfigMap).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteS3Objects(ctx, pipeline)
+
+			// Verify job was created
+			job := &batchv1.Job{}
+			err := r.Get(ctx, types.NamespacedName{Name: "s3-cleanup-test-pipeline", Namespace: "default"}, job)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("test-bucket"))
+		})
+
+		It("skips when no OBC config exists", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).Build(),
+				Scheme: testScheme,
+			}
+			// Should not panic
+			r.deleteS3Objects(ctx, pipeline)
+		})
+
+		It("skips when bucket name is empty", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+
+			obcConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data:       map[string]string{"BUCKET_HOST": "s3.example.com"},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, obcConfigMap).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteS3Objects(ctx, pipeline)
+
+			// Verify no job was created
+			job := &batchv1.Job{}
+			err := r.Get(ctx, types.NamespacedName{Name: "s3-cleanup-test-pipeline", Namespace: "default"}, job)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not recreate job if it already exists", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+
+			obcConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data: map[string]string{
+					"BUCKET_NAME": "test-bucket",
+					"BUCKET_HOST": "s3.example.com",
+				},
+			}
+
+			existingJob := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "s3-cleanup-test-pipeline", Namespace: "default"},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, obcConfigMap, existingJob).Build(),
+				Scheme: testScheme,
+			}
+			// Should not error - just logs and returns
+			r.deleteS3Objects(ctx, pipeline)
+		})
+	})
+
+	Describe("buildPipelineRun", func() {
+		It("builds PipelineRun with keyless signing params", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: `kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18
+      minVersion: "4.18.3"`,
+					Signing: &mirrorv1.CosignSigningConfig{
+						Keyless: &mirrorv1.KeylessSigningConfig{
+							FulcioURL:    "https://fulcio.example.com",
+							RekorURL:     "https://rekor.example.com",
+							TUFURL:       "https://tuf.example.com",
+							OIDCIssuer:   "https://keycloak.example.com/realms/trusted-artifact-signer",
+							OIDCClientID: "sigstore",
+						},
+					},
+				},
+			}
+			pipeline.Status.WorkingPVCName = "collection-storage-test-pipeline"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pr).NotTo(BeNil())
+
+			// Check params contain keyless signing
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["has-keyless-signing"]).To(Equal("true"))
+			Expect(paramMap["fulcio-url"]).To(Equal("https://fulcio.example.com"))
+			Expect(paramMap["rekor-url"]).To(Equal("https://rekor.example.com"))
+			Expect(paramMap["oidc-issuer"]).To(Equal("https://keycloak.example.com/realms/trusted-artifact-signer"))
+		})
+
+		It("builds PipelineRun with S3 storage params", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: `kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18
+      minVersion: "4.18.3"`,
+				},
+			}
+			pipeline.Status.WorkingPVCName = "collection-storage-test-pipeline"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			obcConfigMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data: map[string]string{
+					"BUCKET_NAME":   "my-bucket",
+					"BUCKET_HOST":   "s3.openshift-storage.svc",
+					"BUCKET_REGION": "us-east-1",
+				},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm, obcConfigMap).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["has-s3"]).To(Equal("true"))
+			Expect(paramMap["s3-bucket"]).To(Equal("my-bucket"))
+			Expect(paramMap["s3-endpoint"]).To(Equal("http://s3.openshift-storage.svc"))
+			Expect(paramMap["s3-region"]).To(Equal("us-east-1"))
+			Expect(paramMap["s3-secret-name"]).To(Equal("collection-artifacts"))
+		})
+
+		It("builds PipelineRun with cosign key workspace", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: `kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18`,
+					Signing: &mirrorv1.CosignSigningConfig{
+						KeySecretRef: &corev1.LocalObjectReference{Name: "cosign-key-secret"},
+					},
+				},
+			}
+			pipeline.Status.WorkingPVCName = "collection-storage-test-pipeline"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify cosign-key workspace
+			wsMap := make(map[string]pipelinev1.WorkspaceBinding)
+			for _, ws := range pr.Spec.Workspaces {
+				wsMap[ws.Name] = ws
+			}
+			Expect(wsMap).To(HaveKey("cosign-key"))
+			Expect(wsMap["cosign-key"].Secret.SecretName).To(Equal("cosign-key-secret"))
+		})
+
+		It("detects OCP version from ImageSetConfig minVersion", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: `kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18
+      minVersion: "4.18.5"`,
+				},
+			}
+			pipeline.Status.WorkingPVCName = "collection-storage-test-pipeline"
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-test-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline, cm).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["oc-version"]).To(Equal("4.18.5"))
+		})
+
+		It("uses parent pipeline PVC when parent specified", func() {
+			parent := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "parent-pipeline", Namespace: "default"},
+			}
+			parent.Status.WorkingPVCName = "collection-storage-parent-pipeline"
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "child-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: `kind: ImageSetConfiguration
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18`,
+					ParentPipeline: "parent-pipeline",
+				},
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "mirror-config-child-pipeline", Namespace: "default"},
+				Data:       map[string]string{configMapKey: pipeline.Spec.ImageSetConfig},
+			}
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(parent, pipeline, cm).WithStatusSubresource(parent).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["working-pvc-name"]).To(Equal("collection-storage-parent-pipeline"))
+			Expect(paramMap["parent-pipeline"]).To(Equal("parent-pipeline"))
 		})
 	})
 })

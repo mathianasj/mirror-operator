@@ -1019,6 +1019,52 @@ var _ = Describe("helpers", func() {
 		})
 	})
 
+	Describe("reconcileTrustedCAConfigMap", func() {
+		var (
+			ctx        context.Context
+			testScheme *runtime.Scheme
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			testScheme = runtime.NewScheme()
+			Expect(clientgoscheme.AddToScheme(testScheme)).To(Succeed())
+			Expect(mirrorv1.AddToScheme(testScheme)).To(Succeed())
+		})
+
+		It("creates the trusted CA ConfigMap when it does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileTrustedCAConfigMap(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			err = r.Get(ctx, types.NamespacedName{Name: trustedCAConfigMapName, Namespace: architectNamespace}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).To(HaveKeyWithValue("config.openshift.io/inject-trusted-cabundle", "true"))
+		})
+
+		It("does nothing when the ConfigMap already exists", func() {
+			existing := &corev1.ConfigMap{}
+			existing.SetName(trustedCAConfigMapName)
+			existing.SetNamespace(architectNamespace)
+			existing.SetLabels(map[string]string{
+				"config.openshift.io/inject-trusted-cabundle": "true",
+			})
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileTrustedCAConfigMap(ctx)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
 	Describe("getClusterSSHKey", func() {
 		var (
 			ctx        context.Context

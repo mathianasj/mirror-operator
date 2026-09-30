@@ -1010,4 +1010,208 @@ var _ = Describe("MirrorImportReconciler", func() {
 			Expect(updated.Status.Phase).To(Equal("Complete"))
 		})
 	})
+
+	Describe("resolveNodeRegistries", func() {
+		It("returns empty when no platform exists", func() {
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(BeEmpty())
+		})
+
+		It("returns empty when platform has no MirrorRegistryConfig", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: nil,
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(BeEmpty())
+		})
+
+		It("returns space-separated node:port addresses", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{Port: 9443},
+					},
+				},
+			}
+			node1 := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-0",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+					},
+				},
+			}
+			node2 := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-1",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.6"},
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, node1, node2).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(ContainSubstring("10.0.0.5:9443"))
+			Expect(result).To(ContainSubstring("10.0.0.6:9443"))
+		})
+
+		It("uses default port 8443 when not specified", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{},
+					},
+				},
+			}
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-0",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, node).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(Equal("10.0.0.5:8443"))
+		})
+	})
+
+	Describe("trackImportPipelineRun - running pipeline", func() {
+		It("returns empty result when PipelineRun is still running", func() {
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "running-pr", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{Type: knativeapis.ConditionSucceeded, Status: corev1.ConditionUnknown},
+						},
+					},
+				},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase:          "Importing",
+					PipelineRunRef: "running-pr",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR, pr).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			result, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Importing"))
+		})
+	})
+
+	Describe("Reconcile - finalizer handling", func() {
+		It("adds finalizer and triggers import on new MirrorImport", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "new-import",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "new-import", Namespace: "default"}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "new-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Finalizers).To(ContainElement(importFinalizer))
+		})
+
+		It("returns empty result for not-found import", func() {
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+		})
+	})
 })

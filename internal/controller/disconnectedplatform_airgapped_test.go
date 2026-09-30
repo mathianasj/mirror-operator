@@ -1667,4 +1667,2008 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
+
+	Describe("reconcileAirgapped", func() {
+		It("returns false with no error when airgapped config has no ACM and no import path", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(needsRequeue).To(BeFalse())
+		})
+
+		It("sets needsRequeue when ACM is enabled but package not available", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(needsRequeue).To(BeTrue())
+		})
+
+		It("reconciles import scanner when importPath is set", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "",
+						ImportPath:     "/mnt/bundles",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			// Should not requeue if all succeed (no ACM, no Quay, no Tekton)
+			Expect(needsRequeue).To(BeFalse())
+
+			cronJob := &batchv1.CronJob{}
+			err = r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, cronJob)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("reconciles import pipeline template when Tekton is available", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client:          fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme:          testScheme,
+				TektonAvailable: true,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			// Pipeline template created
+			pipeline := &unstructured.Unstructured{}
+			pipeline.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "tekton.dev", Version: "v1", Kind: "Pipeline",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "import-pipeline-template", Namespace: architectNamespace}, pipeline)
+			Expect(err).NotTo(HaveOccurred())
+			_ = needsRequeue
+		})
+
+		It("skips import pipeline when Tekton is not available", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client:          fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme:          testScheme,
+				TektonAvailable: false,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			pipeline := &unstructured.Unstructured{}
+			pipeline.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "tekton.dev", Version: "v1", Kind: "Pipeline",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "import-pipeline-template", Namespace: architectNamespace}, pipeline)
+			Expect(err).To(HaveOccurred())
+			_ = needsRequeue
+		})
+	})
+
+	Describe("reconcileMirrorRegistry", func() {
+		It("delegates to mirrorregistry.Manager.Reconcile", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{
+							QuayImage:  "quay.io/test/quay:v1",
+							RedisImage: "quay.io/test/redis:v1",
+							Port:       8443,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			// Will fail because nodes don't exist, but the delegation itself works
+			err := r.reconcileMirrorRegistry(ctx, platform)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileAirgappedACM", func() {
+		It("returns false when ACM package is not yet available", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			mchReady, err := r.reconcileAirgappedACM(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mchReady).To(BeFalse())
+		})
+
+		It("creates subscription and checks MCH status when package is available", func() {
+			pkgManifest := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "packages.operators.coreos.com/v1",
+				"kind":       "PackageManifest",
+				"metadata": map[string]interface{}{
+					"name":      "advanced-cluster-management",
+					"namespace": "openshift-marketplace",
+					"labels": map[string]interface{}{
+						"catalog":           "redhat-operators",
+						"catalog-namespace": "openshift-marketplace",
+					},
+				},
+				"status": map[string]interface{}{
+					"catalogSource":          "redhat-operators",
+					"catalogSourceNamespace": "openshift-marketplace",
+					"channels": []interface{}{
+						map[string]interface{}{
+							"name":       "release-2.11",
+							"currentCSV": "acm.v2.11.0",
+						},
+					},
+					"defaultChannel": "release-2.11",
+				},
+			}}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pkgManifest, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			mchReady, err := r.reconcileAirgappedACM(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mchReady).To(BeFalse()) // CSV not yet succeeded
+
+			// Verify subscription was created
+			sub := &unstructured.Unstructured{}
+			sub.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-advanced-cluster-management", Namespace: "open-cluster-management"}, sub)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns true when MCH is Running", func() {
+			pkgManifest := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "packages.operators.coreos.com/v1",
+				"kind":       "PackageManifest",
+				"metadata": map[string]interface{}{
+					"name":      "advanced-cluster-management",
+					"namespace": "openshift-marketplace",
+					"labels": map[string]interface{}{
+						"catalog":           "redhat-operators",
+						"catalog-namespace": "openshift-marketplace",
+					},
+				},
+				"status": map[string]interface{}{
+					"catalogSource":          "redhat-operators",
+					"catalogSourceNamespace": "openshift-marketplace",
+					"channels": []interface{}{
+						map[string]interface{}{
+							"name":       "release-2.11",
+							"currentCSV": "acm.v2.11.0",
+						},
+					},
+					"defaultChannel": "release-2.11",
+				},
+			}}
+
+			csv := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "ClusterServiceVersion",
+				"metadata": map[string]interface{}{
+					"name":      "acm.v2.11.0",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"phase": "Succeeded",
+				},
+			}}
+
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+
+			acmSub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-advanced-cluster-management",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"currentCSV": "acm.v2.11.0",
+				},
+			}}
+
+			acmNS := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "open-cluster-management"},
+			}
+
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.open-cluster-management.io/v1",
+				"kind":       "MultiClusterHub",
+				"metadata":   map[string]interface{}{"name": "multiclusterhub", "namespace": "open-cluster-management"},
+				"status":     map[string]interface{}{"phase": "Running"},
+			}}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pkgManifest, csv, pullSecret, acmSub, acmNS, mch, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			mchReady, err := r.reconcileAirgappedACM(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mchReady).To(BeTrue())
+		})
+	})
+
+	Describe("ensureInfraEnv creation", func() {
+		It("creates InfraEnv with all spec fields when fully configured", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{
+									Enabled:              true,
+									CpuArchitecture:      "aarch64",
+									ImageType:            "minimal-iso",
+									SSHAuthorizedKey:     "ssh-rsa AAAAB...",
+									AdditionalNTPSources: []string{"ntp1.example.com", "ntp2.example.com"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			infraEnv := &unstructured.Unstructured{}
+			infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-infraenv", Namespace: architectNamespace}, infraEnv)
+			Expect(err).NotTo(HaveOccurred())
+
+			arch, _, _ := unstructured.NestedString(infraEnv.Object, "spec", "cpuArchitecture")
+			Expect(arch).To(Equal("aarch64"))
+
+			imageType, _, _ := unstructured.NestedString(infraEnv.Object, "spec", "imageType")
+			Expect(imageType).To(Equal("minimal-iso"))
+
+			sshKey, _, _ := unstructured.NestedString(infraEnv.Object, "spec", "sshAuthorizedKey")
+			Expect(sshKey).To(Equal("ssh-rsa AAAAB..."))
+
+			ntpSources, _, _ := unstructured.NestedStringSlice(infraEnv.Object, "spec", "additionalNTPSources")
+			Expect(ntpSources).To(HaveLen(2))
+			Expect(ntpSources).To(ContainElement("ntp1.example.com"))
+
+			mirrorRef, _, _ := unstructured.NestedStringMap(infraEnv.Object, "spec", "mirrorRegistryRef")
+			Expect(mirrorRef["name"]).To(Equal("assisted-installer-mirror-config"))
+		})
+
+		It("uses custom namespace when configured", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{
+									Enabled:   true,
+									Namespace: "custom-infraenv-ns",
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			infraEnv := &unstructured.Unstructured{}
+			infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-infraenv", Namespace: "custom-infraenv-ns"}, infraEnv)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("uses defaults for cpuArchitecture and imageType when not specified", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{
+									Enabled: true,
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			infraEnv := &unstructured.Unstructured{}
+			infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-infraenv", Namespace: architectNamespace}, infraEnv)
+			Expect(err).NotTo(HaveOccurred())
+
+			arch, _, _ := unstructured.NestedString(infraEnv.Object, "spec", "cpuArchitecture")
+			Expect(arch).To(Equal("x86_64"))
+
+			imageType, _, _ := unstructured.NestedString(infraEnv.Object, "spec", "imageType")
+			Expect(imageType).To(Equal("full-iso"))
+		})
+
+		It("includes static networking label selector when networkType is static", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								InfraEnv: &mirrorv1.InfraEnvConfig{
+									Enabled:     true,
+									NetworkType: "static",
+									NMStateConfigLabels: map[string]string{
+										"infraenvs.agent-install.openshift.io": "mirror-operator-infraenv",
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureInfraEnv(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			infraEnv := &unstructured.Unstructured{}
+			infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-infraenv", Namespace: architectNamespace}, infraEnv)
+			Expect(err).NotTo(HaveOccurred())
+
+			matchLabels, _, _ := unstructured.NestedStringMap(infraEnv.Object, "spec", "nmStateConfigLabelSelector", "matchLabels")
+			Expect(matchLabels).To(HaveKey("infraenvs.agent-install.openshift.io"))
+		})
+	})
+
+	Describe("ensureAssistedInstallerMirrorConfig with IDMS/ITMS", func() {
+		It("builds registries.conf from ImageDigestMirrorSet entries", func() {
+			idms := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "ImageDigestMirrorSet",
+				"metadata":   map[string]interface{}{"name": "test-idms"},
+				"spec": map[string]interface{}{
+					"imageDigestMirrors": []interface{}{
+						map[string]interface{}{
+							"source":  "registry.redhat.io/openshift4/ose-kube-rbac-proxy",
+							"mirrors": []interface{}{"mirror.local:8443/openshift4/ose-kube-rbac-proxy"},
+						},
+					},
+				},
+			}}
+			mceNs := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine"},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(idms, mceNs, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAssistedInstallerMirrorConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			err = r.Get(ctx, client.ObjectKey{Name: "assisted-installer-mirror-config", Namespace: "multicluster-engine"}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Data["registries.conf"]).To(ContainSubstring("mirror-by-digest-only = true"))
+			Expect(cm.Data["registries.conf"]).To(ContainSubstring("registry.redhat.io/openshift4/ose-kube-rbac-proxy"))
+			Expect(cm.Data["registries.conf"]).To(ContainSubstring("mirror.local:8443"))
+		})
+
+		It("updates existing ConfigMap when content changes", func() {
+			mceNs := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine"},
+			}
+			existingCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "assisted-installer-mirror-config",
+					Namespace: "multicluster-engine",
+				},
+				Data: map[string]string{
+					"registries.conf": "old-data",
+					"ca-bundle.crt":   "old-ca",
+				},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(mceNs, existingCM, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAssistedInstallerMirrorConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &corev1.ConfigMap{}
+			err = r.Get(ctx, client.ObjectKey{Name: "assisted-installer-mirror-config", Namespace: "multicluster-engine"}, updated)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated.Data["registries.conf"]).To(ContainSubstring("unqualified-search-registries"))
+		})
+
+		It("filters out Docker Hub shallow namespace entries", func() {
+			idms := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "ImageDigestMirrorSet",
+				"metadata":   map[string]interface{}{"name": "test-idms"},
+				"spec": map[string]interface{}{
+					"imageDigestMirrors": []interface{}{
+						map[string]interface{}{
+							"source":  "docker.io/amazon",
+							"mirrors": []interface{}{"mirror.local:8443/amazon"},
+						},
+						map[string]interface{}{
+							"source":  "quay.io/openshift-release-dev/ocp-release",
+							"mirrors": []interface{}{"mirror.local:8443/openshift-release-dev/ocp-release"},
+						},
+					},
+				},
+			}}
+			mceNs := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine"},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(idms, mceNs, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAssistedInstallerMirrorConfig(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			err = r.Get(ctx, client.ObjectKey{Name: "assisted-installer-mirror-config", Namespace: "multicluster-engine"}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Data["registries.conf"]).NotTo(ContainSubstring("docker.io/amazon"))
+			Expect(cm.Data["registries.conf"]).To(ContainSubstring("quay.io/openshift-release-dev/ocp-release"))
+		})
+	})
+
+	Describe("deleteAirgappedACM", func() {
+		It("deletes MultiClusterHub and subscription without error", func() {
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.open-cluster-management.io/v1",
+				"kind":       "MultiClusterHub",
+				"metadata":   map[string]interface{}{"name": "multiclusterhub", "namespace": "open-cluster-management"},
+			}}
+			sub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-advanced-cluster-management", "namespace": "open-cluster-management"},
+			}}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(mch, sub).Build(),
+				Scheme: testScheme,
+			}
+
+			r.deleteAirgappedACM(ctx)
+
+			// Verify both are deleted
+			checkMCH := &unstructured.Unstructured{}
+			checkMCH.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operator.open-cluster-management.io", Version: "v1", Kind: "MultiClusterHub",
+			})
+			err := r.Get(ctx, client.ObjectKey{Name: "multiclusterhub", Namespace: "open-cluster-management"}, checkMCH)
+			Expect(err).To(HaveOccurred())
+
+			checkSub := &unstructured.Unstructured{}
+			checkSub.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "operators.coreos.com", Version: "v1alpha1", Kind: "Subscription",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-advanced-cluster-management", Namespace: "open-cluster-management"}, checkSub)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("does not panic when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			Expect(func() { r.deleteAirgappedACM(ctx) }).NotTo(Panic())
+		})
+	})
+
+	Describe("reconcileAirgappedQuay with existing QuayRegistry", func() {
+		It("appends Running status when QuayRegistry exists with hostname route", func() {
+			quayRoute := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "route.openshift.io/v1",
+				"kind":       "Route",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-quay-quay",
+					"namespace": architectNamespace,
+				},
+				"spec": map[string]interface{}{
+					"host": "quay.apps.example.com",
+				},
+			}}
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-quay",
+					"namespace": architectNamespace,
+				},
+				"status": map[string]interface{}{
+					"registryEndpoint": "https://quay.apps.example.com",
+				},
+			}}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.apps.example.com/mirror",
+						Quay: &mirrorv1.AirgappedQuayConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry, quayRoute, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileAirgappedQuay(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			foundComponent := false
+			for _, c := range platform.Status.Components {
+				if c.Name == "quay-registry" && c.Status == "Running" {
+					foundComponent = true
+				}
+			}
+			Expect(foundComponent).To(BeTrue())
+		})
+
+		It("returns nil when Quay is not enabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileAirgappedQuay(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when Quay config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						Quay: &mirrorv1.AirgappedQuayConfig{Enabled: false},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileAirgappedQuay(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates QuayRegistry when not found", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						Quay: &mirrorv1.AirgappedQuayConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileAirgappedQuay(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			qr := &unstructured.Unstructured{}
+			qr.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-quay", Namespace: architectNamespace}, qr)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("ensureAirgappedRegistryCredentials", func() {
+		It("returns nil when user-provided credentials are set", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						RegistryCredentials: &corev1.LocalObjectReference{Name: "my-creds"},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when QuayRegistry not yet created", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						Quay: &mirrorv1.AirgappedQuayConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when no credentials config is set", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileAirgapped", func() {
+		It("skips ACM when not configured", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(needsRequeue).To(BeFalse())
+		})
+
+		It("defers other components until MCH is running when ACM enabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						ACM: &mirrorv1.AirgappedACMConfig{Enabled: true},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(needsRequeue).To(BeTrue())
+		})
+
+		It("reconciles mirror registry config when set", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{
+							DataPath: "/opt/quay",
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			_ = needsRequeue
+		})
+	})
+
+	Describe("buildIgnitionConfigOverride", func() {
+		It("returns empty when no ClusterImagePolicy exists", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			override := r.buildIgnitionConfigOverride(ctx)
+			Expect(override).To(BeEmpty())
+		})
+
+		It("returns ignition JSON when ClusterImagePolicy exists", func() {
+			cip := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "ClusterImagePolicy",
+				"metadata":   map[string]interface{}{"name": "test-policy"},
+				"spec": map[string]interface{}{
+					"policy": map[string]interface{}{
+						"rootOfTrust": map[string]interface{}{
+							"publicKey": map[string]interface{}{
+								"keyData": "LS0tLS1CRUdJTi...",
+							},
+						},
+					},
+					"scopes": []interface{}{"quay.io/example"},
+				},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cip).Build(),
+				Scheme: testScheme,
+			}
+			override := r.buildIgnitionConfigOverride(ctx)
+			Expect(override).To(ContainSubstring("ignition"))
+		})
+	})
+
+	Describe("reconcileImportScanner schedule update", func() {
+		It("updates CronJob schedule when it differs from desired", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry:     "quay.airgap.local/mirror",
+						ImportPath:         "/mnt/import",
+						ImportScanSchedule: "*/10 * * * *",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			// First call creates CronJob with schedule */10
+			Expect(r.reconcileImportScanner(ctx, platform)).To(Succeed())
+
+			cronJob := &batchv1.CronJob{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, cronJob)).To(Succeed())
+			Expect(cronJob.Spec.Schedule).To(Equal("*/10 * * * *"))
+
+			// Change schedule and reconcile again
+			platform.Spec.Airgapped.ImportScanSchedule = "*/15 * * * *"
+			Expect(r.reconcileImportScanner(ctx, platform)).To(Succeed())
+
+			Expect(r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, cronJob)).To(Succeed())
+			Expect(cronJob.Spec.Schedule).To(Equal("*/15 * * * *"))
+		})
+
+		It("does not update CronJob when schedule is unchanged", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ImportPath:     "/mnt/import",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			Expect(r.reconcileImportScanner(ctx, platform)).To(Succeed())
+			// Second call with same default schedule should succeed without update
+			Expect(r.reconcileImportScanner(ctx, platform)).To(Succeed())
+
+			cronJob := &batchv1.CronJob{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, cronJob)).To(Succeed())
+			Expect(cronJob.Spec.Schedule).To(Equal("*/30 * * * *"))
+		})
+	})
+
+	Describe("ensureImportScannerScript content update", func() {
+		It("updates ConfigMap when script content differs", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+			}
+
+			// Pre-create a ConfigMap with stale content
+			staleCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "import-scanner-script",
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{
+					"scan-imports.sh": "#!/bin/bash\necho old-script",
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, staleCM).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureImportScannerScript(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "import-scanner-script", Namespace: architectNamespace}, cm)).To(Succeed())
+			Expect(cm.Data["scan-imports.sh"]).To(ContainSubstring("Scanning"))
+			Expect(cm.Data["scan-imports.sh"]).NotTo(ContainSubstring("old-script"))
+		})
+	})
+
+	Describe("ensureImportScannerRBAC role update", func() {
+		It("updates existing Role rules", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+			}
+
+			// Pre-create a Role with stale rules
+			staleRole := &rbacv1.Role{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "import-bundle-scanner",
+					Namespace: architectNamespace,
+				},
+				Rules: []rbacv1.PolicyRule{
+					{
+						APIGroups: []string{""},
+						Resources: []string{"pods"},
+						Verbs:     []string{"get"},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, staleRole).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureImportScannerRBAC(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			role := &rbacv1.Role{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, role)).To(Succeed())
+			Expect(role.Rules).To(HaveLen(1))
+			Expect(role.Rules[0].Resources).To(ContainElement("mirrorimports"))
+		})
+	})
+
+	Describe("reconcileRHCOSServer deployment update", func() {
+		It("updates deployment when image changes", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+
+			// Pre-create deployment with old image
+			oldLabels := map[string]string{"app": "rhcos-server"}
+			existingDeploy := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rhcos-server",
+					Namespace: architectNamespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: oldLabels},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: oldLabels},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "nginx",
+									Image: "quay.airgap.local/mirror/rhcos-server:4.17.0",
+								},
+							},
+						},
+					},
+				},
+			}
+			existingSvc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rhcos-server",
+					Namespace: architectNamespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: oldLabels,
+					Ports: []corev1.ServicePort{
+						{Name: "http", Port: 8080, Protocol: corev1.ProtocolTCP},
+					},
+				},
+			}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, existingDeploy, existingSvc).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("quay.airgap.local/mirror/rhcos-server:4.18.12"))
+		})
+
+		It("returns nil when no OCP version is configured", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled:  true,
+								Versions: []mirrorv1.HostInventoryVersion{},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("is idempotent when deployment image matches desired", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+
+			labels := map[string]string{"app": "rhcos-server"}
+			existingDeploy := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rhcos-server",
+					Namespace: architectNamespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: labels},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: labels},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "nginx",
+									Image: "quay.airgap.local/mirror/rhcos-server:4.18.12",
+								},
+							},
+						},
+					},
+				},
+			}
+			existingSvc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rhcos-server",
+					Namespace: architectNamespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: labels,
+					Ports: []corev1.ServicePort{
+						{Name: "http", Port: 8080, Protocol: corev1.ProtocolTCP},
+					},
+				},
+			}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, existingDeploy, existingSvc).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			deploy := &appsv1.Deployment{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)).To(Succeed())
+			// Image should remain unchanged
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("quay.airgap.local/mirror/rhcos-server:4.18.12"))
+		})
+	})
+
+	Describe("ensureAirgappedRegistryCredentials with QuayRegistry hostname", func() {
+		It("returns nil when QuayRegistry exists but hostname is not yet available", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-quay",
+					"namespace": architectNamespace,
+				},
+				// No status.registryEndpoint
+			}}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						Quay: &mirrorv1.AirgappedQuayConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when QuayRegistry exists with custom org and no hostname", func() {
+			quayRegistry := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-quay",
+					"namespace": architectNamespace,
+				},
+			}}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/myorg",
+						Quay: &mirrorv1.AirgappedQuayConfig{
+							Enabled:          true,
+							OrganizationName: "myorg",
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quayRegistry, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileAirgapped with ACM fully running and host inventory", func() {
+		It("proceeds with host inventory when MCH is Running", func() {
+			pkgManifest := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "packages.operators.coreos.com/v1",
+				"kind":       "PackageManifest",
+				"metadata": map[string]interface{}{
+					"name":      "advanced-cluster-management",
+					"namespace": "openshift-marketplace",
+					"labels": map[string]interface{}{
+						"catalog":           "redhat-operators",
+						"catalog-namespace": "openshift-marketplace",
+					},
+				},
+				"status": map[string]interface{}{
+					"catalogSource":          "redhat-operators",
+					"catalogSourceNamespace": "openshift-marketplace",
+					"channels": []interface{}{
+						map[string]interface{}{
+							"name":       "release-2.11",
+							"currentCSV": "acm.v2.11.0",
+						},
+					},
+					"defaultChannel": "release-2.11",
+				},
+			}}
+
+			csv := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "ClusterServiceVersion",
+				"metadata": map[string]interface{}{
+					"name":      "acm.v2.11.0",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"phase": "Succeeded",
+				},
+			}}
+
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+
+			acmSub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-advanced-cluster-management",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"currentCSV": "acm.v2.11.0",
+				},
+			}}
+
+			acmNS := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "open-cluster-management"},
+			}
+
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.open-cluster-management.io/v1",
+				"kind":       "MultiClusterHub",
+				"metadata":   map[string]interface{}{"name": "multiclusterhub", "namespace": "open-cluster-management"},
+				"status":     map[string]interface{}{"phase": "Running"},
+			}}
+
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			mceNs := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine"},
+			}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+								Credential: &mirrorv1.CredentialConfig{
+									Enabled:    true,
+									BaseDomain: "example.com",
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(
+					pkgManifest, csv, pullSecret, acmSub, acmNS, mch, ns, mceNs, platform,
+				).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Check that host-inventory component was added to status
+			foundHostInventory := false
+			for _, c := range platform.Status.Components {
+				if c.Name == "host-inventory" && c.Status == "Configured" {
+					foundHostInventory = true
+				}
+			}
+			Expect(foundHostInventory).To(BeTrue())
+
+			// Verify RHCOS server deployment was created
+			deploy := &appsv1.Deployment{}
+			err = r.Get(ctx, client.ObjectKey{Name: "rhcos-server", Namespace: architectNamespace}, deploy)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify AgentServiceConfig was created
+			asc := &unstructured.Unstructured{}
+			asc.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "AgentServiceConfig",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "agent"}, asc)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify ClusterImageSet was created
+			cis := &unstructured.Unstructured{}
+			cis.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "hive.openshift.io", Version: "v1", Kind: "ClusterImageSet",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "openshift-4-18-12"}, cis)
+			Expect(err).NotTo(HaveOccurred())
+
+			_ = needsRequeue
+		})
+
+		It("proceeds with host inventory when MCH is Running with InfraEnv enabled", func() {
+			pkgManifest := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "packages.operators.coreos.com/v1",
+				"kind":       "PackageManifest",
+				"metadata": map[string]interface{}{
+					"name":      "advanced-cluster-management",
+					"namespace": "openshift-marketplace",
+					"labels": map[string]interface{}{
+						"catalog":           "redhat-operators",
+						"catalog-namespace": "openshift-marketplace",
+					},
+				},
+				"status": map[string]interface{}{
+					"catalogSource":          "redhat-operators",
+					"catalogSourceNamespace": "openshift-marketplace",
+					"channels": []interface{}{
+						map[string]interface{}{
+							"name":       "release-2.11",
+							"currentCSV": "acm.v2.11.0",
+						},
+					},
+					"defaultChannel": "release-2.11",
+				},
+			}}
+
+			csv := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "ClusterServiceVersion",
+				"metadata": map[string]interface{}{
+					"name":      "acm.v2.11.0",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"phase": "Succeeded",
+				},
+			}}
+
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: architectNamespace},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+
+			acmSub := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1alpha1",
+				"kind":       "Subscription",
+				"metadata": map[string]interface{}{
+					"name":      "mirror-operator-advanced-cluster-management",
+					"namespace": "open-cluster-management",
+				},
+				"status": map[string]interface{}{
+					"currentCSV": "acm.v2.11.0",
+				},
+			}}
+
+			acmNS := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "open-cluster-management"},
+			}
+
+			mch := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operator.open-cluster-management.io/v1",
+				"kind":       "MultiClusterHub",
+				"metadata":   map[string]interface{}{"name": "multiclusterhub", "namespace": "open-cluster-management"},
+				"status":     map[string]interface{}{"phase": "Running"},
+			}}
+
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			mceNs := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "multicluster-engine"},
+			}
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: true,
+								Versions: []mirrorv1.HostInventoryVersion{
+									{OpenshiftVersion: "4.18.12"},
+								},
+								InfraEnv: &mirrorv1.InfraEnvConfig{
+									Enabled: true,
+								},
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(
+					pkgManifest, csv, pullSecret, acmSub, acmNS, mch, ns, mceNs, platform,
+				).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			// InfraEnv should be created
+			infraEnv := &unstructured.Unstructured{}
+			infraEnv.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-infraenv", Namespace: architectNamespace}, infraEnv)
+			Expect(err).NotTo(HaveOccurred())
+
+			_ = needsRequeue
+		})
+	})
+
+	Describe("reconcileAirgapped with import path and Tekton", func() {
+		It("exercises both import scanner and pipeline template branches", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry:     "quay.airgap.local/mirror",
+						ImportPath:         "/mnt/bundles",
+						ImportScanSchedule: "*/5 * * * *",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client:          fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme:          testScheme,
+				TektonAvailable: true,
+				MirrorImage:     "quay.io/test/oc-mirror:v1",
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			// CronJob should be created
+			cronJob := &batchv1.CronJob{}
+			err = r.Get(ctx, client.ObjectKey{Name: "import-bundle-scanner", Namespace: architectNamespace}, cronJob)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cronJob.Spec.Schedule).To(Equal("*/5 * * * *"))
+
+			// Pipeline template should be created
+			pipeline := &unstructured.Unstructured{}
+			pipeline.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "tekton.dev", Version: "v1", Kind: "Pipeline",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "import-pipeline-template", Namespace: architectNamespace}, pipeline)
+			Expect(err).NotTo(HaveOccurred())
+
+			_ = needsRequeue
+		})
+	})
+
+	Describe("reconcileAirgapped with MirrorRegistryConfig", func() {
+		It("calls reconcileMirrorRegistry when MirrorRegistryConfig is set", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "",
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{
+							DataPath:   "/opt/quay",
+							Port:       8443,
+							QuayImage:  "quay.io/test/quay:v1",
+							RedisImage: "quay.io/test/redis:v1",
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			// MirrorRegistryConfig branch was hit (it will fail inside due to no nodes,
+			// but needsRequeue should be true since reconcileMirrorRegistry errored)
+			Expect(needsRequeue).To(BeTrue())
+		})
+	})
+
+	Describe("ensureAirgappedUpdateService update path", func() {
+		It("updates UpdateService when spec differs", func() {
+			existingUS := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "updateservice.operator.openshift.io/v1",
+				"kind":       "UpdateService",
+				"metadata":   map[string]interface{}{"name": "update-service-oc-mirror", "namespace": "openshift-update-service"},
+				"spec": map[string]interface{}{
+					"graphDataImage": "old-image:latest",
+					"releases":       "old-releases",
+					"replicas":       int64(1),
+				},
+			}}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existingUS, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAirgappedUpdateService(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
+			})
+			Expect(r.Get(ctx, client.ObjectKey{Name: "update-service-oc-mirror", Namespace: "openshift-update-service"}, updated)).To(Succeed())
+			graphImage, _, _ := unstructured.NestedString(updated.Object, "spec", "graphDataImage")
+			Expect(graphImage).To(Equal("quay.airgap.local/mirror/openshift/graph-image:latest"))
+		})
+	})
+
+	Describe("ensureImportJobRBAC idempotency and update", func() {
+		It("updates existing ClusterRole rules", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+			}
+
+			// Pre-create ClusterRole with stale rules
+			staleCR := &rbacv1.ClusterRole{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mirror-import-job",
+				},
+				Rules: []rbacv1.PolicyRule{
+					{
+						APIGroups: []string{""},
+						Resources: []string{"pods"},
+						Verbs:     []string{"get"},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, staleCR).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureImportJobRBAC(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			cr := &rbacv1.ClusterRole{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-import-job"}, cr)).To(Succeed())
+			Expect(cr.Rules).To(HaveLen(2))
+			Expect(cr.Rules[0].Resources).To(ContainElement("imagedigestmirrorsets"))
+		})
+
+		It("is idempotent on second call", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			Expect(r.ensureImportJobRBAC(ctx, platform)).To(Succeed())
+			Expect(r.ensureImportJobRBAC(ctx, platform)).To(Succeed())
+		})
+	})
+
+	Describe("createAirgappedQuayConfigSecret idempotency", func() {
+		It("returns nil when secret already exists", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			existingSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "mirror-operator-quay-config-bundle",
+					Namespace: architectNamespace,
+				},
+				Data: map[string][]byte{
+					"config.yaml": []byte("existing config"),
+				},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform, existingSecret).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.createAirgappedQuayConfigSecret(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Secret should not be overwritten
+			secret := &corev1.Secret{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-quay-config-bundle", Namespace: architectNamespace}, secret)).To(Succeed())
+			Expect(string(secret.Data["config.yaml"])).To(Equal("existing config"))
+		})
+	})
+
+	Describe("reconcileAirgapped with Quay enabled", func() {
+		It("exercises the reconcileAirgappedQuay branch when Quay is enabled", func() {
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: architectNamespace},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-platform",
+					UID:  "test-uid",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "",
+						Quay: &mirrorv1.AirgappedQuayConfig{
+							Enabled: true,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(ns, platform).Build(),
+				Scheme: testScheme,
+			}
+
+			needsRequeue, err := r.reconcileAirgapped(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			// QuayRegistry should be created
+			qr := &unstructured.Unstructured{}
+			qr.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry",
+			})
+			err = r.Get(ctx, client.ObjectKey{Name: "mirror-operator-quay", Namespace: architectNamespace}, qr)
+			Expect(err).NotTo(HaveOccurred())
+			_ = needsRequeue
+		})
+	})
+
+	Describe("ensureAirgappedRegistryCredentials with Quay disabled explicitly", func() {
+		It("returns nil without attempting QuayRegistry lookup", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "external-registry.example.com/mirror",
+						Quay: &mirrorv1.AirgappedQuayConfig{
+							Enabled: false,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.ensureAirgappedRegistryCredentials(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("reconcileRHCOSServer with ACM nil", func() {
+		It("returns nil when ACM config is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM:            nil,
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when HostInventory is nil", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled:       true,
+							HostInventory: nil,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("returns nil when HostInventory is disabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistry: "quay.airgap.local/mirror",
+						ACM: &mirrorv1.AirgappedACMConfig{
+							Enabled: true,
+							HostInventory: &mirrorv1.HostInventoryConfig{
+								Enabled: false,
+							},
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			err := r.reconcileRHCOSServer(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Describe("getMirrorRegistryCA from user-ca-bundle", func() {
+		It("returns CA from cluster user-ca-bundle ConfigMap", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-ca-bundle",
+					Namespace: "openshift-config",
+				},
+				Data: map[string]string{
+					"ca-bundle.crt": "-----BEGIN CERTIFICATE-----\ncluster-ca\n-----END CERTIFICATE-----",
+				},
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode:      mirrorv1.PlatformModeAirgapped,
+					Airgapped: &mirrorv1.AirgappedConfig{},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(cm).Build(),
+				Scheme: testScheme,
+			}
+
+			ca := r.getMirrorRegistryCA(ctx, platform)
+			Expect(ca).To(ContainSubstring("cluster-ca"))
+		})
+	})
 })
