@@ -61,6 +61,10 @@ type ConnectedConfig struct {
 	// RHCOS image collection for ACM host inventory in airgapped environments
 	// +optional
 	RHCOSCollection *RHCOSCollectionConfig `json:"rhcosCollection,omitempty"`
+	// Custom catalog image for mirroring the mirror-operator itself (defaults to community-operator-index).
+	// Set to a dev catalog image (e.g. "quay.io/mathianasj/mirror-operator-catalog:latest") to test pre-release code.
+	// +optional
+	MirrorOperatorCatalog string `json:"mirrorOperatorCatalog,omitempty"`
 }
 
 // RHCOSCollectionConfig controls downloading RHCOS boot images and packaging them into a server container image
