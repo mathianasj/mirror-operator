@@ -510,6 +510,11 @@ spec:
                       '0 2 * * 0' for weekly Sunday 2am). Required only when triggerTypes
                       includes 'scheduled'.
                     type: string
+                  mirrorOperatorCatalog:
+                    description: |-
+                      Custom catalog image for mirroring the mirror-operator itself (defaults to community-operator-index).
+                      Set to a dev catalog image (e.g. "quay.io/mathianasj/mirror-operator-catalog:latest") to test pre-release code.
+                    type: string
                   mirrorRegistry:
                     description: Target mirror registry URL (auto-configured when
                       managed Quay is enabled)

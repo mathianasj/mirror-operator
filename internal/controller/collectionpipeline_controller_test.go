@@ -623,4 +623,60 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 			r.updatePlatformCollectionHistory(ctx, pipeline)
 		})
 	})
+
+	Describe("injectMirrorOperator", func() {
+		baseConfig := `kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v1alpha2
+mirror:
+  platform:
+    channels:
+    - name: stable-4.18
+      minVersion: "4.18.3"
+  operators:
+  - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.18
+    packages:
+    - name: advanced-cluster-management
+`
+
+		It("uses default community catalog when no override is set", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.injectMirrorOperator(baseConfig, "")
+			Expect(result).To(ContainSubstring("registry.redhat.io/redhat/community-operator-index"))
+			Expect(result).To(ContainSubstring("mirror-operator"))
+		})
+
+		It("uses custom catalog when override is provided", func() {
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.injectMirrorOperator(baseConfig, "quay.io/mathianasj/mirror-operator-catalog:latest")
+			Expect(result).To(ContainSubstring("quay.io/mathianasj/mirror-operator-catalog:latest"))
+			Expect(result).To(ContainSubstring("mirror-operator"))
+			Expect(result).NotTo(ContainSubstring("community-operator-index"))
+		})
+
+		It("does not duplicate when mirror-operator already present in matching catalog", func() {
+			configWithOperator := `kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v1alpha2
+mirror:
+  operators:
+  - catalog: quay.io/mathianasj/mirror-operator-catalog:latest
+    packages:
+    - name: mirror-operator
+`
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.injectMirrorOperator(configWithOperator, "quay.io/mathianasj/mirror-operator-catalog:latest")
+			Expect(result).To(Equal(configWithOperator))
+		})
+	})
 })
