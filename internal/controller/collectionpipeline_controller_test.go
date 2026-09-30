@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -2683,6 +2684,65 @@ mirror:
 			}
 			Expect(paramMap["working-pvc-name"]).To(Equal("collection-storage-parent-pipeline"))
 			Expect(paramMap["parent-pipeline"]).To(Equal("parent-pipeline"))
+		})
+	})
+
+	Describe("trackPipelineRun - OBC fallback URL", func() {
+		It("constructs bundle URL from OBC ConfigMap and S3 route when no PipelineRun results", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "completed-run", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{Type: knativeapis.ConditionSucceeded, Status: corev1.ConditionTrue},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+						StartTime:      &now,
+					},
+				},
+			}
+
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+			}
+			pipeline.Status.PipelineRunRef = "completed-run"
+
+			obcCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "collection-artifacts", Namespace: "default"},
+				Data: map[string]string{
+					"BUCKET_NAME": "my-bucket",
+					"BUCKET_HOST": "s3.openshift-storage.svc",
+				},
+			}
+
+			s3Route := &unstructured.Unstructured{}
+			s3Route.SetGroupVersionKind(schema.GroupVersionKind{
+				Group: "route.openshift.io", Version: "v1", Kind: "Route",
+			})
+			s3Route.SetName("s3")
+			s3Route.SetNamespace("openshift-storage")
+			unstructured.SetNestedField(s3Route.Object, "s3-external.apps.example.com", "spec", "host")
+
+			r := &CollectionPipelineReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).
+					WithObjects(pipeline, pr, obcCM, s3Route).
+					WithStatusSubresource(pipeline).Build(),
+				Scheme: testScheme,
+			}
+
+			_, err := r.trackPipelineRun(ctx, pipeline, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-pipeline", Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.CollectionPipeline{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-pipeline", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.BundleURL).To(ContainSubstring("s3-external.apps.example.com"))
+			Expect(updated.Status.BundleURL).To(ContainSubstring("my-bucket"))
+			Expect(updated.Status.SignatureURL).To(ContainSubstring(".sig"))
 		})
 	})
 })

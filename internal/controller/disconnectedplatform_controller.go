@@ -5964,6 +5964,9 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundleInNamespace(ctx co
 		if existing.Labels["config.openshift.io/inject-trusted-cabundle"] == "true" {
 			return nil
 		}
+		if existing.Labels == nil {
+			existing.Labels = make(map[string]string)
+		}
 		existing.Labels["config.openshift.io/inject-trusted-cabundle"] = "true"
 		return r.Update(ctx, existing)
 	} else if !apierrors.IsNotFound(err) {

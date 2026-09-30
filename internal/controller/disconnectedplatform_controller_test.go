@@ -6051,6 +6051,55 @@ notifier:
 		})
 	})
 
+	Describe("ensureClusterCABundleInNamespace", func() {
+		It("creates ConfigMap with inject label when not found", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.ensureClusterCABundleInNamespace(ctx, "test-ns")
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := &corev1.ConfigMap{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: clusterCABundleName, Namespace: "test-ns"}, cm)).To(Succeed())
+			Expect(cm.Labels["config.openshift.io/inject-trusted-cabundle"]).To(Equal("true"))
+		})
+
+		It("is idempotent when ConfigMap exists with correct label", func() {
+			existing := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: "test-ns",
+					Labels:    map[string]string{"config.openshift.io/inject-trusted-cabundle": "true"},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			Expect(r.ensureClusterCABundleInNamespace(ctx, "test-ns")).To(Succeed())
+		})
+
+		It("updates label when ConfigMap exists without it", func() {
+			existing := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCABundleName,
+					Namespace: "test-ns",
+					Labels:    map[string]string{},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			Expect(r.ensureClusterCABundleInNamespace(ctx, "test-ns")).To(Succeed())
+
+			updated := &corev1.ConfigMap{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: clusterCABundleName, Namespace: "test-ns"}, updated)).To(Succeed())
+			Expect(updated.Labels["config.openshift.io/inject-trusted-cabundle"]).To(Equal("true"))
+		})
+	})
+
 	Describe("ensureServiceCAConfigMap", func() {
 		It("creates ConfigMap with inject annotation when not found", func() {
 			r := &DisconnectedPlatformReconciler{
@@ -10899,6 +10948,71 @@ notifier:
 			err := r.configureCollectionPipelineSigning(ctx, platform)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("Fulcio or Rekor URL not available"))
+		})
+
+		It("returns error when Keycloak not found", func() {
+			securesign := &unstructured.Unstructured{}
+			securesign.SetGroupVersionKind(schema.GroupVersionKind{Group: "rhtas.redhat.com", Version: "v1alpha1", Kind: "Securesign"})
+			securesign.SetName("mirror-operator-securesign")
+			securesign.SetNamespace(architectNamespace)
+			unstructured.SetNestedMap(securesign.Object, map[string]interface{}{
+				"fulcio": map[string]interface{}{"url": "https://fulcio.example.com"},
+				"rekor":  map[string]interface{}{"url": "https://rekor.example.com"},
+			}, "status")
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: architectNamespace},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build()
+			r := &DisconnectedPlatformReconciler{Client: c, Scheme: testScheme}
+			err := r.configureCollectionPipelineSigning(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("waiting for Keycloak"))
+		})
+
+		It("returns error when Keycloak hostname empty", func() {
+			securesign := &unstructured.Unstructured{}
+			securesign.SetGroupVersionKind(schema.GroupVersionKind{Group: "rhtas.redhat.com", Version: "v1alpha1", Kind: "Securesign"})
+			securesign.SetName("mirror-operator-securesign")
+			securesign.SetNamespace(architectNamespace)
+			unstructured.SetNestedMap(securesign.Object, map[string]interface{}{
+				"fulcio": map[string]interface{}{"url": "https://fulcio.example.com"},
+				"rekor":  map[string]interface{}{"url": "https://rekor.example.com"},
+			}, "status")
+
+			kc := &unstructured.Unstructured{}
+			kc.SetGroupVersionKind(schema.GroupVersionKind{Group: "k8s.keycloak.org", Version: "v2alpha1", Kind: "Keycloak"})
+			kc.SetName("mirror-operator-keycloak")
+			kc.SetNamespace(architectNamespace)
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: architectNamespace},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Connected: &mirrorv1.ConnectedConfig{
+						RHTAS: &mirrorv1.RHTASInstallerConfig{
+							OIDC: &mirrorv1.RHTASOIDCConfig{
+								Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true},
+							},
+						},
+					},
+				},
+			}
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign, kc).Build()
+			r := &DisconnectedPlatformReconciler{Client: c, Scheme: testScheme}
+			err := r.configureCollectionPipelineSigning(ctx, platform)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Keycloak hostname not available"))
 		})
 	})
 
