@@ -1562,7 +1562,7 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 					Mode: "airgapped",
 					Airgapped: &mirrorv1.AirgappedConfig{
 						ACM: &mirrorv1.AirgappedACMConfig{
-							Enabled: true,
+							Enabled:       true,
 							HostInventory: &mirrorv1.HostInventoryConfig{Enabled: true},
 						},
 					},

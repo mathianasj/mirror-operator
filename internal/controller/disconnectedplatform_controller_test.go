@@ -1617,7 +1617,13 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 	Describe("architectBackendDeployment", func() {
 		It("creates a Deployment with correct structure", func() {
 			labels := architectComponentLabels("backend")
-			dep := architectBackendDeployment("test-backend", "quay.io/test/backend:v1", 2, labels, "pull-secret", "openshift-config", backendContainer)
+			testContainerBuilder := func(name, image string, labels map[string]string) map[string]interface{} {
+				return map[string]interface{}{
+					"name":  name,
+					"image": image,
+				}
+			}
+			dep := architectBackendDeployment("test-backend", "quay.io/test/backend:v1", 2, labels, "pull-secret", "openshift-config", testContainerBuilder)
 
 			Expect(dep.GetName()).To(Equal("test-backend"))
 			Expect(dep.GetNamespace()).To(Equal(architectNamespace))
@@ -3030,7 +3036,7 @@ notifier:
 			platform := &mirrorv1.DisconnectedPlatform{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 				Spec: mirrorv1.DisconnectedPlatformSpec{
-					Mode: "connected",
+					Mode:      "connected",
 					Connected: &mirrorv1.ConnectedConfig{},
 				},
 			}
@@ -3958,7 +3964,7 @@ notifier:
 			platform := &mirrorv1.DisconnectedPlatform{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 				Spec: mirrorv1.DisconnectedPlatformSpec{
-					Mode: "connected",
+					Mode:      "connected",
 					Connected: &mirrorv1.ConnectedConfig{},
 				},
 			}
