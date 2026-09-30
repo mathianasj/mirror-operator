@@ -6854,6 +6854,25 @@ notifier:
 			}
 			Expect(r.ensureImportScriptConfigMap(ctx)).To(Succeed())
 		})
+
+		It("updates ConfigMap when content is stale", func() {
+			existing := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "airgap-architect-import-script",
+					Namespace: architectNamespace,
+				},
+				Data: map[string]string{"import-airgap-architect.sh": "old-script-content"},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existing).Build(),
+				Scheme: testScheme,
+			}
+			Expect(r.ensureImportScriptConfigMap(ctx)).To(Succeed())
+
+			updated := &corev1.ConfigMap{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: "airgap-architect-import-script", Namespace: architectNamespace}, updated)).To(Succeed())
+			Expect(updated.Data["import-airgap-architect.sh"]).To(Equal(scripts.ImportAirgapArchitectScript))
+		})
 	})
 
 	Describe("reconcileSubscriptions", func() {

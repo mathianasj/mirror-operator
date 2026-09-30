@@ -810,4 +810,177 @@ var _ = Describe("Event Handlers", func() {
 			Expect(q.Len()).To(Equal(0))
 		})
 	})
+
+	Describe("secretEventHandler no-op methods", func() {
+		It("Create does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &secretEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: secret}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Delete does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &secretEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Delete(ctx, event.TypedDeleteEvent[client.Object]{Object: secret}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &secretEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: secret}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
+
+	Describe("collectionPipelineEventHandler no-op methods", func() {
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &collectionPipelineEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			pipeline := &mirrorv1.CollectionPipeline{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: pipeline}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Create enqueues platforms", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"},
+				Spec:       mirrorv1.DisconnectedPlatformSpec{Mode: "connected"},
+			}
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build()
+			h := &collectionPipelineEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			pipeline := &mirrorv1.CollectionPipeline{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: pipeline}, q)
+			Expect(q.Len()).To(Equal(1))
+		})
+
+		It("Delete enqueues platforms", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"},
+				Spec:       mirrorv1.DisconnectedPlatformSpec{Mode: "connected"},
+			}
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build()
+			h := &collectionPipelineEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			pipeline := &mirrorv1.CollectionPipeline{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+			h.Delete(ctx, event.TypedDeleteEvent[client.Object]{Object: pipeline}, q)
+			Expect(q.Len()).To(Equal(1))
+		})
+	})
+
+	Describe("nodeEventHandler no-op methods", func() {
+		It("Create does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &nodeEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: node}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &nodeEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: node}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
+
+	Describe("taskRunEventHandler no-op methods", func() {
+		It("Create does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &taskRunEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			u := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "tekton.dev/v1",
+				"kind":       "TaskRun",
+				"metadata":   map[string]interface{}{"name": "test", "namespace": "default"},
+			}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: u}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Delete does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &taskRunEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			u := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "tekton.dev/v1",
+				"kind":       "TaskRun",
+				"metadata":   map[string]interface{}{"name": "test", "namespace": "default"},
+			}}
+			h.Delete(ctx, event.TypedDeleteEvent[client.Object]{Object: u}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &taskRunEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			u := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "tekton.dev/v1",
+				"kind":       "TaskRun",
+				"metadata":   map[string]interface{}{"name": "test", "namespace": "default"},
+			}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: u}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
+
+	Describe("nodeReadyStatus", func() {
+		It("returns the Ready condition status", func() {
+			node := &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+					},
+				},
+			}
+			Expect(nodeReadyStatus(node)).To(Equal(corev1.ConditionTrue))
+		})
+
+		It("returns Unknown when no Ready condition exists", func() {
+			node := &corev1.Node{
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionFalse},
+					},
+				},
+			}
+			Expect(nodeReadyStatus(node)).To(Equal(corev1.ConditionUnknown))
+		})
+	})
 })
