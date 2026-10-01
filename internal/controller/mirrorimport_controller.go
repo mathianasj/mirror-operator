@@ -95,10 +95,11 @@ func (r *MirrorImportReconciler) startImport(ctx context.Context, importCR *mirr
 			if versionExists(platform.Status.ImportHistory, importCR.Spec.CollectionVersion) {
 				importCR.Status.Phase = "Failed"
 				importCR.Status.Conditions = append(importCR.Status.Conditions, metav1.Condition{
-					Type:    "DependencyCheck",
-					Status:  "False",
-					Reason:  "VersionAlreadyImported",
-					Message: fmt.Sprintf("version %s has already been imported", importCR.Spec.CollectionVersion),
+					Type:               "DependencyCheck",
+					Status:             "False",
+					Reason:             "VersionAlreadyImported",
+					Message:            fmt.Sprintf("version %s has already been imported", importCR.Spec.CollectionVersion),
+					LastTransitionTime: metav1.Now(),
 				})
 				return ctrl.Result{}, r.Status().Update(ctx, importCR)
 			}

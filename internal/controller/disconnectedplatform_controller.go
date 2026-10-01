@@ -2657,19 +2657,19 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 		"http": map[string]interface{}{
 			"tlsSecret": tlsSecretName,
 		},
-		"additionalOptions": []map[string]interface{}{
-			{
+		"additionalOptions": []interface{}{
+			map[string]interface{}{
 				"name":  "KEYCLOAK_ADMIN",
 				"value": "admin",
 			},
-			{
+			map[string]interface{}{
 				"name": "KEYCLOAK_ADMIN_PASSWORD",
 				"secret": map[string]interface{}{
 					"name": "mirror-operator-keycloak-initial-admin",
 					"key":  "password",
 				},
 			},
-			{
+			map[string]interface{}{
 				"name":  "truststore-paths",
 				"value": clusterCAFilePath,
 			},
@@ -2691,10 +2691,10 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 		"unsupported": map[string]interface{}{
 			"podTemplate": map[string]interface{}{
 				"spec": map[string]interface{}{
-					"containers": []map[string]interface{}{
-						{
-							"volumeMounts": []map[string]interface{}{
-								{
+					"containers": []interface{}{
+						map[string]interface{}{
+							"volumeMounts": []interface{}{
+								map[string]interface{}{
 									"name":      clusterCAVolumeName,
 									"mountPath": clusterCAMountPath,
 									"readOnly":  true,
@@ -2702,8 +2702,8 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 							},
 						},
 					},
-					"volumes": []map[string]interface{}{
-						{
+					"volumes": []interface{}{
+						map[string]interface{}{
 							"name": clusterCAVolumeName,
 							"configMap": map[string]interface{}{
 								"name":     clusterCABundleName,
@@ -5963,6 +5963,9 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundleInNamespace(ctx co
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
 		if existing.Labels["config.openshift.io/inject-trusted-cabundle"] == "true" {
 			return nil
+		}
+		if existing.Labels == nil {
+			existing.Labels = make(map[string]string)
 		}
 		existing.Labels["config.openshift.io/inject-trusted-cabundle"] = "true"
 		return r.Update(ctx, existing)
