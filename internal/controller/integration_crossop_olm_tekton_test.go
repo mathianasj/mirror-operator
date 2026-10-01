@@ -1,9 +1,6 @@
 package controller
 
 import (
-	"fmt"
-	"time"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -589,6 +586,3 @@ var _ = Describe("Integration CrossOp: OLM and Tekton", func() {
 		})
 	})
 })
-
-var _ = fmt.Sprintf
-var _ = time.Now
