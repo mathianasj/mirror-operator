@@ -10995,9 +10995,31 @@ echo "=== Bundle creation complete ==="
 set -ex
 echo "Uploading artifacts to S3..."
 
-# Tune S3 multipart upload for higher throughput
-aws configure set default.s3.multipart_chunksize 64MB
-aws configure set default.s3.max_concurrent_requests 20
+# Tune S3 multipart upload — use smaller chunks and fewer concurrent
+# requests to avoid overwhelming the NooBaa endpoint on large bundles
+aws configure set default.s3.multipart_chunksize 128MB
+aws configure set default.s3.multipart_threshold 128MB
+aws configure set default.s3.max_concurrent_requests 5
+
+S3_TIMEOUT_ARGS="--cli-read-timeout 600 --cli-connect-timeout 30"
+
+upload_with_retry() {
+  local src="$1"
+  shift
+  local max_attempts=3
+  local attempt=1
+  while [ $attempt -le $max_attempts ]; do
+    echo "Upload attempt $attempt/$max_attempts: $(basename "$src")"
+    if aws s3 cp "$src" "$@" $S3_TIMEOUT_ARGS; then
+      return 0
+    fi
+    echo "Attempt $attempt failed, retrying in 10s..."
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+  echo "ERROR: Upload failed after $max_attempts attempts: $(basename "$src")"
+  return 1
+}
 
 # Collection name from working-pvc-name (format: collection-storage-<name>)
 COLLECTION_NAME="$(params.collection-name)"
@@ -11016,7 +11038,7 @@ FINAL_BUNDLE="/workspace/output/${BUNDLE_FILENAME}"
 
 if [ -f "$FINAL_BUNDLE" ]; then
   echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
-  aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
+  upload_with_retry "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
     --region="$(params.s3-region)" \
     --content-type="application/x-tar"
@@ -11025,7 +11047,7 @@ if [ -f "$FINAL_BUNDLE" ]; then
   # Upload signature if it exists
   if [ -f "${FINAL_BUNDLE}.sig" ]; then
     echo "Uploading bundle signature..."
-    aws s3 cp "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
+    upload_with_retry "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
     SIG_FILE="${BUNDLE_FILENAME}.sig"
@@ -11034,7 +11056,7 @@ if [ -f "$FINAL_BUNDLE" ]; then
   # Upload attestation bundle if it exists
   if [ -f "${FINAL_BUNDLE}.bundle" ]; then
     echo "Uploading bundle attestation..."
-    aws s3 cp "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
+    upload_with_retry "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
   fi
@@ -11049,20 +11071,20 @@ if [ -f /workspace/output/sboms/bundle-*.spdx.json ]; then
   for sbomfile in /workspace/output/sboms/bundle-*.spdx.json; do
     FILENAME=$(basename "$sbomfile")
     echo "Uploading bundle SBOM: $FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
-    aws s3 cp "$sbomfile" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
+    upload_with_retry "$sbomfile" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
 
     # Upload signature if it exists
     if [ -f "${sbomfile}.sig" ]; then
-      aws s3 cp "${sbomfile}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.sig" \
+      upload_with_retry "${sbomfile}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.sig" \
         --endpoint-url="$(params.s3-endpoint)" \
         --region="$(params.s3-region)"
     fi
 
     # Upload bundle if it exists
     if [ -f "${sbomfile}.bundle" ]; then
-      aws s3 cp "${sbomfile}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.bundle" \
+      upload_with_retry "${sbomfile}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.bundle" \
         --endpoint-url="$(params.s3-endpoint)" \
         --region="$(params.s3-region)"
     fi
