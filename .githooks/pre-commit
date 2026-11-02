@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-commit hook: blocks direct commits to master and runs RH leak scanner.
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+# Block direct commits to master
+if [ "$(git branch --show-current)" = "master" ]; then
+    echo "Committing directly to master is not allowed."
+    echo "Create a feature branch and open a PR instead."
+    echo "See agents.md for the git workflow."
+    exit 1
+fi
+
+# Delegate to RH multi pre-commit (LeakTK) if available
+INSTALL_PYTHON="${HOME}/.local/share/rh-pre-commit/venv/bin/python3"
+
+if [ -x "$INSTALL_PYTHON" ]; then
+    exec "$INSTALL_PYTHON" -m rh_pre_commit.multi
+elif command -v rh-multi-pre-commit > /dev/null; then
+    exec rh-multi-pre-commit
+fi

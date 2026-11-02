@@ -319,7 +319,7 @@ if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err == nil 
 
 ## Testing
 
-**All code changes must include unit tests.** Run `make test` to verify tests pass before committing.
+**All code changes must follow the TDD Red/Green/Refactor cycle.** Write a failing test first (RED), write the minimum code to make it pass (GREEN), then clean up (REFACTOR). Run `make test` to verify tests pass before committing. See `agents.md` for detailed TDD examples and anti-patterns.
 
 ### Unit Tests
 Located in `*_test.go` files alongside controllers. Use `envtest` for controller testing:

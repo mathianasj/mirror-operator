@@ -624,8 +624,12 @@ func versionExists(history []mirrorv1.ImportInfo, version string) bool {
 func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, name string) (*corev1.ConfigMap, error) {
 	enrichedConfig := pipeline.Spec.ImageSetConfig
 
-	// Inject mirror-operator from community catalog so the operator and its relatedImages get mirrored
-	enrichedConfig = r.injectMirrorOperator(enrichedConfig)
+	// Inject mirror-operator catalog so the operator and its relatedImages get mirrored
+	var catalogOverride string
+	if platform, err := r.findPlatform(ctx); err == nil && platform != nil && platform.Spec.Connected != nil {
+		catalogOverride = platform.Spec.Connected.MirrorOperatorCatalog
+	}
+	enrichedConfig = r.injectMirrorOperator(enrichedConfig, catalogOverride)
 
 	// Include Architect images consumed by the export task in the intermediate mirror.
 	enrichedConfig = r.injectArchitectImages(ctx, enrichedConfig)
@@ -1162,28 +1166,34 @@ func (r *CollectionPipelineReconciler) injectRHCOSServerImage(ctx context.Contex
 const communityOperatorCatalog = "registry.redhat.io/redhat/community-operator-index"
 const mirrorOperatorPackage = "mirror-operator"
 
-// injectMirrorOperator ensures the community-operator-index with the mirror-operator
-// package is present in the ImageSetConfiguration operators section. This allows
-// oc-mirror to discover and mirror the operator and all its relatedImages.
-func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string) string {
+// injectMirrorOperator ensures a catalog with the mirror-operator package is present
+// in the ImageSetConfiguration operators section. When catalogOverride is set, it uses
+// that image directly; otherwise it defaults to the community-operator-index.
+func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string, catalogOverride string) string {
 	var config ImageSetConfiguration
 	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
 		return configYAML
 	}
 
-	ocVersion := r.extractOCPVersion(configYAML)
-	parts := strings.SplitN(ocVersion, ".", 2)
-	if len(parts) != 2 {
-		return configYAML
+	var catalogRef string
+	if catalogOverride != "" {
+		catalogRef = catalogOverride
+	} else {
+		ocVersion := r.extractOCPVersion(configYAML)
+		parts := strings.SplitN(ocVersion, ".", 2)
+		if len(parts) != 2 {
+			return configYAML
+		}
+		minor, err := strconv.Atoi(parts[1])
+		if err != nil || minor < 18 {
+			return configYAML
+		}
+		catalogRef = fmt.Sprintf("%s:v%s", communityOperatorCatalog, ocVersion)
 	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil || minor < 18 {
-		return configYAML
-	}
-	catalogRef := fmt.Sprintf("%s:v%s", communityOperatorCatalog, ocVersion)
 
 	for i, op := range config.Mirror.Operators {
-		if !strings.HasPrefix(op.Catalog, communityOperatorCatalog) {
+		matches := op.Catalog == catalogRef || (catalogOverride == "" && strings.HasPrefix(op.Catalog, communityOperatorCatalog))
+		if !matches {
 			continue
 		}
 		for _, pkg := range op.Packages {

@@ -172,3 +172,243 @@ Fields: `spec.connected.operators.{openshiftPipelines,rhtas,rhtpa}` with `{disab
 5. (Optional) Wire S3 import path for MirrorImport.
 6. (Optional) Parse ImageSetConfiguration YAML to auto-detect mirror sources for IDMS.
 7. (Optional) Increment build number in version strings.
+
+---
+
+## Testing Requirements
+
+### Test-Driven Development (TDD)
+
+**All new functionality, bug fixes, and implementations MUST follow the TDD cycle:**
+
+1. **RED**: Write a failing test first that describes expected behavior
+2. **GREEN**: Write minimum code to make the test pass
+3. **REFACTOR**: Clean up code while keeping tests green
+
+### Testing Philosophy
+
+- **Black-box testing**: Test behavior (inputs to reconciler produce expected resources), not implementation details
+- **Inputs**: CR specs, existing cluster state (fake client objects)
+- **Outputs**: Created/updated Kubernetes resources, status conditions, requeue results
+
+### Test Frameworks
+
+| Context | Framework | Pattern |
+|---------|-----------|---------|
+| Controller tests | Ginkgo/Gomega | `Describe`/`It` blocks with `fake.NewClientBuilder()` |
+| Domain packages | Standard `testing` | Table-driven tests with `t.Run(tt.name, ...)` |
+| Integration tests | Ginkgo + `envtest` | Real API server with CRDs loaded |
+
+### TDD Red/Green/Refactor Cycle (Go)
+
+**Controller test (Ginkgo):**
+
+```go
+// RED: Write failing test first
+It("creates a Deployment when none exists", func() {
+    platform := &mirrorv1.DisconnectedPlatform{
+        ObjectMeta: metav1.ObjectMeta{Name: "test"},
+        Spec: mirrorv1.DisconnectedPlatformSpec{
+            Mode: mirrorv1.PlatformModeAirgapped,
+            // ... minimal spec to trigger the behavior
+        },
+    }
+
+    r := &DisconnectedPlatformReconciler{
+        Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+        Scheme: testScheme,
+    }
+
+    err := r.reconcileSomeFeature(ctx, platform)
+    Expect(err).NotTo(HaveOccurred())
+
+    deploy := &appsv1.Deployment{}
+    err = r.Get(ctx, client.ObjectKey{Name: "expected-name", Namespace: "expected-ns"}, deploy)
+    Expect(err).NotTo(HaveOccurred())
+    Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("expected-image:tag"))
+})
+
+// GREEN: Write minimum code to make the test pass
+// REFACTOR: Clean up while keeping tests green
+```
+
+**Domain package test (standard testing):**
+
+```go
+// RED: Write failing test first
+func TestGetRegistryAddress(t *testing.T) {
+    tests := []struct {
+        name     string
+        nodes    []*corev1.Node
+        config   *mirrorv1.MirrorRegistryConfig
+        wantAddr string
+        wantErr  string
+    }{
+        {
+            name:     "default port",
+            nodes:    []*corev1.Node{masterNode("master-0", "10.0.0.5")},
+            config:   &mirrorv1.MirrorRegistryConfig{},
+            wantAddr: "10.0.0.5:8443",
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            // ... setup fake client, call method, assert result
+        })
+    }
+}
+
+// GREEN: Write minimum code to make the test pass
+// REFACTOR: Clean up while keeping tests green
+```
+
+### Anti-Patterns (Never Do These)
+
+```go
+// NEVER: Arbitrary sleeps in tests
+time.Sleep(5 * time.Second)
+
+// NEVER: Snapshot-style comparison of entire structs
+reflect.DeepEqual(gotDeployment, wantDeployment) // Too brittle
+
+// NEVER: Test implementation details instead of behavior
+// BAD: Assert that a specific internal method was called
+// GOOD: Assert that the expected Kubernetes resource was created/updated
+
+// NEVER: Skip error assertions
+result, _ := r.Reconcile(ctx, req) // Always check err
+```
+
+### Running Tests
+
+```bash
+# Run all tests (includes manifests, generate, fmt, vet)
+make test
+
+# Run a specific test
+go test ./internal/controller/mirrorregistry/ -run TestGetRegistryAddress -v
+
+# Run e2e tests (requires Kind cluster)
+make test-e2e
+```
+
+---
+
+## Git Workflow
+
+### Feature Branch Process
+
+**All changes MUST be done via feature branches and PRs, not direct pushes to master:**
+
+1. **Before starting work, create or identify the issue:**
+   - Every piece of work MUST have a corresponding GitHub issue
+   - If no issue exists, create one first with `gh issue create`
+   - The issue will be closed by your PR
+
+2. **Create a feature branch:**
+   ```bash
+   git checkout master && git pull origin master
+   git checkout -b feat/issue-42-your-feature-name
+   # OR for bug fixes:
+   git checkout -b fix/issue-42-your-bug-fix
+   ```
+
+3. **Make changes following TDD:**
+   - RED: Write failing tests first
+   - GREEN: Implement the feature
+   - REFACTOR: Clean up
+
+4. **Run tests before committing:**
+   ```bash
+   make test
+   ```
+
+5. **Commit and push:**
+   ```bash
+   git add <specific-files>
+   git commit -m "feat: description (#42)"
+   git push -u origin feat/issue-42-your-feature-name
+   ```
+
+6. **Create PR via GitHub CLI:**
+   ```bash
+   gh pr create --title "feat: your feature" --body "Fixes #42"
+   ```
+
+7. **After PR merged, clean up:**
+   ```bash
+   git checkout master && git pull
+   git branch -d feat/issue-42-your-feature-name
+   ```
+
+### Branch Naming Convention
+
+| Type | Pattern | Example |
+|------|---------|---------|
+| Feature | `feat/issue-N-description` | `feat/issue-46-mirror-registry-machineconfig` |
+| Bug Fix | `fix/issue-N-description` | `fix/issue-83-rhcos-mirror-registry` |
+| Chore | `chore/issue-N-description` | `chore/issue-86-tdd-git-flow-standards` |
+| Documentation | `docs/issue-N-description` | `docs/issue-80-node-sizing` |
+| Testing | `test/issue-N-description` | `test/issue-4-controller-coverage` |
+
+### Commit Message Format
+
+Use conventional commits with issue references:
+
+```
+feat: add mirror registry bootstrap via MachineConfig (#46)
+fix: RHCOS server image references importer mirror registry (#83)
+chore: add TDD and git flow standards (#86)
+docs: add cluster node sizing guide (#80)
+test: add controller reconcile coverage (#4)
+refactor: extract Quay management into internal/controller/quay (#8)
+```
+
+**Rules:**
+- Include issue number `(#N)` in the commit title
+- Use `Fixes #N` in the commit body to auto-close issues on merge
+- Keep the title under 72 characters
+- Use imperative mood ("add", "fix", "update", not "added", "fixed", "updated")
+
+### Pre-Commit Master Branch Protection
+
+A pre-commit hook prevents direct commits to master. Install with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+---
+
+## Operator-Specific Testing Guidelines
+
+### What to Test
+
+| Area | What to Assert | Example |
+|------|---------------|---------|
+| Resource creation | Expected K8s resource created with correct fields | Deployment image, Service ports |
+| Resource updates | Existing resource updated when spec changes | Image tag updated on reconcile |
+| Status conditions | Status reflects reconciliation result | Phase set to Ready, components populated |
+| Error handling | Errors propagated correctly, requeue behavior | Missing dependency returns error |
+| Finalizer lifecycle | Added on first reconcile, removed on deletion | Platform cleaned up on delete |
+| Owner references | Child resources owned by parent CR | Deployment owned by DisconnectedPlatform |
+
+### What NOT to Test
+
+- Kubernetes API behavior (that's controller-runtime's job)
+- Exact resource version numbers
+- Ordering of status components (use `ContainElement` not index access)
+- Internal helper functions in isolation (test through the public reconcile path)
+
+---
+
+## Checklist Before Submitting Code
+
+- [ ] Tests written first (TDD Red/Green/Refactor)
+- [ ] `make test` passes
+- [ ] GitHub issue exists and is referenced in commit message
+- [ ] Changes made via feature branch + PR (not direct push to master)
+- [ ] Conventional commit format used
+- [ ] After CRD/RBAC marker changes: `make manifests generate` ran
+- [ ] Container operations use `podman` (not `docker`)

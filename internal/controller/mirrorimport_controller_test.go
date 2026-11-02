@@ -17,6 +17,8 @@ import (
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
 	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	knativeapis "knative.dev/pkg/apis"
+	knativeduckv1 "knative.dev/pkg/apis/duck/v1"
 )
 
 var _ = Describe("MirrorImportReconciler", func() {
@@ -521,6 +523,695 @@ var _ = Describe("MirrorImportReconciler", func() {
 			Expect(pr.OwnerReferences).To(HaveLen(1))
 			Expect(pr.OwnerReferences[0].Kind).To(Equal("MirrorImport"))
 			Expect(pr.OwnerReferences[0].Name).To(Equal("test-import"))
+		})
+	})
+
+	Describe("importPipelineRunPhase", func() {
+		It("returns Complete when completion time set and Succeeded is True", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionTrue,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			Expect(importPipelineRunPhase(pr)).To(Equal("Complete"))
+		})
+
+		It("returns Failed when completion time set but Succeeded is False", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{
+								Type:   knativeapis.ConditionSucceeded,
+								Status: corev1.ConditionFalse,
+							},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			Expect(importPipelineRunPhase(pr)).To(Equal("Failed"))
+		})
+
+		It("returns Running when start time is set but no completion", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				Status: pipelinev1.PipelineRunStatus{
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						StartTime: &now,
+					},
+				},
+			}
+			Expect(importPipelineRunPhase(pr)).To(Equal("Running"))
+		})
+
+		It("returns Pending when nothing is set", func() {
+			pr := &pipelinev1.PipelineRun{}
+			Expect(importPipelineRunPhase(pr)).To(Equal("Pending"))
+		})
+	})
+
+	Describe("findPlatform", func() {
+		It("returns the first DisconnectedPlatform", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			found, err := r.findPlatform(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).NotTo(BeNil())
+			Expect(found.Name).To(Equal("test-platform"))
+		})
+
+		It("returns nil when no platform exists", func() {
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			found, err := r.findPlatform(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeNil())
+		})
+	})
+
+	Describe("ensureImportConfigMap", func() {
+		It("creates ConfigMap with imageSetConfig from import CR", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration\napiVersion: mirror.openshift.io/v1alpha2",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			cm, err := r.ensureImportConfigMap(ctx, importCR, "import-config-test")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm).NotTo(BeNil())
+			Expect(cm.Name).To(Equal("import-config-test"))
+			Expect(cm.Data["imageset-config.yaml"]).To(ContainSubstring("ImageSetConfiguration"))
+		})
+
+		It("returns existing ConfigMap without creating a duplicate", func() {
+			existingCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "import-config-test",
+					Namespace: "default",
+				},
+				Data: map[string]string{"imageset-config.yaml": "existing-content"},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(existingCM).Build(),
+				Scheme: testScheme,
+			}
+
+			cm, err := r.ensureImportConfigMap(ctx, importCR, "import-config-test")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Data["imageset-config.yaml"]).To(Equal("existing-content"))
+		})
+	})
+
+	Describe("buildImportPipelineRun workspaces", func() {
+		It("has bundle-data, config, pull-secret, and cosign-pub workspaces", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
+			Expect(err).NotTo(HaveOccurred())
+
+			wsNames := []string{}
+			for _, ws := range pr.Spec.Workspaces {
+				wsNames = append(wsNames, ws.Name)
+			}
+			Expect(wsNames).To(ContainElements("bundle-data", "config", "pull-secret", "cosign-pub"))
+		})
+
+		It("uses emptyDir for cosign-pub when verification is not enabled", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, ws := range pr.Spec.Workspaces {
+				if ws.Name == "cosign-pub" {
+					Expect(ws.EmptyDir).NotTo(BeNil())
+					Expect(ws.Secret).To(BeNil())
+				}
+			}
+		})
+	})
+
+	Describe("buildImportPipelineRun timeout", func() {
+		It("sets a pipeline timeout", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-import", Namespace: "default"},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			pr, err := r.buildImportPipelineRun(ctx, importCR, "import-config")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pr.Spec.Timeouts).NotTo(BeNil())
+		})
+	})
+
+	Describe("trackImportPipelineRun", func() {
+		It("clears PipelineRunRef when PipelineRun not found", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase:          "Importing",
+					PipelineRunRef: "missing-pr",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			_, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.PipelineRunRef).To(BeEmpty())
+		})
+
+		It("sets phase to Publishing when PipelineRun completes successfully", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pr", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{Type: knativeapis.ConditionSucceeded, Status: corev1.ConditionTrue},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase:          "Importing",
+					PipelineRunRef: "test-pr",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR, pr).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			_, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Publishing"))
+		})
+
+		It("sets phase to Failed when PipelineRun fails", func() {
+			now := metav1.Now()
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "failed-pr", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{Type: knativeapis.ConditionSucceeded, Status: corev1.ConditionFalse},
+						},
+					},
+					PipelineRunStatusFields: pipelinev1.PipelineRunStatusFields{
+						CompletionTime: &now,
+					},
+				},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase:          "Importing",
+					PipelineRunRef: "failed-pr",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR, pr).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			_, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Failed"))
+		})
+
+		It("creates PipelineRun when no ref exists", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase: "Importing",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			_, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			prList := &pipelinev1.PipelineRunList{}
+			Expect(r.List(ctx, prList)).To(Succeed())
+			Expect(prList.Items).To(HaveLen(1))
+			Expect(prList.Items[0].Spec.PipelineRef.Name).To(Equal("import-pipeline-template"))
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.PipelineRunRef).NotTo(BeEmpty())
+		})
+	})
+
+	Describe("finalizeImport", func() {
+		It("sets phase to Complete and updates platform history", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-import",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					CollectionVersion: "v2025.01.15.001-manual",
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase: "Publishing",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}, &mirrorv1.DisconnectedPlatform{}).
+					WithObjects(importCR, platform).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			result, err := r.finalizeImport(ctx, importCR)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Complete"))
+
+			updatedPlatform := &mirrorv1.DisconnectedPlatform{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updatedPlatform)).To(Succeed())
+			Expect(updatedPlatform.Status.ImportHistory).To(HaveLen(1))
+			Expect(updatedPlatform.Status.ImportHistory[0].Version).To(Equal("v2025.01.15.001-manual"))
+		})
+
+		It("sets phase to Complete even without platform", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-import",
+					Namespace: "default",
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase: "Publishing",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			result, err := r.finalizeImport(ctx, importCR)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Complete"))
+		})
+	})
+
+	Describe("resolveNodeRegistries", func() {
+		It("returns empty when no platform exists", func() {
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(BeEmpty())
+		})
+
+		It("returns empty when platform has no MirrorRegistryConfig", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: nil,
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(BeEmpty())
+		})
+
+		It("returns space-separated node:port addresses", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{Port: 9443},
+					},
+				},
+			}
+			node1 := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-0",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+					},
+				},
+			}
+			node2 := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-1",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.6"},
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, node1, node2).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(ContainSubstring("10.0.0.5:9443"))
+			Expect(result).To(ContainSubstring("10.0.0.6:9443"))
+		})
+
+		It("uses default port 8443 when not specified", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "airgapped",
+					Airgapped: &mirrorv1.AirgappedConfig{
+						MirrorRegistryConfig: &mirrorv1.MirrorRegistryConfig{},
+					},
+				},
+			}
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "master-0",
+					Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+				},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.5"},
+					},
+				},
+			}
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, node).Build(),
+				Scheme: testScheme,
+			}
+
+			result := r.resolveNodeRegistries(ctx)
+			Expect(result).To(Equal("10.0.0.5:8443"))
+		})
+	})
+
+	Describe("trackImportPipelineRun - running pipeline", func() {
+		It("returns empty result when PipelineRun is still running", func() {
+			pr := &pipelinev1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "running-pr", Namespace: "default"},
+				Status: pipelinev1.PipelineRunStatus{
+					Status: knativeduckv1.Status{
+						Conditions: knativeduckv1.Conditions{
+							{Type: knativeapis.ConditionSucceeded, Status: corev1.ConditionUnknown},
+						},
+					},
+				},
+			}
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-import",
+					Namespace:  "default",
+					Finalizers: []string{importFinalizer},
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+				},
+				Status: mirrorv1.MirrorImportStatus{
+					Phase:          "Importing",
+					PipelineRunRef: "running-pr",
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR, pr).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-import", Namespace: "default"}}
+			result, err := r.trackImportPipelineRun(ctx, importCR, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "test-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Importing"))
+		})
+	})
+
+	Describe("Reconcile - finalizer handling", func() {
+		It("adds finalizer and triggers import on new MirrorImport", func() {
+			importCR := &mirrorv1.MirrorImport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "new-import",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.MirrorImportSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					Bundle: mirrorv1.BundleSource{
+						PVC:      "import-pvc",
+						Filename: "bundle.tar",
+					},
+					TargetRegistry: mirrorv1.RegistryConfig{
+						URL: "https://quay.airgap.local",
+					},
+				},
+			}
+
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.MirrorImport{}).
+					WithObjects(importCR).
+					Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "new-import", Namespace: "default"}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &mirrorv1.MirrorImport{}
+			Expect(r.Get(ctx, types.NamespacedName{Name: "new-import", Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Finalizers).To(ContainElement(importFinalizer))
+		})
+
+		It("returns empty result for not-found import", func() {
+			r := &MirrorImportReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "nonexistent", Namespace: "default"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
 		})
 	})
 })

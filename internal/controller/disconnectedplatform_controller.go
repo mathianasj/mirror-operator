@@ -185,10 +185,12 @@ type DisconnectedPlatformReconciler struct {
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=proxies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterversions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=machineconfiguration.openshift.io,resources=machineconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.openshift.io,resources=imagedigestmirrorsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=config.openshift.io,resources=imagetagmirrorsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=clusterimagepolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=images,verbs=get;update;patch
 // +kubebuilder:rbac:groups=hive.openshift.io,resources=clusterimagesets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -2665,19 +2667,19 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 		"http": map[string]interface{}{
 			"tlsSecret": tlsSecretName,
 		},
-		"additionalOptions": []map[string]interface{}{
-			{
+		"additionalOptions": []interface{}{
+			map[string]interface{}{
 				"name":  "KEYCLOAK_ADMIN",
 				"value": "admin",
 			},
-			{
+			map[string]interface{}{
 				"name": "KEYCLOAK_ADMIN_PASSWORD",
 				"secret": map[string]interface{}{
 					"name": "mirror-operator-keycloak-initial-admin",
 					"key":  "password",
 				},
 			},
-			{
+			map[string]interface{}{
 				"name":  "truststore-paths",
 				"value": clusterCAFilePath,
 			},
@@ -2699,10 +2701,10 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 		"unsupported": map[string]interface{}{
 			"podTemplate": map[string]interface{}{
 				"spec": map[string]interface{}{
-					"containers": []map[string]interface{}{
-						{
-							"volumeMounts": []map[string]interface{}{
-								{
+					"containers": []interface{}{
+						map[string]interface{}{
+							"volumeMounts": []interface{}{
+								map[string]interface{}{
 									"name":      clusterCAVolumeName,
 									"mountPath": clusterCAMountPath,
 									"readOnly":  true,
@@ -2710,8 +2712,8 @@ func (r *DisconnectedPlatformReconciler) reconcileManagedKeycloak(ctx context.Co
 							},
 						},
 					},
-					"volumes": []map[string]interface{}{
-						{
+					"volumes": []interface{}{
+						map[string]interface{}{
 							"name": clusterCAVolumeName,
 							"configMap": map[string]interface{}{
 								"name":     clusterCABundleName,
@@ -5978,6 +5980,9 @@ func (r *DisconnectedPlatformReconciler) ensureClusterCABundleInNamespace(ctx co
 		if existing.Labels["config.openshift.io/inject-trusted-cabundle"] == "true" {
 			return nil
 		}
+		if existing.Labels == nil {
+			existing.Labels = make(map[string]string)
+		}
 		existing.Labels["config.openshift.io/inject-trusted-cabundle"] = "true"
 		return r.Update(ctx, existing)
 	} else if !apierrors.IsNotFound(err) {
@@ -7632,6 +7637,66 @@ func (h *collectionPipelineEventHandler) triggerPlatformReconcile(ctx context.Co
 			},
 		})
 	}
+}
+
+type nodeEventHandler struct {
+	client client.Client
+}
+
+func (h *nodeEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *nodeEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	oldNode, oldOk := e.ObjectOld.(*corev1.Node)
+	newNode, newOk := e.ObjectNew.(*corev1.Node)
+	if !oldOk || !newOk {
+		return
+	}
+
+	if _, hasMasterLabel := newNode.Labels["node-role.kubernetes.io/master"]; !hasMasterLabel {
+		return
+	}
+
+	oldReady := nodeReadyStatus(oldNode)
+	newReady := nodeReadyStatus(newNode)
+	if oldReady != newReady {
+		h.triggerPlatformReconcile(ctx, q)
+	}
+}
+
+func (h *nodeEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	if node, ok := e.Object.(*corev1.Node); ok {
+		if _, hasMasterLabel := node.Labels["node-role.kubernetes.io/master"]; hasMasterLabel {
+			h.triggerPlatformReconcile(ctx, q)
+		}
+	}
+}
+
+func (h *nodeEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *nodeEventHandler) triggerPlatformReconcile(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	platformList := &mirrorv1.DisconnectedPlatformList{}
+	if err := h.client.List(ctx, platformList); err != nil {
+		return
+	}
+	for _, platform := range platformList.Items {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      platform.Name,
+				Namespace: platform.Namespace,
+			},
+		})
+	}
+}
+
+func nodeReadyStatus(node *corev1.Node) corev1.ConditionStatus {
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status
+		}
+	}
+	return corev1.ConditionUnknown
 }
 
 // taskRunEventHandler watches Tekton TaskRuns for mirror-to-intermediate completion
@@ -10942,9 +11007,31 @@ echo "=== Bundle creation complete ==="
 set -ex
 echo "Uploading artifacts to S3..."
 
-# Tune S3 multipart upload for higher throughput
-aws configure set default.s3.multipart_chunksize 64MB
-aws configure set default.s3.max_concurrent_requests 20
+# Tune S3 multipart upload — use smaller chunks and fewer concurrent
+# requests to avoid overwhelming the NooBaa endpoint on large bundles
+aws configure set default.s3.multipart_chunksize 128MB
+aws configure set default.s3.multipart_threshold 128MB
+aws configure set default.s3.max_concurrent_requests 5
+
+S3_TIMEOUT_ARGS="--cli-read-timeout 600 --cli-connect-timeout 30"
+
+upload_with_retry() {
+  local src="$1"
+  shift
+  local max_attempts=3
+  local attempt=1
+  while [ $attempt -le $max_attempts ]; do
+    echo "Upload attempt $attempt/$max_attempts: $(basename "$src")"
+    if aws s3 cp "$src" "$@" $S3_TIMEOUT_ARGS; then
+      return 0
+    fi
+    echo "Attempt $attempt failed, retrying in 10s..."
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+  echo "ERROR: Upload failed after $max_attempts attempts: $(basename "$src")"
+  return 1
+}
 
 # Collection name from working-pvc-name (format: collection-storage-<name>)
 COLLECTION_NAME="$(params.collection-name)"
@@ -10963,7 +11050,7 @@ FINAL_BUNDLE="/workspace/output/${BUNDLE_FILENAME}"
 
 if [ -f "$FINAL_BUNDLE" ]; then
   echo "Uploading final bundle: $BUNDLE_FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
-  aws s3 cp "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
+  upload_with_retry "$FINAL_BUNDLE" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$BUNDLE_FILENAME" \
     --endpoint-url="$(params.s3-endpoint)" \
     --region="$(params.s3-region)" \
     --content-type="application/x-tar"
@@ -10972,7 +11059,7 @@ if [ -f "$FINAL_BUNDLE" ]; then
   # Upload signature if it exists
   if [ -f "${FINAL_BUNDLE}.sig" ]; then
     echo "Uploading bundle signature..."
-    aws s3 cp "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
+    upload_with_retry "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
     SIG_FILE="${BUNDLE_FILENAME}.sig"
@@ -10981,7 +11068,7 @@ if [ -f "$FINAL_BUNDLE" ]; then
   # Upload attestation bundle if it exists
   if [ -f "${FINAL_BUNDLE}.bundle" ]; then
     echo "Uploading bundle attestation..."
-    aws s3 cp "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
+    upload_with_retry "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
   fi
@@ -10996,20 +11083,20 @@ if [ -f /workspace/output/sboms/bundle-*.spdx.json ]; then
   for sbomfile in /workspace/output/sboms/bundle-*.spdx.json; do
     FILENAME=$(basename "$sbomfile")
     echo "Uploading bundle SBOM: $FILENAME to s3://$(params.s3-bucket)/$COLLECTION_NAME/"
-    aws s3 cp "$sbomfile" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
+    upload_with_retry "$sbomfile" "s3://$(params.s3-bucket)/$COLLECTION_NAME/$FILENAME" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
 
     # Upload signature if it exists
     if [ -f "${sbomfile}.sig" ]; then
-      aws s3 cp "${sbomfile}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.sig" \
+      upload_with_retry "${sbomfile}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.sig" \
         --endpoint-url="$(params.s3-endpoint)" \
         --region="$(params.s3-region)"
     fi
 
     # Upload bundle if it exists
     if [ -f "${sbomfile}.bundle" ]; then
-      aws s3 cp "${sbomfile}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.bundle" \
+      upload_with_retry "${sbomfile}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${FILENAME}.bundle" \
         --endpoint-url="$(params.s3-endpoint)" \
         --region="$(params.s3-region)"
     fi
@@ -11428,5 +11515,6 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 	return b.
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
 		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
+		Watches(&corev1.Node{}, &nodeEventHandler{client: r.Client}).
 		Complete(r)
 }
