@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a \
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
-RUN microdnf install -y ca-certificates && microdnf clean all
+RUN update-ca-trust && microdnf install -y ca-certificates && microdnf clean all
 
 COPY --from=builder /workspace/manager /manager
 
