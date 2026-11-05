@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -209,6 +210,7 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		platform.SetFinalizers(append(platform.GetFinalizers(), platformFinalizer))
 		return ctrl.Result{}, r.Update(ctx, platform)
 	}
+	originalStatus := platform.Status.DeepCopy()
 
 	if platform.Status.Phase == "" {
 		platform.Status.Phase = mirrorv1.PlatformPhaseReady
@@ -370,17 +372,22 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 				log.FromContext(ctx).Error(err, "failed to ensure Quay credentials in pull-secret")
 			}
 		}
-		// Copy pull secret to OSUS namespace and cluster pull secret so UpdateService pods can pull graph images
-		if err := r.ensureOSUSPullSecret(ctx); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure pull secret in OSUS namespace")
-		}
-		// Create/update the singleton UpdateService CR for graph support
-		if err := r.ensureUpdateService(ctx, platform); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure UpdateService CR")
-		}
-		// Grant pipeline SA read access to UpdateService for OSUS discovery
-		if err := r.ensurePipelineOSUSAccess(ctx); err != nil {
-			log.FromContext(ctx).Error(err, "failed to ensure pipeline OSUS RBAC")
+		osusEnabled := platform.Spec.Connected.Operators == nil ||
+			platform.Spec.Connected.Operators.OSUS == nil ||
+			!platform.Spec.Connected.Operators.OSUS.Disabled
+		if osusEnabled {
+			// Copy pull secret to OSUS namespace and cluster pull secret so UpdateService pods can pull graph images
+			if err := r.ensureOSUSPullSecret(ctx); err != nil {
+				log.FromContext(ctx).Error(err, "failed to ensure pull secret in OSUS namespace")
+			}
+			// Create/update the singleton UpdateService CR for graph support
+			if err := r.ensureUpdateService(ctx, platform); err != nil {
+				log.FromContext(ctx).Error(err, "failed to ensure UpdateService CR")
+			}
+			// Grant pipeline SA read access to UpdateService for OSUS discovery
+			if err := r.ensurePipelineOSUSAccess(ctx); err != nil {
+				log.FromContext(ctx).Error(err, "failed to ensure pipeline OSUS RBAC")
+			}
 		}
 
 		// Reconcile ObjectBucketClaim for artifacts storage
@@ -467,6 +474,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 	r.setReadyCondition(platform, "ReconciliationSucceeded", "All components reconciled successfully")
 
 	// Only update status if it changed
+	if reflect.DeepEqual(*originalStatus, platform.Status) {
+		return ctrl.Result{}, nil
+	}
 	if err := r.Status().Update(ctx, platform); err != nil {
 		// Ignore conflict errors - another reconciliation already updated it
 		if !apierrors.IsConflict(err) {
@@ -5110,9 +5120,15 @@ func (r *DisconnectedPlatformReconciler) extractRHTASRootKeys(ctx context.Contex
 
 	existing := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
-		cm.ResourceVersion = existing.ResourceVersion
-		if err := r.Update(ctx, cm); err != nil {
-			return fmt.Errorf("failed to update RHTAS trusted root ConfigMap: %w", err)
+		if existing.Data["fulcio-root.pem"] == fulcioRootPEM &&
+			existing.Data["rekor-public-key.pem"] == rekorPubKeyPEM &&
+			existing.Data["tuf-repository-url"] == tufURL {
+			cm = existing
+		} else {
+			cm.ResourceVersion = existing.ResourceVersion
+			if err := r.Update(ctx, cm); err != nil {
+				return fmt.Errorf("failed to update RHTAS trusted root ConfigMap: %w", err)
+			}
 		}
 	} else if apierrors.IsNotFound(err) {
 		if err := r.Create(ctx, cm); err != nil {
@@ -7848,6 +7864,10 @@ func (r *DisconnectedPlatformReconciler) clearDegradedCondition(ctx context.Cont
 	// Remove or update Degraded condition for this specific reason
 	for i := range platform.Status.Conditions {
 		if platform.Status.Conditions[i].Type == "Degraded" && platform.Status.Conditions[i].Reason == reason {
+			if platform.Status.Conditions[i].Status == metav1.ConditionFalse &&
+				platform.Status.Conditions[i].Message == "Health check passed" {
+				break
+			}
 			platform.Status.Conditions[i].Status = metav1.ConditionFalse
 			platform.Status.Conditions[i].LastTransitionTime = metav1.Now()
 			platform.Status.Conditions[i].Message = "Health check passed"
@@ -8052,7 +8072,8 @@ func (r *DisconnectedPlatformReconciler) setReadyCondition(platform *mirrorv1.Di
 	for i, c := range platform.Status.Conditions {
 		if c.Type == "Ready" {
 			// Condition exists - only update if status, reason, or message changed
-			if c.Status == metav1.ConditionTrue && c.Reason == reason && c.Message == message {
+			if c.Status == metav1.ConditionTrue && c.Reason == reason && c.Message == message &&
+				c.ObservedGeneration == platform.Generation {
 				// No change needed
 				return
 			}
@@ -8465,10 +8486,19 @@ func (r *DisconnectedPlatformReconciler) ensureQuayCredentials(ctx context.Conte
 		return nil
 	}
 
-	// Create or get robot account credentials using Python API (REST API requires CSRF tokens)
-	// This runs Python code inside the Quay pod via kubectl exec
 	robotShortName := "mirroroperator"
 	robotFullName := "mirror+" + robotShortName
+
+	// Reuse the persisted robot credentials instead of executing into Quay on every reconcile.
+	cachedCredentials := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "quay-robot-credentials", Namespace: architectNamespace}, cachedCredentials); err == nil {
+		if string(cachedCredentials.Data["username"]) == robotFullName && len(cachedCredentials.Data["token"]) > 0 {
+			return nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get cached Quay robot credentials: %w", err)
+	}
+
 	robotToken, err := r.ensureQuayRobotViaPython(ctx, "mirror", robotShortName)
 	if err != nil {
 		return fmt.Errorf("failed to ensure Quay robot account: %w", err)
@@ -8950,12 +8980,14 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "s3-secret-name", "type": "string", "default": ""},
 		{"name": "architect-frontend-image", "type": "string", "description": "Airgap Architect frontend container image"},
 		{"name": "architect-backend-image", "type": "string", "description": "Airgap Architect backend container image"},
+		{"name": "architect-export-enabled", "type": "string", "default": "true", "description": "Export standalone Airgap Architect images into the bundle"},
 		{"name": "oc-version", "type": "string", "default": "latest", "description": "OpenShift CLI version to download"},
 		{"name": "mirror-registry-version", "type": "string", "default": "latest", "description": "mirror-registry installer version"},
 		{"name": "cli-tools-enabled", "type": "string", "default": "true", "description": "Include CLI tools in bundle"},
 		{"name": "sbom-parallel-jobs", "type": "string", "default": "8", "description": "Number of parallel syft SBOM scans"},
 		{"name": "rhcos-download-enabled", "type": "string", "default": "true", "description": "Download RHCOS boot images for ACM host inventory"},
 		{"name": "rhcos-server-base-image", "type": "string", "default": "registry.access.redhat.com/ubi9/nginx-122:latest", "description": "Base image for RHCOS server container"},
+		{"name": "osus-enabled", "type": "string", "default": "true", "description": "Use the operator-managed OpenShift Update Service"},
 		{"name": "http-proxy", "type": "string", "default": "", "description": "HTTP proxy URL from cluster config"},
 		{"name": "https-proxy", "type": "string", "default": "", "description": "HTTPS proxy URL from cluster config"},
 		{"name": "no-proxy", "type": "string", "default": "", "description": "No-proxy hosts from cluster config"},
@@ -9014,6 +9046,11 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		return fmt.Errorf("failed to unmarshal pipeline spec: %w", err)
 	}
 
+	specHash := sha256.Sum256(specJSON)
+	desiredSpecHash := hex.EncodeToString(specHash[:])
+	pipeline.SetAnnotations(map[string]string{
+		"mirror.mathianasj.github.com/desired-spec-hash": desiredSpecHash,
+	})
 	pipeline.Object["spec"] = specMap
 
 	if err := ctrl.SetControllerReference(platform, pipeline, r.Scheme); err != nil {
@@ -9024,6 +9061,9 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(pipeline.GroupVersionKind())
 	if err := r.Get(ctx, client.ObjectKeyFromObject(pipeline), existing); err == nil {
+		if existing.GetAnnotations()["mirror.mathianasj.github.com/desired-spec-hash"] == desiredSpecHash {
+			return nil
+		}
 		pipeline.SetResourceVersion(existing.GetResourceVersion())
 		if err := r.Update(ctx, pipeline); err != nil {
 			return fmt.Errorf("failed to update collection pipeline template: %w", err)
@@ -9902,50 +9942,6 @@ else
   echo "No ITMS file found"
 fi
 
-# Add per-image entries for additionalImages from the ImageSetConfig.
-# oc-mirror flattens docker.io paths when storing in the intermediate registry
-# (e.g. docker.io/amazon/aws-cli -> mirror/aws-cli), so the top-level docker.io
-# fallback produces the wrong path. These specific entries take precedence.
-echo ""
-echo "=== Adding additionalImages entries from ImageSetConfig ==="
-if [ -f "/workspace/config/imageset-config.yaml" ]; then
-  IN_ADDITIONAL=0
-  while IFS= read -r line; do
-    case "$line" in
-      *additionalImages:*) IN_ADDITIONAL=1 ;;
-      *:*) [ "$IN_ADDITIONAL" -eq 1 ] && case "$line" in *"name:"*) ;; *) IN_ADDITIONAL=0 ;; esac ;;
-    esac
-    if [ "$IN_ADDITIONAL" -eq 1 ]; then
-      IMG_REF=$(echo "$line" | grep "name:" | sed 's/.*name:[[:space:]]*//' | tr -d "'" | tr -d '"')
-      [ -z "$IMG_REF" ] && continue
-
-      # Skip images already in the intermediate registry (e.g. rhcos-server)
-      case "$IMG_REF" in
-        "${INTERMEDIATE_HOST}"/*) echo "  Skipping (already in intermediate): $IMG_REF"; continue ;;
-      esac
-
-      # Normalize: add docker.io/ prefix for short-form refs (no dots before first slash)
-      NORMALIZED="$IMG_REF"
-      PREFIX=$(echo "$IMG_REF" | cut -d/ -f1)
-      case "$PREFIX" in
-        *.*|*:*|localhost) ;;
-        *) NORMALIZED="docker.io/$IMG_REF" ;;
-      esac
-
-      # Extract image name (last path component without tag/digest)
-      IMAGE_NAME=$(echo "$NORMALIZED" | sed 's|^[^/]*/||' | sed 's|.*/||' | sed 's|[@:].*||')
-      FULL_SOURCE=$(echo "$NORMALIZED" | sed 's|[@:].*||')
-
-      # Only add if not already covered by IDMS/ITMS entries
-      if ! grep -q "location=\"$FULL_SOURCE\"" "$CONF_FILE" 2>/dev/null; then
-        printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s/%s"\n' \
-          "$FULL_SOURCE" "$INTERMEDIATE_REGISTRY" "$IMAGE_NAME" >> "$CONF_FILE"
-        echo "  Added: $FULL_SOURCE -> $INTERMEDIATE_REGISTRY/$IMAGE_NAME"
-      fi
-    fi
-  done < /workspace/config/imageset-config.yaml
-fi
-
 # Block CDN access that Quay might redirect to
 printf '\n# Block CDN access\n' >> "$CONF_FILE"
 for cdn in cdn01.quay.io cdn02.quay.io cdn03.quay.io; do
@@ -10023,23 +10019,27 @@ CA_CERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 US_API="$API_SERVER/apis/updateservice.operator.openshift.io/v1/namespaces/openshift-update-service/updateservices/update-service-oc-mirror"
 
-echo "=== Waiting for OSUS to be ready ==="
-OSUS_READY=0
-for i in $(seq 1 60); do
-  POLICY_URI=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
-    "$US_API" 2>/dev/null | jq -r '.status.policyEngineURI // empty' 2>/dev/null)
-  if [ -n "$POLICY_URI" ]; then
-    export UPDATE_URL_OVERRIDE="${POLICY_URI}/api/upgrades_info/v1/graph"
-    echo "✓ OSUS ready: UPDATE_URL_OVERRIDE=$UPDATE_URL_OVERRIDE"
-    OSUS_READY=1
-    break
-  fi
-  echo "  Waiting for OSUS policy engine... (attempt $i/60)"
-  sleep 10
-done
+if [ "$(params.osus-enabled)" = "true" ]; then
+  echo "=== Waiting for OSUS to be ready ==="
+  OSUS_READY=0
+  for i in $(seq 1 60); do
+    POLICY_URI=$(curl -sf --cacert "$CA_CERT" -H "Authorization: Bearer $TOKEN" \
+      "$US_API" 2>/dev/null | jq -r '.status.policyEngineURI // empty' 2>/dev/null)
+    if [ -n "$POLICY_URI" ]; then
+      export UPDATE_URL_OVERRIDE="${POLICY_URI}/api/upgrades_info/v1/graph"
+      echo "✓ OSUS ready: UPDATE_URL_OVERRIDE=$UPDATE_URL_OVERRIDE"
+      OSUS_READY=1
+      break
+    fi
+    echo "  Waiting for OSUS policy engine... (attempt $i/60)"
+    sleep 10
+  done
 
-if [ "$OSUS_READY" -eq 0 ]; then
-  echo "WARNING: OSUS not ready after 10 minutes - graph: true in ImageSetConfig may fail"
+  if [ "$OSUS_READY" -eq 0 ]; then
+    echo "WARNING: OSUS not ready after 10 minutes - graph: true in ImageSetConfig may fail"
+  fi
+else
+  echo "OSUS disabled; using graph content mirrored by oc-mirror"
 fi
 echo ""
 
@@ -10564,6 +10564,9 @@ fi
 			"name":     "export-architect-images",
 			"retries":  2,
 			"runAfter": []string{"sign-images"},
+			"when": []map[string]interface{}{
+				{"input": "$(params.architect-export-enabled)", "operator": "in", "values": []string{"true"}},
+			},
 			"taskSpec": map[string]interface{}{
 				"steps": []map[string]interface{}{
 					{
@@ -10676,15 +10679,19 @@ curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-client-linux.tar.gz" \
   -o "$CLI_DIR/openshift-client-linux.tar.gz"
 
 echo "Downloading openshift-install (version: $OC_VERSION, RHEL9/FIPS)..."
-curl -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-rhel9-amd64.tar.gz" \
-  -o "$CLI_DIR/openshift-install-linux.tar.gz"
+if ! curl -f -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-rhel9-amd64.tar.gz" \
+  -o "$CLI_DIR/openshift-install-linux.tar.gz" 2>/dev/null; then
+  echo "RHEL9 installer archive unavailable; trying legacy filename..."
+  curl -f -L "${MIRROR_BASE}/ocp/${OC_VERSION}/openshift-install-linux.tar.gz" \
+    -o "$CLI_DIR/openshift-install-linux.tar.gz"
+fi
 
 echo "Downloading oc-mirror standalone binary (RHEL9/FIPS)..."
 OC_MIRROR_URL="${MIRROR_BASE}/ocp/${OC_VERSION}/oc-mirror.rhel9.tar.gz"
 if ! curl -f -L "$OC_MIRROR_URL" -o "$CLI_DIR/oc-mirror.tar.gz" 2>/dev/null; then
-  echo "WARNING: oc-mirror rhel9 not found in stable, trying dev-preview..."
-  curl -f -L "${MIRROR_BASE}/ocp-dev-preview/latest/oc-mirror.rhel9.tar.gz" \
-    -o "$CLI_DIR/oc-mirror.tar.gz" || echo "WARNING: oc-mirror download failed, skipping"
+  echo "Version-specific oc-mirror archive unavailable; using current stable RHEL9 build..."
+  curl -f -L "${MIRROR_BASE}/ocp/stable/oc-mirror.rhel9.tar.gz" \
+    -o "$CLI_DIR/oc-mirror.tar.gz"
 fi
 
 echo "Downloading mirror-registry installer..."
@@ -10867,7 +10874,13 @@ else
   FINAL_BUNDLE_NAME="${COLLECTION_NAME}-complete.tar"
   echo "=== Creating full bundle ==="
 
-  SMALL_CONTENTS="airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh"
+  SMALL_CONTENTS=""
+
+  for artifact in airgap-architect-frontend.tar.gz airgap-architect-backend.tar.gz import-airgap-architect.sh; do
+    if [ -f "$artifact" ]; then
+      SMALL_CONTENTS="$SMALL_CONTENTS $artifact"
+    fi
+  done
 
   if [ -f "imageset-config.yaml" ]; then
     echo "Including ImageSetConfiguration in bundle"
@@ -10901,9 +10914,8 @@ else
 ## Contents
 
 - archives/         Mirrored OpenShift container images (oc-mirror output)
-- airgap-architect-frontend.tar.gz   Airgap Architect UI frontend container image
-- airgap-architect-backend.tar.gz    Airgap Architect UI backend container image
-- import-airgap-architect.sh         Bootstrap script to run Architect UI with podman
+- airgap-architect-*.tar.gz          Optional standalone Architect images (if exported)
+- import-airgap-architect.sh         Optional bootstrap script for standalone Architect
 - imageset-config.yaml               ImageSetConfiguration used for this collection
 - sbom.spdx.json                     SPDX SBOM covering all bundled content (if available)
 - idms-oc-mirror.yaml / itms-oc-mirror.yaml   ImageDigestMirrorSet / ImageTagMirrorSet
@@ -10921,7 +10933,7 @@ else
      tar -xf <bundle>.tar -C airgap-workspace
      cd airgap-workspace
 
-3. Run the Airgap Architect UI:
+3. If standalone Architect images are included, run the UI:
 
      ./import-airgap-architect.sh start
 

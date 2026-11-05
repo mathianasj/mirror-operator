@@ -102,7 +102,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 			Expect(cm.Data["imageset-config.yaml"]).To(ContainSubstring("ImageSetConfiguration"))
 		})
 
-		It("returns existing ConfigMap without creating a duplicate", func() {
+		It("updates an existing ConfigMap when the pipeline configuration changes", func() {
 			pipeline = &mirrorv1.CollectionPipeline{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-pipeline",
@@ -127,7 +127,7 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 
 			cm, err := r.ensureConfigMap(ctx, pipeline, "mirror-config-test-pipeline")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cm.Data["imageset-config.yaml"]).To(Equal("existing"))
+			Expect(cm.Data["imageset-config.yaml"]).To(Equal("kind: ImageSetConfiguration"))
 		})
 	})
 

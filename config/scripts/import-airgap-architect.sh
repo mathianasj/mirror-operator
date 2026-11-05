@@ -88,7 +88,10 @@ fi
 
 # Mirror-registry configuration
 MIRROR_REGISTRY_INSTALL="${MIRROR_REGISTRY_INSTALL:-prompt}"  # "prompt" | "true" | "false"
+MIRROR_REGISTRY_INSTALL_DIR="${MIRROR_REGISTRY_INSTALL_DIR:-}"
 MIRROR_REGISTRY_DATA_PATH="${MIRROR_REGISTRY_DATA_PATH:-}"
+MIRROR_REGISTRY_STORAGE="${MIRROR_REGISTRY_STORAGE:-quay-storage}"
+MIRROR_REGISTRY_SQLITE_STORAGE="${MIRROR_REGISTRY_SQLITE_STORAGE:-sqlite-storage}"
 MIRROR_REGISTRY_HOSTNAME="${MIRROR_REGISTRY_HOSTNAME:-}"
 MIRROR_REGISTRY_PORT="${MIRROR_REGISTRY_PORT:-}"
 MIRROR_REGISTRY_INIT_PASSWORD="${MIRROR_REGISTRY_INIT_PASSWORD:-}"
@@ -126,11 +129,15 @@ Environment Variables:
     BUNDLE_DIR                    Same as --bundle-dir
     DATA_DIR                      Same as --data-dir
     CLI_INSTALL_DIR               Directory for CLI tools (default: ~/.local/bin, /usr/local/bin in STIG mode)
+    OC_MIRROR_TMPDIR              Executable temporary directory for oc-mirror (auto-selects /opt storage if TMPDIR or /tmp is noexec)
     STIG_MODE                     "auto" (detect), "true" (force), "false" (disable) [default: auto]
     MIRROR_REGISTRY_INSTALL       "prompt" (interactive), "true" (auto-install), "false" (skip) [default: prompt]
+    MIRROR_REGISTRY_INSTALL_DIR   Executable installer directory (auto-selects /opt/airgap-architect/mirror-registry-install if data is noexec)
     MIRROR_REGISTRY_HOSTNAME      Hostname for Quay (prompted if not set)
     MIRROR_REGISTRY_PORT          Port for Quay (prompted if not set, default: 8443)
     MIRROR_REGISTRY_DATA_PATH     Storage path for Quay data (prompted if not set, default: /opt/quay)
+    MIRROR_REGISTRY_STORAGE       Quay object storage directory or Podman volume (default: quay-storage)
+    MIRROR_REGISTRY_SQLITE_STORAGE Quay database directory or Podman volume (default: sqlite-storage)
     MIRROR_REGISTRY_INIT_PASSWORD Initial admin password (prompted if not set, auto-generated if empty)
     MIRROR_REGISTRY_SSL_CERT      Path to custom SSL certificate file (optional, prompted if not set)
     MIRROR_REGISTRY_SSL_KEY       Path to custom SSL key file (optional, prompted if not set)
@@ -677,8 +684,8 @@ install_cli_tools() {
 
     # Extract and install oc and kubectl
     if [ -f "${CLI_TOOLS_DIR}/openshift-client-linux.tar.gz" ]; then
-        check_existing_tool "oc"
-        local oc_choice=$?
+        local oc_choice=0
+        check_existing_tool "oc" || oc_choice=$?
         if [ ${oc_choice} -eq 2 ]; then
             rm -rf "$temp_dir"
             exit 0
@@ -729,8 +736,8 @@ EOSUDO
     local has_oc_mirror=false
 
     if [ -f "${CLI_TOOLS_DIR}/openshift-install-linux.tar.gz" ]; then
-        check_existing_tool "openshift-install"
-        local install_choice=$?
+        local install_choice=0
+        check_existing_tool "openshift-install" || install_choice=$?
         if [ ${install_choice} -eq 2 ]; then
             rm -rf "$temp_dir"
             exit 0
@@ -746,8 +753,8 @@ EOSUDO
     fi
 
     if [ -f "${CLI_TOOLS_DIR}/oc-mirror.tar.gz" ]; then
-        check_existing_tool "oc-mirror"
-        local mirror_choice=$?
+        local mirror_choice=0
+        check_existing_tool "oc-mirror" || mirror_choice=$?
         if [ ${mirror_choice} -eq 2 ]; then
             rm -rf "$temp_dir"
             exit 0
@@ -1240,27 +1247,18 @@ load_existing_registry_config() {
 }
 
 check_mirror_registry() {
-    # Check if mirror-registry is already running
-
-    # Check system-level service
-    if command -v systemctl &>/dev/null && systemctl is-active --quiet quay-pod.service 2>/dev/null; then
-        log "Mirror-registry is already running (system service: quay-pod)"
-        return 0
+    # A created container or auto-restarting service is not a healthy registry.
+    if ! podman ps --format '{{.Names}}' 2>/dev/null | grep -qE '^(quay|quay-app)$'; then
+        return 1
     fi
-
-    # Check user-level service (more common with newer mirror-registry)
-    if command -v systemctl &>/dev/null && systemctl --user is-active --quiet quay-app.service 2>/dev/null; then
-        log "Mirror-registry is already running (user service: quay-app)"
-        return 0
+    if [ -n "${MIRROR_REGISTRY_HOSTNAME:-}" ] && [ -n "${MIRROR_REGISTRY_PORT:-}" ]; then
+        if ! curl -k -f -s --connect-timeout 5 --max-time 10 \
+            "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}/health/instance" >/dev/null 2>&1; then
+            return 1
+        fi
     fi
-
-    # Check if podman containers exist
-    if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qE '^(quay|quay-app|quay-postgres|quay-redis)$'; then
-        log "Mirror-registry containers exist"
-        return 0
-    fi
-
-    return 1
+    log "Mirror-registry container is running and configured endpoint is healthy"
+    return 0
 }
 
 prompt_for_registry_config() {
@@ -1424,6 +1422,66 @@ prompt_for_registry_config() {
     esac
 }
 
+# Resolve mount options through the nearest existing ancestor, including symlinks.
+installer_mount_options() {
+    local path="$1"
+    if ! command -v findmnt &>/dev/null; then
+        error "findmnt is required to check the mirror-registry execution filesystem"
+        return 1
+    fi
+    while [ ! -e "$path" ]; do
+        local parent
+        parent=$(dirname "$path")
+        if [ "$parent" = "$path" ]; then
+            error "Cannot locate an existing parent for installer directory: $1"
+            return 1
+        fi
+        path="$parent"
+    done
+    findmnt -n -o OPTIONS -T "$path"
+}
+
+select_mirror_registry_install_dir() {
+    local install_dir="${MIRROR_REGISTRY_INSTALL_DIR:-${DATA_DIR}/mirror-registry-install}"
+    local mount_options
+    if ! mount_options=$(installer_mount_options "$install_dir"); then
+        error "Cannot determine mount options for mirror-registry installer: $install_dir"
+        return 1
+    fi
+    if [[ ",${mount_options}," == *,noexec,* ]]; then
+        if [ -n "${MIRROR_REGISTRY_INSTALL_DIR:-}" ]; then
+            error "MIRROR_REGISTRY_INSTALL_DIR is on a noexec filesystem: $install_dir"
+            return 1
+        fi
+        log "Installer data path is noexec; using executable storage under /opt/airgap-architect" >&2
+        install_dir="/opt/airgap-architect/mirror-registry-install"
+        if ! mount_options=$(installer_mount_options "$install_dir"); then
+            error "Cannot determine mount options for fallback installer directory: $install_dir"
+            return 1
+        fi
+        if [[ ",${mount_options}," == *,noexec,* ]]; then
+            error "Fallback installer directory is also noexec: $install_dir"
+            error "Set MIRROR_REGISTRY_INSTALL_DIR to a writable directory on an executable filesystem"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$install_dir"
+}
+
+prepare_mirror_registry_install_dir() {
+    local install_dir="$1"
+    if [ ! -d "$install_dir" ]; then
+        if ! mkdir -p "$install_dir" 2>/dev/null; then
+            log "Creating executable installer directory with sudo: $install_dir"
+            sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$install_dir" || return 1
+        fi
+    fi
+    if [ ! -w "$install_dir" ]; then
+        error "Mirror-registry installer directory is not writable: $install_dir"
+        return 1
+    fi
+}
+
 install_mirror_registry() {
     if [ "${MIRROR_REGISTRY_INSTALL}" != "true" ]; then
         return 0
@@ -1440,7 +1498,8 @@ install_mirror_registry() {
         return 0
     fi
 
-    if check_mirror_registry; then
+    if check_mirror_registry && { [ -f "${DATA_DIR}/mirror-registry-config.json" ] || \
+        [ -f "${HOME}/.config/airgap-architect/mirror-registry-config.json" ]; }; then
         log "Mirror-registry already installed, skipping"
         return 0
     fi
@@ -1451,8 +1510,9 @@ install_mirror_registry() {
 
     # Extract mirror-registry installer
     # Use a persistent directory instead of temp to preserve for uninstall
-    local install_dir="${DATA_DIR}/mirror-registry-install"
-    mkdir -p "${install_dir}"
+    local install_dir
+    install_dir=$(select_mirror_registry_install_dir) || return 1
+    prepare_mirror_registry_install_dir "$install_dir" || return 1
     log "Extracting mirror-registry to ${install_dir}..."
 
     # Try different extraction methods
@@ -1549,8 +1609,10 @@ install_mirror_registry() {
     fi
 
     if ! ${MIRROR_REGISTRY_CMD} install \
-        --quayHostname "${MIRROR_REGISTRY_HOSTNAME}" \
+        --quayHostname "${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}" \
         --quayRoot "${MIRROR_REGISTRY_DATA_PATH}" \
+        --quayStorage "${MIRROR_REGISTRY_STORAGE}" \
+        --sqliteStorage "${MIRROR_REGISTRY_SQLITE_STORAGE}" \
         --initPassword "${MIRROR_REGISTRY_INIT_PASSWORD}" \
         --sslCert "${ssl_cert_arg}" \
         --sslKey "${ssl_key_arg}"; then
@@ -1802,7 +1864,7 @@ wait_for_mirror_registry() {
     local waited=0
 
     while [ $waited -lt $max_wait ]; do
-        if curl -k -s "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}/health/instance" >/dev/null 2>&1; then
+        if curl -k -f -s --connect-timeout 5 --max-time 10 "https://${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}/health/instance" >/dev/null 2>&1; then
             echo ""
             log "✓ Mirror-registry is ready (took ${waited} seconds)"
             return 0
@@ -2096,6 +2158,40 @@ show_logs() {
     fi
 }
 
+prepare_oc_mirror_tmpdir() {
+    local tmp_dir="${OC_MIRROR_TMPDIR:-${TMPDIR:-/tmp}}"
+    local mount_options
+    if ! mount_options=$(installer_mount_options "$tmp_dir"); then
+        error "Cannot determine mount options for oc-mirror temporary directory: $tmp_dir"
+        return 1
+    fi
+    if [[ ",${mount_options}," == *,noexec,* ]]; then
+        if [ -n "${OC_MIRROR_TMPDIR:-}" ]; then
+            error "OC_MIRROR_TMPDIR is on a noexec filesystem: $tmp_dir"
+            return 1
+        fi
+        tmp_dir="/opt/airgap-architect/oc-mirror-tmp-$(id -u)"
+        if ! mount_options=$(installer_mount_options "$tmp_dir"); then
+            error "Cannot determine mount options for oc-mirror fallback: $tmp_dir"
+            return 1
+        fi
+        if [[ ",${mount_options}," == *,noexec,* ]]; then
+            error "oc-mirror fallback directory is noexec; set OC_MIRROR_TMPDIR to executable storage"
+            return 1
+        fi
+        prepare_mirror_registry_install_dir "$tmp_dir" || return 1
+        chmod 700 "$tmp_dir" || return 1
+    elif [ ! -d "$tmp_dir" ]; then
+        prepare_mirror_registry_install_dir "$tmp_dir" || return 1
+    fi
+    if [ ! -w "$tmp_dir" ] || [ ! -x "$tmp_dir" ]; then
+        error "oc-mirror temporary directory is not writable/searchable: $tmp_dir"
+        return 1
+    fi
+    OC_MIRROR_TMPDIR="$tmp_dir"
+    log "oc-mirror executable temporary directory: $OC_MIRROR_TMPDIR"
+}
+
 mirror_to_registry() {
     log "Mirroring images from archives to registry..."
 
@@ -2227,8 +2323,9 @@ mirror_to_registry() {
     log "This may take several minutes depending on the number of images..."
 
     # Run oc-mirror from the archives directory to the registry
+    prepare_oc_mirror_tmpdir || return 1
     cd "${work_dir}"
-    if oc-mirror --v2 --from "file://${archives_dir}" --config "${imageset_config}" ${oc_mirror_args} "docker://${registry_url}"; then
+    if TMPDIR="$OC_MIRROR_TMPDIR" oc-mirror --v2 --from "file://${archives_dir}" --config "${imageset_config}" ${oc_mirror_args} "docker://${registry_url}"; then
         log "✓ Successfully mirrored images to ${registry_url}"
 
         # Find and copy IDMS/ITMS files from oc-mirror output
@@ -2450,9 +2547,11 @@ uninstall_mirror_registry() {
             return 1
         fi
 
-        # Extract mirror-registry to temp location
-        temp_dir="${SCRIPT_DIR}/.tmp-uninstall-$$"
-        mkdir -p "${temp_dir}"
+        # Uninstall also executes the binary and needs its supporting files.
+        local executable_install_dir
+        executable_install_dir=$(select_mirror_registry_install_dir) || return 1
+        prepare_mirror_registry_install_dir "$executable_install_dir" || return 1
+        temp_dir=$(mktemp -d "${executable_install_dir}/.tmp-uninstall-XXXXXX") || return 1
 
         if tar -xzf "${CLI_TOOLS_DIR}/mirror-registry.tar.gz" -C "$temp_dir" 2>/dev/null; then
             : # Success

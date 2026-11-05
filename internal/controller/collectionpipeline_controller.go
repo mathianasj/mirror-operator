@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -621,15 +622,6 @@ func versionExists(history []mirrorv1.ImportInfo, version string) bool {
 }
 
 func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipeline *mirrorv1.CollectionPipeline, name string) (*corev1.ConfigMap, error) {
-	existing := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: name}, existing)
-	if err == nil {
-		return existing, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return nil, err
-	}
-
 	enrichedConfig := pipeline.Spec.ImageSetConfig
 
 	// Inject mirror-operator catalog so the operator and its relatedImages get mirrored
@@ -639,9 +631,12 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 	}
 	enrichedConfig = r.injectMirrorOperator(enrichedConfig, catalogOverride)
 
+	// Include Architect images consumed by the export task in the intermediate mirror.
+	enrichedConfig = r.injectArchitectImages(ctx, enrichedConfig)
+
 	// Inject RHCOS server image from intermediate registry so oc-mirror mirrors it for airgapped deployment
 	intReg := r.getIntermediateRegistry(ctx, pipeline)
-	enrichedConfig, err = r.injectRHCOSServerImage(ctx, enrichedConfig, intReg)
+	enrichedConfig, err := r.injectRHCOSServerImage(ctx, enrichedConfig, intReg)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to inject RHCOS server image, continuing without it")
 	}
@@ -650,6 +645,21 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 	// The local OSUS graph only indexes by concrete arch (e.g. amd64), not "multi".
 	// oc-mirror defaults to arch=multi when unset, returning 0 results from local OSUS.
 	enrichedConfig = injectDefaultArchitecture(enrichedConfig)
+
+	existing := &corev1.ConfigMap{}
+	err = r.Get(ctx, types.NamespacedName{Namespace: pipeline.Namespace, Name: name}, existing)
+	if err == nil {
+		if existing.Data[configMapKey] != enrichedConfig {
+			existing.Data[configMapKey] = enrichedConfig
+			if err := r.Update(ctx, existing); err != nil {
+				return nil, err
+			}
+		}
+		return existing, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
 
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -899,6 +909,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 	// Add Airgap Architect image parameters for tarball export
 	frontendImage := envOrDefault("RELATED_IMAGE_ARCHITECT_FRONTEND", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest")
 	backendImage := envOrDefault("RELATED_IMAGE_ARCHITECT_BACKEND", "quay.io/mathianasj/openshift-airgap-architect-backend:latest")
+	architectExportEnabled := "true"
 	if platform, err := r.findPlatform(ctx); err == nil && platform != nil && platform.Spec.Architect != nil {
 		if platform.Spec.Architect.FrontendImage != "" {
 			frontendImage = platform.Spec.Architect.FrontendImage
@@ -906,10 +917,15 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		if platform.Spec.Architect.BackendImage != "" {
 			backendImage = platform.Spec.Architect.BackendImage
 		}
+		if platform.Spec.Architect.ConsolePlugin != nil && platform.Spec.Architect.ConsolePlugin.Enabled &&
+			platform.Spec.Architect.FrontendImage == "" {
+			architectExportEnabled = "false"
+		}
 	}
 	params = append(params,
 		pipelinev1.Param{Name: "architect-frontend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: frontendImage}},
 		pipelinev1.Param{Name: "architect-backend-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: backendImage}},
+		pipelinev1.Param{Name: "architect-export-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: architectExportEnabled}},
 	)
 
 	// Auto-detect CLI tool versions from ImageSetConfiguration
@@ -970,6 +986,16 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "rhcos-download-enabled", Value: pipelinev1.ParamValue{Type: "string", StringVal: rhcosEnabled}},
 		pipelinev1.Param{Name: "rhcos-server-base-image", Value: pipelinev1.ParamValue{Type: "string", StringVal: rhcosServerBaseImage}},
 	)
+
+	osusEnabled := "true"
+	if platform != nil && platform.Spec.Connected != nil && platform.Spec.Connected.Operators != nil &&
+		platform.Spec.Connected.Operators.OSUS != nil && platform.Spec.Connected.Operators.OSUS.Disabled {
+		osusEnabled = "false"
+	}
+	params = append(params, pipelinev1.Param{
+		Name:  "osus-enabled",
+		Value: pipelinev1.ParamValue{Type: "string", StringVal: osusEnabled},
+	})
 
 	// Define workspaces
 	workspaces := []pipelinev1.WorkspaceBinding{
@@ -1154,6 +1180,14 @@ func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string, c
 		catalogRef = catalogOverride
 	} else {
 		ocVersion := r.extractOCPVersion(configYAML)
+		parts := strings.SplitN(ocVersion, ".", 2)
+		if len(parts) != 2 {
+			return configYAML
+		}
+		minor, err := strconv.Atoi(parts[1])
+		if err != nil || minor < 18 {
+			return configYAML
+		}
 		catalogRef = fmt.Sprintf("%s:v%s", communityOperatorCatalog, ocVersion)
 	}
 
@@ -1184,6 +1218,49 @@ func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string, c
 		return configYAML
 	}
 	return string(enrichedYAML)
+}
+
+func (r *CollectionPipelineReconciler) injectArchitectImages(ctx context.Context, configYAML string) string {
+	platform, err := r.findPlatform(ctx)
+	if err != nil || platform == nil || platform.Spec.Architect == nil || !platform.Spec.Architect.Enabled {
+		return configYAML
+	}
+	if platform.Spec.Architect.ConsolePlugin != nil && platform.Spec.Architect.ConsolePlugin.Enabled &&
+		platform.Spec.Architect.FrontendImage == "" {
+		return configYAML
+	}
+
+	var config ImageSetConfiguration
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return configYAML
+	}
+
+	images := []string{
+		envOrDefault("RELATED_IMAGE_ARCHITECT_FRONTEND", "quay.io/mathianasj/openshift-airgap-architect-frontend:latest"),
+		envOrDefault("RELATED_IMAGE_ARCHITECT_BACKEND", "quay.io/mathianasj/openshift-airgap-architect-backend:latest"),
+	}
+	if platform.Spec.Architect.FrontendImage != "" {
+		images[0] = platform.Spec.Architect.FrontendImage
+	}
+	if platform.Spec.Architect.BackendImage != "" {
+		images[1] = platform.Spec.Architect.BackendImage
+	}
+
+	existing := make(map[string]bool, len(config.Mirror.AdditionalImages))
+	for _, image := range config.Mirror.AdditionalImages {
+		existing[image.Name] = true
+	}
+	for _, image := range images {
+		if image != "" && !existing[image] {
+			config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: image})
+		}
+	}
+
+	out, err := yaml.Marshal(&config)
+	if err != nil {
+		return configYAML
+	}
+	return string(out)
 }
 
 // getIntermediateRegistry returns the intermediate registry URL for the m2m workflow.

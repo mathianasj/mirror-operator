@@ -129,7 +129,7 @@ if [ -z "$HTTP_CODE" ]; then HTTP_CODE="000"; fi
 
 func downloadRHCOSScript() string {
 	return `
-set -ex
+set -e
 
 if [ "$(params.rhcos-download-enabled)" != "true" ]; then
   echo "RHCOS download skipped (rhcos-download-enabled=$(params.rhcos-download-enabled))"
@@ -203,7 +203,7 @@ echo "=== RHCOS download complete ==="
 
 func buildRHCOSServerScript() string {
 	return `
-set -ex
+set -e
 
 if [ "$(params.rhcos-download-enabled)" != "true" ] || [ -z "$(params.intermediate-registry)" ]; then
   echo "RHCOS server build skipped (rhcos-download-enabled=$(params.rhcos-download-enabled), intermediate-registry=$(params.intermediate-registry))"
