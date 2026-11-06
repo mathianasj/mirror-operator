@@ -1008,12 +1008,16 @@ var _ = Describe("RHTASHealthCheckReconciler", func() {
 			securesign.SetNamespace(architectNamespace)
 			unstructured.SetNestedSlice(securesign.Object, []interface{}{}, "status", "conditions")
 
-			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build()
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).WithStatusSubresource(securesign).Build()
 			r := &RHTASHealthCheckReconciler{Client: c}
 
 			r.updateSecuresignHealthStatus(ctx, securesign, false, "Something failed")
 
-			conditions, _, _ := unstructured.NestedSlice(securesign.Object, "status", "conditions")
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(securesignGVK)
+			Expect(c.Get(ctx, types.NamespacedName{Name: "test-securesign", Namespace: architectNamespace}, updated)).To(Succeed())
+
+			conditions, _, _ := unstructured.NestedSlice(updated.Object, "status", "conditions")
 			Expect(len(conditions)).To(BeNumerically(">=", 1))
 			condMap := conditions[len(conditions)-1].(map[string]interface{})
 			Expect(condMap["status"]).To(Equal("False"))
@@ -1032,15 +1036,51 @@ var _ = Describe("RHTASHealthCheckReconciler", func() {
 				},
 			}, "status", "conditions")
 
-			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).Build()
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).WithStatusSubresource(securesign).Build()
 			r := &RHTASHealthCheckReconciler{Client: c}
 
 			r.updateSecuresignHealthStatus(ctx, securesign, true, "Fixed now")
 
-			conditions, _, _ := unstructured.NestedSlice(securesign.Object, "status", "conditions")
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(securesignGVK)
+			Expect(c.Get(ctx, types.NamespacedName{Name: "test-securesign", Namespace: architectNamespace}, updated)).To(Succeed())
+
+			conditions, _, _ := unstructured.NestedSlice(updated.Object, "status", "conditions")
 			Expect(len(conditions)).To(Equal(1))
 			condMap := conditions[0].(map[string]interface{})
 			Expect(condMap["status"]).To(Equal("True"))
+		})
+
+		It("skips update when status and message have not changed", func() {
+			securesign := &unstructured.Unstructured{}
+			securesign.SetGroupVersionKind(securesignGVK)
+			securesign.SetName("test-securesign")
+			securesign.SetNamespace(architectNamespace)
+			unstructured.SetNestedSlice(securesign.Object, []interface{}{
+				map[string]interface{}{
+					"type":    "HealthCheckPassed",
+					"status":  "True",
+					"reason":  "AllHealthChecksPassed",
+					"message": "All RHTAS components healthy",
+				},
+			}, "status", "conditions")
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(securesign).WithStatusSubresource(securesign).Build()
+			r := &RHTASHealthCheckReconciler{Client: c}
+
+			// Get resource version before the call
+			before := &unstructured.Unstructured{}
+			before.SetGroupVersionKind(securesignGVK)
+			Expect(c.Get(ctx, types.NamespacedName{Name: "test-securesign", Namespace: architectNamespace}, before)).To(Succeed())
+			rvBefore := before.GetResourceVersion()
+
+			r.updateSecuresignHealthStatus(ctx, securesign, true, "All RHTAS components healthy")
+
+			// Resource version should not have changed since update was skipped
+			after := &unstructured.Unstructured{}
+			after.SetGroupVersionKind(securesignGVK)
+			Expect(c.Get(ctx, types.NamespacedName{Name: "test-securesign", Namespace: architectNamespace}, after)).To(Succeed())
+			Expect(after.GetResourceVersion()).To(Equal(rvBefore))
 		})
 	})
 

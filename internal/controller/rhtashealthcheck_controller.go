@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -94,36 +95,54 @@ func (r *RHTASHealthCheckReconciler) validateTUFKeys(ctx context.Context, secure
 		return nil
 	}
 
+	hasBadKey := false
 	for _, key := range keys {
 		if keyMap, ok := key.(map[string]interface{}); ok {
 			if name, _ := keyMap["name"].(string); name == "tsa.certchain.pem" {
-				// Found problematic key, auto-fix it
-				log.FromContext(ctx).Info("Auto-fixing TUF keys: removing tsa.certchain.pem")
-
-				newKeys := []interface{}{}
-				for _, k := range keys {
-					if km, ok := k.(map[string]interface{}); ok {
-						if n, _ := km["name"].(string); n != "tsa.certchain.pem" {
-							newKeys = append(newKeys, k)
-						}
-					}
-				}
-
-				if err := unstructured.SetNestedSlice(securesign.Object, newKeys, "spec", "tuf", "keys"); err != nil {
-					return err
-				}
-
-				if err := r.Update(ctx, securesign); err != nil {
-					return err
-				}
-
-				log.FromContext(ctx).Info("Successfully removed tsa.certchain.pem from TUF keys")
-				return nil
+				hasBadKey = true
+				break
 			}
 		}
 	}
 
-	return nil
+	if !hasBadKey {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("Auto-fixing TUF keys: removing tsa.certchain.pem")
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(securesignGVK)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(securesign), latest); err != nil {
+			return err
+		}
+
+		latestKeys, found, err := unstructured.NestedSlice(latest.Object, "spec", "tuf", "keys")
+		if err != nil || !found {
+			return nil
+		}
+
+		newKeys := []interface{}{}
+		for _, k := range latestKeys {
+			if km, ok := k.(map[string]interface{}); ok {
+				if n, _ := km["name"].(string); n != "tsa.certchain.pem" {
+					newKeys = append(newKeys, k)
+				}
+			}
+		}
+
+		if err := unstructured.SetNestedSlice(latest.Object, newKeys, "spec", "tuf", "keys"); err != nil {
+			return err
+		}
+
+		if err := r.Update(ctx, latest); err != nil {
+			return err
+		}
+
+		log.FromContext(ctx).Info("Successfully removed tsa.certchain.pem from TUF keys")
+		return nil
+	})
 }
 
 func (r *RHTASHealthCheckReconciler) validateFulcioKeycloakConnection(ctx context.Context) error {
@@ -318,51 +337,72 @@ func (r *RHTASHealthCheckReconciler) validateEmailVerifiedClaim(ctx context.Cont
 }
 
 func (r *RHTASHealthCheckReconciler) updateSecuresignHealthStatus(ctx context.Context, securesign *unstructured.Unstructured, healthy bool, message string) {
-	// Update Securesign status conditions with health check results
-	// DisconnectedPlatform controller will read this and update its own status
+	logger := log.FromContext(ctx)
 
-	conditions, found, err := unstructured.NestedSlice(securesign.Object, "status", "conditions")
-	if err != nil || !found {
-		conditions = []interface{}{}
-	}
-
-	now := metav1.Now()
-	healthCondition := map[string]interface{}{
-		"type":               "HealthCheckPassed",
-		"status":             "True",
-		"reason":             "AllHealthChecksPassed",
-		"message":            message,
-		"lastTransitionTime": now.Format(time.RFC3339),
-	}
-
+	desiredStatus := "True"
+	desiredReason := "AllHealthChecksPassed"
 	if !healthy {
-		healthCondition["status"] = "False"
-		healthCondition["reason"] = "HealthCheckFailed"
+		desiredStatus = "False"
+		desiredReason = "HealthCheckFailed"
 	}
 
-	// Find and update existing health condition or add new one
-	conditionFound := false
-	for i, cond := range conditions {
-		if condMap, ok := cond.(map[string]interface{}); ok {
-			if condMap["type"] == "HealthCheckPassed" {
-				conditions[i] = healthCondition
-				conditionFound = true
-				break
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Re-fetch the latest version to avoid conflicts
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(securesignGVK)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(securesign), latest); err != nil {
+			return err
+		}
+
+		conditions, _, _ := unstructured.NestedSlice(latest.Object, "status", "conditions")
+		if conditions == nil {
+			conditions = []interface{}{}
+		}
+
+		// Check if update is actually needed
+		for _, cond := range conditions {
+			if condMap, ok := cond.(map[string]interface{}); ok {
+				if condMap["type"] == "HealthCheckPassed" {
+					if condMap["status"] == desiredStatus && condMap["message"] == message {
+						return nil
+					}
+					break
+				}
 			}
 		}
-	}
 
-	if !conditionFound {
-		conditions = append(conditions, healthCondition)
-	}
+		now := metav1.Now()
+		healthCondition := map[string]interface{}{
+			"type":               "HealthCheckPassed",
+			"status":             desiredStatus,
+			"reason":             desiredReason,
+			"message":            message,
+			"lastTransitionTime": now.Format(time.RFC3339),
+		}
 
-	if err := unstructured.SetNestedSlice(securesign.Object, conditions, "status", "conditions"); err != nil {
-		log.FromContext(ctx).Error(err, "Failed to set Securesign health condition")
-		return
-	}
+		conditionFound := false
+		for i, cond := range conditions {
+			if condMap, ok := cond.(map[string]interface{}); ok {
+				if condMap["type"] == "HealthCheckPassed" {
+					conditions[i] = healthCondition
+					conditionFound = true
+					break
+				}
+			}
+		}
 
-	if err := r.Status().Update(ctx, securesign); err != nil {
-		log.FromContext(ctx).Error(err, "Failed to update Securesign health status")
+		if !conditionFound {
+			conditions = append(conditions, healthCondition)
+		}
+
+		if err := unstructured.SetNestedSlice(latest.Object, conditions, "status", "conditions"); err != nil {
+			return err
+		}
+
+		return r.Status().Update(ctx, latest)
+	})
+	if err != nil {
+		logger.Error(err, "Failed to update Securesign health status")
 	}
 }
 
