@@ -162,18 +162,31 @@ mkdir -p "$RHCOS_DIR"
 RHCOS_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/latest"
 
 echo "Downloading RHCOS live ISO for version $RHCOS_VERSION..."
-if ! curl -L -f "${RHCOS_BASE}/rhcos-live-iso.x86_64.iso" \
+if ! curl -L -f "${RHCOS_BASE}/rhcos-live.x86_64.iso" \
   -o "$RHCOS_DIR/rhcos-live.x86_64.iso" 2>/dev/null; then
-  echo "Trying versioned filename..."
-  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}.0-x86_64-live-iso.x86_64.iso" \
+  echo "Unversioned filename not found, discovering versioned filename from rhcos-id.txt..."
+  RHCOS_FULL_VERSION=$(curl -sL -f "${RHCOS_BASE}/rhcos-id.txt" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$RHCOS_FULL_VERSION" ]; then
+    echo "ERROR: Could not determine RHCOS version from ${RHCOS_BASE}/rhcos-id.txt"
+    exit 1
+  fi
+  echo "Discovered RHCOS version: $RHCOS_FULL_VERSION"
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_FULL_VERSION}-x86_64-live.x86_64.iso" \
     -o "$RHCOS_DIR/rhcos-live.x86_64.iso"
 fi
 
 echo "Downloading RHCOS rootFS for version $RHCOS_VERSION..."
 if ! curl -L -f "${RHCOS_BASE}/rhcos-live-rootfs.x86_64.img" \
   -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img" 2>/dev/null; then
-  echo "Trying versioned filename..."
-  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_VERSION}.0-x86_64-live-rootfs.x86_64.img" \
+  echo "Unversioned filename not found, discovering versioned filename from rhcos-id.txt..."
+  if [ -z "$RHCOS_FULL_VERSION" ]; then
+    RHCOS_FULL_VERSION=$(curl -sL -f "${RHCOS_BASE}/rhcos-id.txt" 2>/dev/null | tr -d '[:space:]')
+  fi
+  if [ -z "$RHCOS_FULL_VERSION" ]; then
+    echo "ERROR: Could not determine RHCOS version from ${RHCOS_BASE}/rhcos-id.txt"
+    exit 1
+  fi
+  curl -L -f "${RHCOS_BASE}/rhcos-${RHCOS_FULL_VERSION}-x86_64-live-rootfs.x86_64.img" \
     -o "$RHCOS_DIR/rhcos-live-rootfs.x86_64.img"
 fi
 

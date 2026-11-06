@@ -170,6 +170,28 @@ func TestRegistryExistsCheckSnippet_AuthLookup(t *testing.T) {
 	}
 }
 
+func TestDownloadRHCOSScript_UsesCorrectFilenames(t *testing.T) {
+	script := downloadRHCOSScript()
+
+	if strings.Contains(script, "rhcos-live-iso.x86_64.iso") {
+		t.Error("script uses wrong ISO filename 'rhcos-live-iso.x86_64.iso'; should be 'rhcos-live.x86_64.iso'")
+	}
+	if !strings.Contains(script, "rhcos-live.x86_64.iso") {
+		t.Error("script does not try unversioned filename 'rhcos-live.x86_64.iso'")
+	}
+	if strings.Contains(script, `${RHCOS_VERSION}.0-x86_64-live-iso`) {
+		t.Error("script still uses hardcoded .0 patch version fallback")
+	}
+}
+
+func TestDownloadRHCOSScript_DiscoverVersionedFilename(t *testing.T) {
+	script := downloadRHCOSScript()
+
+	if !strings.Contains(script, "rhcos-id.txt") {
+		t.Error("script should use rhcos-id.txt for versioned filename discovery")
+	}
+}
+
 func TestDownloadAndBuildScripts_HaveConsistentRegistryCheck(t *testing.T) {
 	downloadScript := downloadRHCOSScript()
 	buildScript := buildRHCOSServerScript()
