@@ -11346,7 +11346,7 @@ notifier:
 			proxy := &unstructured.Unstructured{}
 			proxy.SetGroupVersionKind(schema.GroupVersionKind{Group: "config.openshift.io", Version: "v1", Kind: "Proxy"})
 			proxy.SetName("cluster")
-			unstructured.SetNestedField(proxy.Object, "http://proxy.example.com", "spec", "httpProxy")
+			unstructured.SetNestedField(proxy.Object, "http://proxy.example.com", "status", "httpProxy")
 
 			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sub, proxy).Build()
 			r := &DisconnectedPlatformReconciler{Client: c, Scheme: testScheme}
@@ -11367,7 +11367,7 @@ notifier:
 			proxy := &unstructured.Unstructured{}
 			proxy.SetGroupVersionKind(schema.GroupVersionKind{Group: "config.openshift.io", Version: "v1", Kind: "Proxy"})
 			proxy.SetName("cluster")
-			unstructured.SetNestedField(proxy.Object, "http://proxy.example.com", "spec", "httpProxy")
+			unstructured.SetNestedField(proxy.Object, "http://proxy.example.com", "status", "httpProxy")
 
 			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sub, proxy).Build()
 			r := &DisconnectedPlatformReconciler{Client: c, Scheme: testScheme}
