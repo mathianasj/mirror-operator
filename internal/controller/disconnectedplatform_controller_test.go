@@ -768,6 +768,105 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			checkDeletedSvc(frontendSvcName)
 		})
 
+		It("skips architect deployment on connected cluster even when architect is enabled", func() {
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled:       true,
+						FrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform, pullSecret).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+
+			for _, c := range updated.Status.Components {
+				Expect(c.Name).NotTo(Equal("airgap-architect-frontend"))
+				Expect(c.Name).NotTo(Equal("airgap-architect-backend"))
+			}
+		})
+
+		It("cleans up existing architect resources when switching to connected mode", func() {
+			backendDepName := "mo-test-platform-airgap-architect-backend"
+			frontendDepName := "mo-test-platform-airgap-architect-frontend"
+
+			backendDep := &unstructured.Unstructured{}
+			backendDep.SetGroupVersionKind(deploymentGVK)
+			backendDep.SetName(backendDepName)
+			backendDep.SetNamespace(architectNamespace)
+
+			frontendDep := &unstructured.Unstructured{}
+			frontendDep.SetGroupVersionKind(deploymentGVK)
+			frontendDep.SetName(frontendDepName)
+			frontendDep.SetNamespace(architectNamespace)
+
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform, backendDep, frontendDep).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			checkDeleted := func(name string) {
+				obj := &unstructured.Unstructured{}
+				obj.SetGroupVersionKind(deploymentGVK)
+				obj.SetName(name)
+				obj.SetNamespace(architectNamespace)
+				err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}
+			checkDeleted(backendDepName)
+			checkDeleted(frontendDepName)
+		})
+
 		It("deletes architect resources on finalizer cleanup", func() {
 			now := metav1.Now()
 			backendDepName := "mo-test-platform-airgap-architect-backend"
