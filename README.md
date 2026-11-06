@@ -97,7 +97,7 @@ metadata:
   namespace: openshift-marketplace
 spec:
   sourceType: grpc
-  image: quay.io/mathianasj/mirror-operator-catalog:v0.0.1
+  image: quay.io/mathianasj/mirror-operator-catalog:latest
   displayName: Mirror Operator
   publisher: mathianasj
   updateStrategy:
@@ -133,8 +133,8 @@ EOF
 For airgapped clusters, mirror the catalog image to your local registry first:
 
 ```sh
-oc image mirror quay.io/mathianasj/mirror-operator-catalog:v0.0.1 \
-  <your-registry>/mirror-operator-catalog:v0.0.1
+oc image mirror quay.io/mathianasj/mirror-operator-catalog:latest \
+  <your-registry>/mirror-operator-catalog:latest
 
 oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
@@ -144,7 +144,7 @@ metadata:
   namespace: openshift-marketplace
 spec:
   sourceType: grpc
-  image: <your-registry>/mirror-operator-catalog:v0.0.1
+  image: <your-registry>/mirror-operator-catalog:latest
   displayName: Mirror Operator
   publisher: mathianasj
   updateStrategy:

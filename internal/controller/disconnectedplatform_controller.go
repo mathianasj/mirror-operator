@@ -10914,12 +10914,29 @@ else
 ## Contents
 
 - archives/         Mirrored OpenShift container images (oc-mirror output)
-- airgap-architect-*.tar.gz          Optional standalone Architect images (if exported)
-- import-airgap-architect.sh         Optional bootstrap script for standalone Architect
+- airgap-architect-*.tar.gz          Standalone Architect UI images
+- import-airgap-architect.sh         Bootstrap script for the Architect UI
 - imageset-config.yaml               ImageSetConfiguration used for this collection
 - sbom.spdx.json                     SPDX SBOM covering all bundled content (if available)
 - idms-oc-mirror.yaml / itms-oc-mirror.yaml   ImageDigestMirrorSet / ImageTagMirrorSet
 - cli-tools/                         OpenShift CLI tools (if included)
+
+## IMPORTANT: Extraction Location
+
+**You must extract this bundle to the correct directory before use.**
+
+On systems with SELinux or fapolicyd enabled (RHEL, STIG-hardened systems),
+binaries and scripts must reside in a trusted path to be executable.
+Extract to /opt/bundle (or the path configured in your DisconnectedPlatform
+importPath field) rather than your home directory or a temporary location:
+
+     sudo mkdir -p /opt/bundle
+     sudo tar -xf <bundle>.tar -C /opt/bundle
+     cd /opt/bundle
+
+If you extract to a different directory, fapolicyd may block execution of
+the bundled scripts and CLI tools, and oc-mirror may fail due to SELinux
+context denials.
 
 ## Quick Start
 
@@ -10927,15 +10944,16 @@ else
 
      cosign verify-blob --bundle <bundle>.tar.bundle <bundle>.tar
 
-2. Extract the bundle:
+2. Extract the bundle to /opt/bundle (see IMPORTANT section above):
 
-     mkdir airgap-workspace
-     tar -xf <bundle>.tar -C airgap-workspace
-     cd airgap-workspace
+     sudo mkdir -p /opt/bundle
+     sudo tar -xf <bundle>.tar -C /opt/bundle
+     cd /opt/bundle
 
-3. If standalone Architect images are included, run the UI:
+3. Run the import script with no arguments to be guided through the available
+   options:
 
-     ./import-airgap-architect.sh start
+     ./import-airgap-architect.sh
 
 4. Open a browser to http://localhost:5173 to access the Architect UI.
 

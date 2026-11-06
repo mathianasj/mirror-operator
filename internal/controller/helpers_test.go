@@ -280,9 +280,9 @@ var _ = Describe("Proxy and CA helpers", func() {
 				Kind:    "Proxy",
 			})
 			proxyCR.SetName("cluster")
-			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
-			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "spec", "httpsProxy")
-			unstructured.SetNestedField(proxyCR.Object, ".local,.internal", "spec", "noProxy")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "status", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "status", "httpsProxy")
+			unstructured.SetNestedField(proxyCR.Object, ".local,.internal", "status", "noProxy")
 
 			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR).Build()
 			httpProxy, httpsProxy, noProxy := getClusterProxyFromClient(ctx, c)
@@ -411,8 +411,8 @@ var _ = Describe("Proxy and CA helpers", func() {
 				Kind:    "Proxy",
 			})
 			proxyCR.SetName("cluster")
-			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
-			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "spec", "httpsProxy")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "status", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "status", "httpsProxy")
 
 			r := &DisconnectedPlatformReconciler{
 				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxyCR).Build(),
@@ -552,8 +552,8 @@ var _ = Describe("Proxy and CA helpers", func() {
 				Kind:    "Proxy",
 			})
 			proxyCR.SetName("cluster")
-			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "spec", "httpProxy")
-			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "spec", "httpsProxy")
+			unstructured.SetNestedField(proxyCR.Object, "http://proxy:8080", "status", "httpProxy")
+			unstructured.SetNestedField(proxyCR.Object, "https://proxy:8443", "status", "httpsProxy")
 
 			obcConfigMap := &corev1.ConfigMap{}
 			obcConfigMap.SetName("collection-artifacts")
@@ -995,9 +995,9 @@ var _ = Describe("helpers", func() {
 				Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
 			})
 			proxy.SetName("cluster")
-			unstructured.SetNestedField(proxy.Object, "http://proxy:8080", "spec", "httpProxy")
-			unstructured.SetNestedField(proxy.Object, "https://proxy:8443", "spec", "httpsProxy")
-			unstructured.SetNestedField(proxy.Object, ".cluster.local", "spec", "noProxy")
+			unstructured.SetNestedField(proxy.Object, "http://proxy:8080", "status", "httpProxy")
+			unstructured.SetNestedField(proxy.Object, "https://proxy:8443", "status", "httpsProxy")
+			unstructured.SetNestedField(proxy.Object, ".cluster.local", "status", "noProxy")
 
 			r := &DisconnectedPlatformReconciler{
 				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(proxy).Build(),

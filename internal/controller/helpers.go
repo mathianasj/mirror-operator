@@ -127,9 +127,9 @@ func (r *DisconnectedPlatformReconciler) getClusterProxy(ctx context.Context) (h
 		return "", "", ""
 	}
 
-	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpProxy")
-	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpsProxy")
-	noProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "noProxy")
+	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "httpProxy")
+	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "httpsProxy")
+	noProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "noProxy")
 	return
 }
 
@@ -246,9 +246,9 @@ func getClusterProxyFromClient(ctx context.Context, c client.Client) (httpProxy,
 		return "", "", ""
 	}
 
-	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpProxy")
-	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "httpsProxy")
-	noProxy, _, _ = unstructured.NestedString(proxy.Object, "spec", "noProxy")
+	httpProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "httpProxy")
+	httpsProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "httpsProxy")
+	noProxy, _, _ = unstructured.NestedString(proxy.Object, "status", "noProxy")
 	return
 }
 
