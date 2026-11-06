@@ -983,4 +983,393 @@ var _ = Describe("Event Handlers", func() {
 			Expect(nodeReadyStatus(node)).To(Equal(corev1.ConditionUnknown))
 		})
 	})
+
+	Describe("proxyEventHandler", func() {
+		It("enqueues platforms when proxy status changes", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build()
+			h := &proxyEventHandler{client: c}
+
+			oldProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy":  "http://old-proxy:8080",
+					"httpsProxy": "https://old-proxy:8443",
+					"noProxy":    ".local",
+				},
+			}}
+
+			newProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy":  "http://new-proxy:8080",
+					"httpsProxy": "https://new-proxy:8443",
+					"noProxy":    ".local,.internal",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: oldProxy,
+				ObjectNew: newProxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(1))
+			item, _ := q.Get()
+			Expect(item.Name).To(Equal("test-platform"))
+		})
+
+		It("does not enqueue when proxy status is unchanged", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build()
+			h := &proxyEventHandler{client: c}
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy":  "http://proxy:8080",
+					"httpsProxy": "https://proxy:8443",
+					"noProxy":    ".local",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: proxy,
+				ObjectNew: proxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("ignores non-cluster proxy objects", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-platform",
+					Namespace: "default",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: "connected",
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform).Build()
+			h := &proxyEventHandler{client: c}
+
+			oldProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "not-cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://old:8080",
+				},
+			}}
+
+			newProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "not-cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://new:8080",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: oldProxy,
+				ObjectNew: newProxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("ignores non-Unstructured objects", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &proxyEventHandler{client: c}
+
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: secret,
+				ObjectNew: secret,
+			}, q)
+
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("enqueues multiple platforms when proxy changes", func() {
+			platform1 := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "platform-1",
+					Namespace: "ns-1",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{Mode: "connected"},
+			}
+			platform2 := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "platform-2",
+					Namespace: "ns-2",
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{Mode: "airgapped"},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform1, platform2).Build()
+			h := &proxyEventHandler{client: c}
+
+			oldProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status":     map[string]interface{}{},
+			}}
+			newProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://proxy:8080",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: oldProxy,
+				ObjectNew: newProxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(2))
+		})
+	})
+
+	Describe("proxyEventHandler - no-op methods", func() {
+		It("Create does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &proxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Delete does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &proxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Delete(ctx, event.TypedDeleteEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &proxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
+
+	Describe("collectionProxyEventHandler", func() {
+		It("enqueues collection pipelines when proxy status changes", func() {
+			pipeline := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pipeline",
+					Namespace: "default",
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).Build()
+			h := &collectionProxyEventHandler{client: c}
+
+			oldProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://old-proxy:8080",
+				},
+			}}
+
+			newProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://new-proxy:8080",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: oldProxy,
+				ObjectNew: newProxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(1))
+			item, _ := q.Get()
+			Expect(item.Name).To(Equal("test-pipeline"))
+		})
+
+		It("does not enqueue when proxy status is unchanged", func() {
+			pipeline := &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pipeline",
+					Namespace: "default",
+				},
+			}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(pipeline).Build()
+			h := &collectionProxyEventHandler{client: c}
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+				"status": map[string]interface{}{
+					"httpProxy": "http://proxy:8080",
+				},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: proxy,
+				ObjectNew: proxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("ignores non-cluster proxy objects", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &collectionProxyEventHandler{client: c}
+
+			oldProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "other-proxy"},
+				"status":     map[string]interface{}{"httpProxy": "http://old:8080"},
+			}}
+			newProxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "other-proxy"},
+				"status":     map[string]interface{}{"httpProxy": "http://new:8080"},
+			}}
+
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			h.Update(ctx, event.TypedUpdateEvent[client.Object]{
+				ObjectOld: oldProxy,
+				ObjectNew: newProxy,
+			}, q)
+
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
+
+	Describe("collectionProxyEventHandler - no-op methods", func() {
+		It("Create does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &collectionProxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Create(ctx, event.TypedCreateEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Delete does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &collectionProxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Delete(ctx, event.TypedDeleteEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("Generic does nothing", func() {
+			c := fake.NewClientBuilder().WithScheme(testScheme).Build()
+			h := &collectionProxyEventHandler{client: c}
+			q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+			defer q.ShutDown()
+
+			proxy := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "config.openshift.io/v1",
+				"kind":       "Proxy",
+				"metadata":   map[string]interface{}{"name": "cluster"},
+			}}
+			h.Generic(ctx, event.TypedGenericEvent[client.Object]{Object: proxy}, q)
+			Expect(q.Len()).To(Equal(0))
+		})
+	})
 })
