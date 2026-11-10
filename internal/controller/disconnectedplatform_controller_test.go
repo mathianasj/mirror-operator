@@ -768,7 +768,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			checkDeletedSvc(frontendSvcName)
 		})
 
-		It("skips architect deployment on connected cluster even when architect is enabled", func() {
+		It("deploys console plugin on connected cluster (skips standalone frontend and routes)", func() {
 			pullSecret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
 				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
@@ -807,13 +807,78 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 			updated := &mirrorv1.DisconnectedPlatform{}
 			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
 
+			hasBackend := false
+			hasConsolePlugin := false
+			for _, c := range updated.Status.Components {
+				Expect(c.Name).NotTo(Equal("airgap-architect-frontend"))
+				if c.Name == "airgap-architect-backend" {
+					hasBackend = true
+				}
+				if c.Name == "airgap-architect-console-plugin" {
+					hasConsolePlugin = true
+				}
+			}
+			Expect(hasBackend).To(BeTrue(), "backend should be deployed for console plugin proxy")
+			Expect(hasConsolePlugin).To(BeTrue(), "console plugin should be deployed on connected clusters")
+
+			// Verify no routes were created (routes are only for airgapped standalone UI)
+			frontendRoute := &unstructured.Unstructured{}
+			frontendRoute.SetGroupVersionKind(routeGVK)
+			frontendRoute.SetName("airgap-architect")
+			frontendRoute.SetNamespace(architectNamespace)
+			err = r.Get(ctx, client.ObjectKeyFromObject(frontendRoute), frontendRoute)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "frontend route should not exist on connected clusters")
+		})
+
+		It("skips all architect resources on connected cluster when console plugin is disabled", func() {
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-platform",
+					Finalizers: []string{platformFinalizer},
+				},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+						ConsolePlugin: &mirrorv1.ConsolePluginConfig{
+							Enabled: false,
+						},
+					},
+				},
+			}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(testScheme).
+					WithStatusSubresource(&mirrorv1.DisconnectedPlatform{}).
+					WithObjects(platform, pullSecret).
+					Build(),
+				Scheme:                 testScheme,
+				ArchitectFrontendImage: "quay.io/mathianasj/openshift-airgap-architect-frontend:latest",
+				ArchitectBackendImage:  "quay.io/mathianasj/openshift-airgap-architect-backend:latest",
+			}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-platform"}}
+			result, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			updated := &mirrorv1.DisconnectedPlatform{}
+			_ = r.Get(ctx, types.NamespacedName{Name: "test-platform"}, updated)
+
 			for _, c := range updated.Status.Components {
 				Expect(c.Name).NotTo(Equal("airgap-architect-frontend"))
 				Expect(c.Name).NotTo(Equal("airgap-architect-backend"))
+				Expect(c.Name).NotTo(Equal("airgap-architect-console-plugin"))
 			}
 		})
 
-		It("cleans up existing architect resources when switching to connected mode", func() {
+		It("cleans up existing architect resources when switching to connected mode with console plugin disabled", func() {
 			backendDepName := "mo-test-platform-airgap-architect-backend"
 			frontendDepName := "mo-test-platform-airgap-architect-frontend"
 
@@ -836,6 +901,9 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 					Mode: mirrorv1.PlatformModeConnected,
 					Architect: &mirrorv1.AirgapArchitectConfig{
 						Enabled: true,
+						ConsolePlugin: &mirrorv1.ConsolePluginConfig{
+							Enabled: false,
+						},
 					},
 				},
 			}
@@ -6960,6 +7028,66 @@ notifier:
 			}
 			err := r.reconcileArchitect(ctx, platform)
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("deploys backend and console plugin on connected mode", func() {
+			pullSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-config"},
+				Data:       map[string][]byte{".dockerconfigjson": []byte(`{"auths":{}}`)},
+				Type:       corev1.SecretTypeDockerConfigJson,
+			}
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client:                fake.NewClientBuilder().WithScheme(testScheme).WithObjects(platform, pullSecret).Build(),
+				Scheme:                testScheme,
+				ArchitectBackendImage: "quay.io/test/backend:latest",
+			}
+			err := r.reconcileArchitect(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+
+			hasBackend := false
+			hasConsolePlugin := false
+			for _, c := range platform.Status.Components {
+				if c.Name == "airgap-architect-backend" {
+					hasBackend = true
+				}
+				if c.Name == "airgap-architect-console-plugin" {
+					hasConsolePlugin = true
+				}
+				Expect(c.Name).NotTo(Equal("airgap-architect-frontend"))
+			}
+			Expect(hasBackend).To(BeTrue())
+			Expect(hasConsolePlugin).To(BeTrue())
+		})
+
+		It("deletes all resources on connected mode when console plugin disabled", func() {
+			platform := &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec: mirrorv1.DisconnectedPlatformSpec{
+					Mode: mirrorv1.PlatformModeConnected,
+					Architect: &mirrorv1.AirgapArchitectConfig{
+						Enabled: true,
+						ConsolePlugin: &mirrorv1.ConsolePluginConfig{
+							Enabled: false,
+						},
+					},
+				},
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			err := r.reconcileArchitect(ctx, platform)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(platform.Status.Components).To(BeEmpty())
 		})
 	})
 

@@ -6416,7 +6416,15 @@ func (r *DisconnectedPlatformReconciler) getRouteHostname(route *unstructured.Un
 func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
 	cfg := platform.Spec.Architect
-	if cfg == nil || !cfg.Enabled || platform.Spec.Mode == mirrorv1.PlatformModeConnected {
+	if cfg == nil || !cfg.Enabled {
+		return r.deleteArchitectResources(ctx, platform)
+	}
+
+	isConnected := platform.Spec.Mode == mirrorv1.PlatformModeConnected
+	consolePluginEnabled := cfg.ConsolePlugin == nil || cfg.ConsolePlugin.Enabled
+
+	// On connected clusters, only deploy architect resources if console plugin is enabled
+	if isConnected && !consolePluginEnabled {
 		return r.deleteArchitectResources(ctx, platform)
 	}
 
@@ -6459,55 +6467,50 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 		return err
 	}
 
-	// Routes (create routes first to get hostnames)
-	// Always create routes with default edge termination if not explicitly disabled
+	// Routes and standalone frontend are only needed on airgapped clusters
 	var frontendRouteHostname, backendRouteHostname string
 
-	// Frontend route
-	frontendRouteName := "airgap-architect"
-	if err := r.ensureArchitectRoute(ctx, platform, frontendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-frontend")); err != nil {
-		return err
-	}
-	// Get frontend route hostname for VITE_ALLOWED_HOSTS
-	frontendRoute := &unstructured.Unstructured{}
-	frontendRoute.SetGroupVersionKind(routeGVK)
-	frontendRoute.SetName(frontendRouteName)
-	frontendRoute.SetNamespace(architectNamespace)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(frontendRoute), frontendRoute); err == nil {
-		if cfg.Route != nil && cfg.Route.Host != "" {
-			frontendRouteHostname = cfg.Route.Host
-		} else {
-			// Get auto-generated hostname from route status
-			frontendRouteHostname = r.getRouteHostname(frontendRoute)
+	if !isConnected {
+		// Frontend route
+		frontendRouteName := "airgap-architect"
+		if err := r.ensureArchitectRoute(ctx, platform, frontendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-frontend")); err != nil {
+			return err
+		}
+		// Get frontend route hostname for VITE_ALLOWED_HOSTS
+		frontendRoute := &unstructured.Unstructured{}
+		frontendRoute.SetGroupVersionKind(routeGVK)
+		frontendRoute.SetName(frontendRouteName)
+		frontendRoute.SetNamespace(architectNamespace)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(frontendRoute), frontendRoute); err == nil {
+			if cfg.Route != nil && cfg.Route.Host != "" {
+				frontendRouteHostname = cfg.Route.Host
+			} else {
+				frontendRouteHostname = r.getRouteHostname(frontendRoute)
+			}
+		}
+
+		// Backend API route
+		backendRouteName := "airgap-architect-api"
+		if err := r.ensureArchitectRoute(ctx, platform, backendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-backend")); err != nil {
+			return err
+		}
+		// Get backend route hostname for VITE_API_BASE
+		backendRoute := &unstructured.Unstructured{}
+		backendRoute.SetGroupVersionKind(routeGVK)
+		backendRoute.SetName(backendRouteName)
+		backendRoute.SetNamespace(architectNamespace)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(backendRoute), backendRoute); err == nil {
+			if cfg.Route != nil && cfg.Route.Host != "" {
+				backendRouteHostname = "api-" + cfg.Route.Host
+			} else {
+				backendRouteHostname = r.getRouteHostname(backendRoute)
+			}
 		}
 	}
-
-	// Backend API route
-	backendRouteName := "airgap-architect-api"
-	if err := r.ensureArchitectRoute(ctx, platform, backendRouteName, cfg.Route, architectResourceName(platform, "airgap-architect-backend")); err != nil {
-		return err
-	}
-	// Get backend route hostname for VITE_API_BASE
-	backendRoute := &unstructured.Unstructured{}
-	backendRoute.SetGroupVersionKind(routeGVK)
-	backendRoute.SetName(backendRouteName)
-	backendRoute.SetNamespace(architectNamespace)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(backendRoute), backendRoute); err == nil {
-		if cfg.Route != nil && cfg.Route.Host != "" {
-			// If custom host specified, use subdomain pattern
-			backendRouteHostname = "api-" + cfg.Route.Host
-		} else {
-			// Get auto-generated hostname from route status
-			backendRouteHostname = r.getRouteHostname(backendRoute)
-		}
-	}
-
-	// Console plugin is enabled by default (when ConsolePlugin is nil or Enabled is not explicitly false)
-	consolePluginEnabled := cfg.ConsolePlugin == nil || cfg.ConsolePlugin.Enabled
 
 	// Frontend resources (after routes to get hostnames)
-	// Deploy if frontendImage is explicitly set, or if console plugin is not enabled
-	deployFrontend := frontendImage != "" && (!consolePluginEnabled || cfg.FrontendImage != "")
+	// Skip standalone frontend on connected clusters — the console plugin replaces it
+	deployFrontend := !isConnected && frontendImage != "" && (!consolePluginEnabled || cfg.FrontendImage != "")
 
 	if deployFrontend {
 		frontendName := architectResourceName(platform, "airgap-architect-frontend")
@@ -6523,14 +6526,12 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 				Kind: "Deployment", APIGroup: "apps", Namespace: architectNamespace},
 		)
 	} else if consolePluginEnabled && cfg.FrontendImage == "" {
-		// Only delete frontend if console plugin is enabled AND frontendImage is not explicitly set
-		// This allows hybrid mode (both frontend and plugin) when frontendImage is specified
 		if err := r.deleteArchitectFrontendResources(ctx, platform); err != nil {
 			logger.Error(err, "failed to delete frontend resources")
 		}
 	}
 
-	// Console Plugin resources (enabled by default)
+	// Console Plugin resources (enabled by default, works on both connected and airgapped)
 	if consolePluginEnabled {
 		consolePluginImage := ""
 		if cfg.ConsolePlugin != nil {
@@ -7524,6 +7525,9 @@ func (r *DisconnectedPlatformReconciler) deleteArchitectResources(ctx context.Co
 	_ = r.deleteResource(ctx, serviceGVK, frontendName)
 	_ = r.deleteResource(ctx, routeGVK, "airgap-architect")
 	_ = r.deleteResource(ctx, routeGVK, "airgap-architect-api")
+	if err := r.deleteConsolePluginResources(ctx, platform); err != nil {
+		log.FromContext(ctx).Error(err, "failed to delete console plugin resources")
+	}
 	return nil
 }
 
