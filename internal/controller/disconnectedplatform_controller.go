@@ -7783,6 +7783,64 @@ func taskRunSucceeded(u *unstructured.Unstructured) bool {
 	return false
 }
 
+// proxyEventHandler watches the cluster Proxy CR for proxy configuration changes
+// and triggers reconciliation of all DisconnectedPlatform resources so that
+// managed deployments, pipelines, and subscriptions pick up the new proxy settings.
+type proxyEventHandler struct {
+	client client.Client
+}
+
+func (h *proxyEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *proxyEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	oldU, oldOk := e.ObjectOld.(*unstructured.Unstructured)
+	newU, newOk := e.ObjectNew.(*unstructured.Unstructured)
+	if !oldOk || !newOk {
+		return
+	}
+
+	if newU.GetName() != "cluster" {
+		return
+	}
+
+	oldHTTP, _, _ := unstructured.NestedString(oldU.Object, "status", "httpProxy")
+	newHTTP, _, _ := unstructured.NestedString(newU.Object, "status", "httpProxy")
+	oldHTTPS, _, _ := unstructured.NestedString(oldU.Object, "status", "httpsProxy")
+	newHTTPS, _, _ := unstructured.NestedString(newU.Object, "status", "httpsProxy")
+	oldNoProxy, _, _ := unstructured.NestedString(oldU.Object, "status", "noProxy")
+	newNoProxy, _, _ := unstructured.NestedString(newU.Object, "status", "noProxy")
+
+	if oldHTTP == newHTTP && oldHTTPS == newHTTPS && oldNoProxy == newNoProxy {
+		return
+	}
+
+	log.FromContext(ctx).Info("Cluster proxy configuration changed, triggering reconciliation",
+		"oldHttpProxy", oldHTTP, "newHttpProxy", newHTTP,
+		"oldHttpsProxy", oldHTTPS, "newHttpsProxy", newHTTPS,
+		"oldNoProxy", oldNoProxy, "newNoProxy", newNoProxy)
+
+	platformList := &mirrorv1.DisconnectedPlatformList{}
+	if err := h.client.List(ctx, platformList); err != nil {
+		return
+	}
+
+	for _, platform := range platformList.Items {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      platform.Name,
+				Namespace: platform.Namespace,
+			},
+		})
+	}
+}
+
+func (h *proxyEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *proxyEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
 // RHTAS Health Check and Self-Healing Functions
 
 func (r *DisconnectedPlatformReconciler) updateStatusFromSecuresignHealth(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
@@ -11530,7 +11588,13 @@ func (r *DisconnectedPlatformReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		b = b.Watches(taskRunGVK, &taskRunEventHandler{client: r.Client})
 	}
 
+	proxyGVK := &unstructured.Unstructured{}
+	proxyGVK.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+	})
+
 	return b.
+		Watches(proxyGVK, &proxyEventHandler{client: r.Client}).
 		Watches(&corev1.Secret{}, &secretEventHandler{client: r.Client}).
 		Watches(&mirrorv1.CollectionPipeline{}, &collectionPipelineEventHandler{client: r.Client}).
 		Watches(&corev1.Node{}, &nodeEventHandler{client: r.Client}).

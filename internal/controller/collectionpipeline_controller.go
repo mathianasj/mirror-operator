@@ -16,9 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
 	mirrorv1 "github.com/mathianasj/mirror-operator/api/v1"
@@ -1638,9 +1641,67 @@ func (r *CollectionPipelineReconciler) getParentDisconnectedPlatform(ctx context
 }
 
 func (r *CollectionPipelineReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	proxyGVK := &unstructured.Unstructured{}
+	proxyGVK.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "config.openshift.io", Version: "v1", Kind: "Proxy",
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mirrorv1.CollectionPipeline{}).
 		Owns(&pipelinev1.PipelineRun{}).
 		Owns(&batchv1.Job{}).
+		Watches(proxyGVK, &collectionProxyEventHandler{client: r.Client}).
 		Complete(r)
+}
+
+type collectionProxyEventHandler struct {
+	client client.Client
+}
+
+func (h *collectionProxyEventHandler) Create(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *collectionProxyEventHandler) Update(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	oldU, oldOk := e.ObjectOld.(*unstructured.Unstructured)
+	newU, newOk := e.ObjectNew.(*unstructured.Unstructured)
+	if !oldOk || !newOk {
+		return
+	}
+
+	if newU.GetName() != "cluster" {
+		return
+	}
+
+	oldHTTP, _, _ := unstructured.NestedString(oldU.Object, "status", "httpProxy")
+	newHTTP, _, _ := unstructured.NestedString(newU.Object, "status", "httpProxy")
+	oldHTTPS, _, _ := unstructured.NestedString(oldU.Object, "status", "httpsProxy")
+	newHTTPS, _, _ := unstructured.NestedString(newU.Object, "status", "httpsProxy")
+	oldNoProxy, _, _ := unstructured.NestedString(oldU.Object, "status", "noProxy")
+	newNoProxy, _, _ := unstructured.NestedString(newU.Object, "status", "noProxy")
+
+	if oldHTTP == newHTTP && oldHTTPS == newHTTPS && oldNoProxy == newNoProxy {
+		return
+	}
+
+	log.FromContext(ctx).Info("Cluster proxy configuration changed, triggering CollectionPipeline reconciliation")
+
+	pipelineList := &mirrorv1.CollectionPipelineList{}
+	if err := h.client.List(ctx, pipelineList); err != nil {
+		return
+	}
+
+	for _, pipeline := range pipelineList.Items {
+		q.Add(reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      pipeline.Name,
+				Namespace: pipeline.Namespace,
+			},
+		})
+	}
+}
+
+func (h *collectionProxyEventHandler) Delete(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+}
+
+func (h *collectionProxyEventHandler) Generic(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 }
