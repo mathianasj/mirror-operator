@@ -6416,7 +6416,7 @@ func (r *DisconnectedPlatformReconciler) getRouteHostname(route *unstructured.Un
 func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
 	cfg := platform.Spec.Architect
-	if cfg == nil || !cfg.Enabled {
+	if cfg == nil || !cfg.Enabled || platform.Spec.Mode == mirrorv1.PlatformModeConnected {
 		return r.deleteArchitectResources(ctx, platform)
 	}
 
