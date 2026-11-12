@@ -974,6 +974,28 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 		pipelinev1.Param{Name: "no-proxy", Value: pipelinev1.ParamValue{Type: "string", StringVal: noProxy}},
 	)
 
+	// Add mirror tuning parameters from platform status
+	mirrorMaxPerRegistry := fmt.Sprintf("%d", defaultMaxPerRegistry)
+	mirrorRetries := fmt.Sprintf("%d", defaultRetries)
+	mirrorRequestTimeout := fmt.Sprintf("%d", defaultRequestTimeoutS)
+	if platform != nil && platform.Status.NetworkPerformance != nil {
+		np := platform.Status.NetworkPerformance
+		if np.EffectiveMaxPerRegistry > 0 {
+			mirrorMaxPerRegistry = fmt.Sprintf("%d", np.EffectiveMaxPerRegistry)
+		}
+		if np.EffectiveRetries > 0 {
+			mirrorRetries = fmt.Sprintf("%d", np.EffectiveRetries)
+		}
+		if np.EffectiveRequestTimeout != nil {
+			mirrorRequestTimeout = fmt.Sprintf("%d", int(np.EffectiveRequestTimeout.Duration.Seconds()))
+		}
+	}
+	params = append(params,
+		pipelinev1.Param{Name: "mirror-max-per-registry", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorMaxPerRegistry}},
+		pipelinev1.Param{Name: "mirror-retries", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRetries}},
+		pipelinev1.Param{Name: "mirror-request-timeout", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRequestTimeout}},
+	)
+
 	// Add RHCOS collection parameters (enabled by default)
 	rhcosEnabled := "true"
 	rhcosServerBaseImage := "registry.access.redhat.com/ubi9/nginx-122:latest"

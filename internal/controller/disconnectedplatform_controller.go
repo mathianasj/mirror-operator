@@ -408,6 +408,9 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		if err := r.ensureImportScriptConfigMap(ctx); err != nil {
 			log.FromContext(ctx).Error(err, "failed to ensure import script ConfigMap")
 		}
+		// Run network performance tuning before building pipeline template
+		r.reconcileNetworkPerformance(ctx, platform)
+
 		// Reconcile collection pipeline template
 		if err := r.reconcileCollectionPipelineTemplate(ctx, platform); err != nil {
 			if isCRDNotFoundError(err) {
@@ -9277,6 +9280,9 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "http-proxy", "type": "string", "default": "", "description": "HTTP proxy URL from cluster config"},
 		{"name": "https-proxy", "type": "string", "default": "", "description": "HTTPS proxy URL from cluster config"},
 		{"name": "no-proxy", "type": "string", "default": "", "description": "No-proxy hosts from cluster config"},
+		{"name": "mirror-max-per-registry", "type": "string", "default": "6", "description": "Maximum parallel image pulls per registry (oc-mirror --max-per-registry)"},
+		{"name": "mirror-retries", "type": "string", "default": "3", "description": "Number of retry attempts for failed mirror operations (oc-mirror --retry-times)"},
+		{"name": "mirror-request-timeout", "type": "string", "default": "300", "description": "Timeout in seconds for individual registry requests"},
 	}
 
 	// Define workspaces
@@ -9429,6 +9435,8 @@ oc-mirror \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --dry-run \
   --workspace=file:///workspace/output \
+  --max-per-registry=$(params.mirror-max-per-registry) \
+  --retry-times=$(params.mirror-retries) \
   docker://$(params.intermediate-registry)
 `},
 					},
@@ -9458,7 +9466,8 @@ oc-mirror \
 						"args": []string{`
 set -e
 
-MAX_RETRIES=3
+MAX_RETRIES=$(params.mirror-retries)
+if [ "$MAX_RETRIES" -lt 1 ]; then MAX_RETRIES=1; fi
 RETRY_COUNT=0
 SUCCESS=0
 
@@ -9475,6 +9484,8 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $SUCCESS -eq 0 ]; do
     --authfile=/workspace/pull-secret/.dockerconfigjson \
     --cache-dir=/workspace/output/.cache \
     --workspace=file:///workspace/output/workspace-to-intermediate \
+    --max-per-registry=$(params.mirror-max-per-registry) \
+    --retry-times=$(params.mirror-retries) \
     docker://$(params.intermediate-registry) 2>&1 | tee "$OUTPUT_FILE" || true
 
   if grep -q "✗" "$OUTPUT_FILE"; then
@@ -10043,7 +10054,9 @@ oc-mirror \
   --v2 \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
-  --workspace=file:///workspace/output
+  --workspace=file:///workspace/output \
+  --max-per-registry=$(params.mirror-max-per-registry) \
+  --retry-times=$(params.mirror-retries)
 `},
 					},
 				},
@@ -10335,6 +10348,8 @@ if ! oc-mirror \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --cache-dir=/workspace/output/.oc-mirror/.cache \
+  --max-per-registry=$(params.mirror-max-per-registry) \
+  --retry-times=$(params.mirror-retries) \
   file:///workspace/output; then
 
   echo ""
