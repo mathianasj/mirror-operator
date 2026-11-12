@@ -2359,6 +2359,39 @@ var _ = Describe("DisconnectedPlatform Airgapped", func() {
 		})
 	})
 
+	Describe("deleteAirgappedResources", func() {
+		It("deletes import job RBAC and ACM resources without error", func() {
+			og := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1",
+				"kind":       "OperatorGroup",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-advanced-cluster-management", "namespace": "open-cluster-management"},
+			}}
+			acmSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "open-cluster-management"}}
+
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(og, acmSecret).Build(),
+				Scheme: testScheme,
+			}
+
+			r.deleteAirgappedResources(ctx)
+
+			checkOG := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			checkOG.SetGroupVersionKind(schema.GroupVersionKind{Group: "operators.coreos.com", Version: "v1", Kind: "OperatorGroup"})
+			err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-advanced-cluster-management", Namespace: "open-cluster-management"}, checkOG)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "open-cluster-management"}, &corev1.Secret{}))).To(BeTrue())
+		})
+
+		It("does not panic when no resources exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			Expect(func() { r.deleteAirgappedResources(ctx) }).NotTo(Panic())
+		})
+	})
+
 	Describe("reconcileAirgappedQuay with existing QuayRegistry", func() {
 		It("appends Running status when QuayRegistry exists with hostname route", func() {
 			quayRoute := &unstructured.Unstructured{Object: map[string]interface{}{
