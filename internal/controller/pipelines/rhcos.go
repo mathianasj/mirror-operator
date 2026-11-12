@@ -287,8 +287,8 @@ buildah bud \
   --label "io.openshift.rhcos.version=${RHCOS_VERSION}" \
   --label "io.openshift.mirror-operator/component=rhcos-server" \
   -f /var/tmp/Containerfile \
-  --context "$RHCOS_DIR" \
-  -t "$FULL_IMAGE"
+  -t "$FULL_IMAGE" \
+  "$RHCOS_DIR"
 
 # Push directly to internal Quay service (bypasses external route/HAProxy)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")

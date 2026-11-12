@@ -210,6 +210,9 @@ func TestBuildRHCOSServerScript_UsesBuildahBud(t *testing.T) {
 	if !strings.Contains(script, `--build-arg BASE_IMAGE="$BASE_IMAGE"`) {
 		t.Error("buildah bud must pass the base image via --build-arg")
 	}
+	if strings.Contains(script, "--context") {
+		t.Error("buildah bud does not support --context; build context must be a positional argument")
+	}
 }
 
 func TestBuildRHCOSServerTask_HasEmptyDirVolumes(t *testing.T) {
