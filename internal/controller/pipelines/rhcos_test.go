@@ -192,6 +192,62 @@ func TestDownloadRHCOSScript_DiscoverVersionedFilename(t *testing.T) {
 	}
 }
 
+func TestBuildRHCOSServerScript_UsesBuildahBud(t *testing.T) {
+	script := buildRHCOSServerScript()
+
+	if !strings.Contains(script, "buildah bud") {
+		t.Error("script should use 'buildah bud' with an inline Containerfile")
+	}
+	if !strings.Contains(script, "/var/tmp/Containerfile") {
+		t.Error("Containerfile must be written to /var/tmp (emptyDir-backed) not on the PVC workspace")
+	}
+	if !strings.Contains(script, "--storage-driver=vfs") {
+		t.Error("buildah bud must pass --storage-driver=vfs")
+	}
+	if !strings.Contains(script, "--isolation=chroot") {
+		t.Error("buildah bud must pass --isolation=chroot")
+	}
+	if !strings.Contains(script, `--build-arg BASE_IMAGE="$BASE_IMAGE"`) {
+		t.Error("buildah bud must pass the base image via --build-arg")
+	}
+}
+
+func TestBuildRHCOSServerTask_HasEmptyDirVolumes(t *testing.T) {
+	task := BuildRHCOSServerTask()
+	taskSpec, _ := task["taskSpec"].(map[string]interface{})
+	volumes, _ := taskSpec["volumes"].([]map[string]interface{})
+
+	names := map[string]bool{}
+	for _, v := range volumes {
+		name, _ := v["name"].(string)
+		names[name] = true
+		if _, hasEmptyDir := v["emptyDir"]; !hasEmptyDir {
+			t.Errorf("volume %q should be an emptyDir", name)
+		}
+	}
+	for _, required := range []string{"varlibcontainers", "vartmp"} {
+		if !names[required] {
+			t.Errorf("taskSpec missing required emptyDir volume %q", required)
+		}
+	}
+
+	steps, _ := taskSpec["steps"].([]map[string]interface{})
+	if len(steps) == 0 {
+		t.Fatal("no steps in task")
+	}
+	mounts, _ := steps[0]["volumeMounts"].([]map[string]interface{})
+	mountPaths := map[string]bool{}
+	for _, m := range mounts {
+		mp, _ := m["mountPath"].(string)
+		mountPaths[mp] = true
+	}
+	for _, required := range []string{"/var/lib/containers", "/var/tmp"} {
+		if !mountPaths[required] {
+			t.Errorf("build-and-push step missing volumeMount at %q", required)
+		}
+	}
+}
+
 func TestDownloadAndBuildScripts_HaveConsistentRegistryCheck(t *testing.T) {
 	downloadScript := downloadRHCOSScript()
 	buildScript := buildRHCOSServerScript()
