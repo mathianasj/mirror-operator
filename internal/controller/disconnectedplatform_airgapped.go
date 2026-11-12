@@ -1485,7 +1485,7 @@ func (r *DisconnectedPlatformReconciler) ensureClusterImageSets(ctx context.Cont
 			Group: "hive.openshift.io", Version: "v1", Kind: "ClusterImageSet",
 		})
 		cis.SetName(cisName)
-		cis.SetLabels(map[string]string{"visible": "true"})
+		cis.SetLabels(map[string]string{"visible": "true", "app.kubernetes.io/managed-by": "mirror-operator"})
 
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(cis.GroupVersionKind())
@@ -1542,6 +1542,7 @@ func (r *DisconnectedPlatformReconciler) ensureInfraEnv(ctx context.Context, pla
 	})
 	infraEnv.SetName("mirror-operator-infraenv")
 	infraEnv.SetNamespace(ns)
+	infraEnv.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "mirror-operator"})
 
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(infraEnv.GroupVersionKind())
@@ -1689,6 +1690,7 @@ func (r *DisconnectedPlatformReconciler) ensureACMCredential(ctx context.Context
 			Labels: map[string]string{
 				"cluster.open-cluster-management.io/type":        "hostinventory",
 				"cluster.open-cluster-management.io/credentials": "",
+				"app.kubernetes.io/managed-by":                   "mirror-operator",
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
@@ -1990,6 +1992,71 @@ func (r *DisconnectedPlatformReconciler) deleteAirgappedACM(ctx context.Context)
 	sub.SetNamespace("open-cluster-management")
 	if err := r.Delete(ctx, sub); err != nil && !apierrors.IsNotFound(err) {
 		log.FromContext(ctx).Error(err, "failed to delete ACM subscription")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteAirgappedResources(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	// Reuse existing host inventory cleanup
+	r.deleteHostInventoryResources(ctx)
+
+	// Import job ClusterRole and ClusterRoleBinding (cluster-scoped, no owner ref)
+	cr := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "mirror-import-job"}}
+	if err := r.Delete(ctx, cr); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete import job ClusterRole")
+	}
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "mirror-import-job"}}
+	if err := r.Delete(ctx, crb); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete import job ClusterRoleBinding")
+	}
+
+	// Provisioning configuration (cluster-scoped)
+	provisioning := &unstructured.Unstructured{}
+	provisioning.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "metal3.io", Version: "v1alpha1", Kind: "Provisioning",
+	})
+	provisioning.SetName("provisioning-configuration")
+	if err := r.Delete(ctx, provisioning); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Provisioning configuration")
+	}
+
+	// ClusterImageSets managed by the operator (use label selector)
+	cisList := &unstructured.UnstructuredList{}
+	cisList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "hive.openshift.io", Version: "v1", Kind: "ClusterImageSetList",
+	})
+	if err := r.List(ctx, cisList, client.MatchingLabels{"app.kubernetes.io/managed-by": "mirror-operator"}); err == nil {
+		for i := range cisList.Items {
+			if err := r.Delete(ctx, &cisList.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete ClusterImageSet", "name", cisList.Items[i].GetName())
+			}
+		}
+	}
+
+	// ACM credential secrets with managed-by label (handles configurable names)
+	credList := &corev1.SecretList{}
+	if err := r.List(ctx, credList, client.MatchingLabels{"app.kubernetes.io/managed-by": "mirror-operator"}); err == nil {
+		for i := range credList.Items {
+			if err := r.Delete(ctx, &credList.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete managed secret", "name", credList.Items[i].Name)
+			}
+		}
+	}
+
+	// ACM pull secret
+	acmSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "open-cluster-management"}}
+	if err := r.Delete(ctx, acmSecret); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete ACM pull secret")
+	}
+
+	// ACM OperatorGroup
+	og := &unstructured.Unstructured{}
+	og.SetGroupVersionKind(operatorGroupGVK)
+	og.SetName("mirror-operator-advanced-cluster-management")
+	og.SetNamespace("open-cluster-management")
+	if err := r.Delete(ctx, og); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete ACM OperatorGroup")
 	}
 }
 

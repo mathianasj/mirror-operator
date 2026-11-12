@@ -20,6 +20,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -511,9 +512,22 @@ func (r *DisconnectedPlatformReconciler) cleanup(ctx context.Context, platform *
 			return ctrl.Result{}, err
 		}
 		r.deleteManagedKeycloak(ctx)
+		r.deleteKeycloakPostgreSQL(ctx)
 		r.deleteRHTASConfig(ctx)
 		r.deleteRHTPAConfig(ctx)
+		r.deleteRHTPAPostgreSQL(ctx)
+		r.deleteRHTPAOBC(ctx)
+		r.deleteQuayConfig(ctx)
+		r.deleteUpdateService(ctx)
+		r.deletePipelineOSUSAccess(ctx)
+		r.deleteArchitectServiceAccount(ctx)
+		r.deleteOAuthClients(ctx)
+		r.deleteOperatorSecrets(ctx)
+		r.deleteOperatorConfigMaps(ctx)
+		r.deleteSubscriptions(ctx)
+		r.deleteOperatorGroups(ctx)
 		r.deleteAirgappedACM(ctx)
+		r.deleteAirgappedResources(ctx)
 		platform.SetFinalizers(removeString(platform.GetFinalizers(), platformFinalizer))
 		return ctrl.Result{}, r.Update(ctx, platform)
 	}
@@ -1276,6 +1290,216 @@ func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) 
 	tpa.SetNamespace(architectNamespace)
 	if err := r.Delete(ctx, tpa); err != nil && !apierrors.IsNotFound(err) {
 		log.FromContext(ctx).Error(err, "failed to delete RHTPA config")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteSubscriptions(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	for _, op := range defaultOperators {
+		sub := &unstructured.Unstructured{}
+		sub.SetGroupVersionKind(subscriptionGVK)
+		sub.SetName("mirror-operator-" + op.name)
+		sub.SetNamespace(op.ns)
+		if err := r.Delete(ctx, sub); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete Subscription", "name", "mirror-operator-"+op.name)
+		}
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteOperatorGroups(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	for _, op := range defaultOperators {
+		if op.ns == "openshift-operators" {
+			continue
+		}
+		og := &unstructured.Unstructured{}
+		og.SetGroupVersionKind(operatorGroupGVK)
+		og.SetName("mirror-operator-" + op.name)
+		og.SetNamespace(op.ns)
+		if err := r.Delete(ctx, og); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete OperatorGroup", "name", "mirror-operator-"+op.name)
+		}
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteKeycloakPostgreSQL(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, sts); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Keycloak PostgreSQL StatefulSet")
+	}
+
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Keycloak PostgreSQL Service")
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql-data", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Keycloak PostgreSQL PVC")
+	}
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-db-secret", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Keycloak DB secret")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteRHTPAPostgreSQL(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, sts); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHTPA PostgreSQL StatefulSet")
+	}
+
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHTPA PostgreSQL Service")
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql-data", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHTPA PostgreSQL PVC")
+	}
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-db-credentials", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete RHTPA DB credentials secret")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteRHTPAOBC(ctx context.Context) {
+	obc := &unstructured.Unstructured{}
+	obc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "objectbucket.io", Version: "v1alpha1", Kind: "ObjectBucketClaim",
+	})
+	obc.SetName("rhtpa-storage")
+	obc.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, obc); err != nil && !apierrors.IsNotFound(err) {
+		log.FromContext(ctx).Error(err, "failed to delete RHTPA ObjectBucketClaim")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteQuayConfig(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	quay := &unstructured.Unstructured{}
+	quay.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry",
+	})
+	quay.SetName("mirror-operator-quay")
+	quay.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, quay); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete QuayRegistry")
+	}
+
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(certificateGVK)
+	cert.SetName("quay-certificate")
+	cert.SetNamespace(architectNamespace)
+	if err := r.Delete(ctx, cert); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete Quay certificate")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteUpdateService(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	us := &unstructured.Unstructured{}
+	us.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService",
+	})
+	us.SetName("update-service-oc-mirror")
+	us.SetNamespace("openshift-update-service")
+	if err := r.Delete(ctx, us); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete UpdateService")
+	}
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-update-service"}}
+	if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete OSUS pull secret")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deletePipelineOSUSAccess(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	cr := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-pipeline-osus-reader"}}
+	if err := r.Delete(ctx, cr); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete pipeline OSUS ClusterRole")
+	}
+
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "mirror-operator-pipeline-osus-reader"}}
+	if err := r.Delete(ctx, crb); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete pipeline OSUS ClusterRoleBinding")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteArchitectServiceAccount(ctx context.Context) {
+	logger := log.FromContext(ctx)
+
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "airgap-architect-backend", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, sa); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete architect ServiceAccount")
+	}
+
+	role := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: "airgap-architect-backend", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, role); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete architect Role")
+	}
+
+	rb := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "airgap-architect-backend", Namespace: architectNamespace}}
+	if err := r.Delete(ctx, rb); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to delete architect RoleBinding")
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteOAuthClients(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	for _, name := range []string{"keycloak-trusted-artifact-signer", "keycloak-trustify"} {
+		oc := &unstructured.Unstructured{}
+		oc.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "oauth.openshift.io", Version: "v1", Kind: "OAuthClient",
+		})
+		oc.SetName(name)
+		if err := r.Delete(ctx, oc); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete OAuthClient", "name", name)
+		}
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteOperatorSecrets(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	secretNames := []string{
+		"pull-secret",
+		"mirror-operator-keycloak-client-secret",
+		"quay-api-token",
+		"quay-robot-credentials",
+		"rhtpa-oidc-cli-secret",
+	}
+	for _, name := range secretNames {
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: architectNamespace}}
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete Secret", "name", name)
+		}
+	}
+}
+
+func (r *DisconnectedPlatformReconciler) deleteOperatorConfigMaps(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	cmNames := []string{
+		clusterCABundleName,
+		serviceCAConfigMap,
+		combinedCABundleName,
+		"airgap-architect-import-script",
+	}
+	for _, name := range cmNames {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: architectNamespace}}
+		if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete ConfigMap", "name", name)
+		}
 	}
 }
 
