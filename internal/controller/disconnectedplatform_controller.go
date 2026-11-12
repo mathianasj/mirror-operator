@@ -10368,7 +10368,7 @@ echo "=== Mirror from intermediate complete ==="
 		// Task 7: sign-bundles (sign the complete repackaged bundle)
 		{
 			"name":     "sign-bundles",
-			"runAfter": []string{"repackage-bundle"},
+			"runAfter": []string{"create-bundle-sbom"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-keyless-signing)", "operator": "in", "values": []string{"true"}},
 			},
@@ -10387,8 +10387,9 @@ echo "=== Signing tar bundles with cosign ==="
 
 export COSIGN_EXPERIMENTAL=1
 
-# Increase cosign HTTP timeout for large file operations (default 30s is too short)
-export COSIGN_TIMEOUT=300
+# Timeout budget covers large-payload hashing (~390 GiB) plus Rekor upload latency.
+# SIGN-004: increased from 600s; must match COSIGN_TIMEOUT below.
+export COSIGN_TIMEOUT=3600
 
 fetch_oidc_token() {
   curl -s -X POST "$(params.oidc-issuer)/protocol/openid-connect/token" \
@@ -10405,25 +10406,39 @@ sign_file() {
   echo "Signing $filepath ($(du -h "$filepath" | cut -f1))"
   while [ $attempt -lt $max_retries ]; do
     attempt=$((attempt + 1))
-    local token=$(fetch_oidc_token)
+    local token
+    token=$(fetch_oidc_token)
     if [ -z "$token" ] || [ "$token" = "null" ]; then
       echo "  OIDC token fetch failed (attempt $attempt/$max_retries)"
-    elif cosign sign-blob \
+      sleep 10
+      continue
+    fi
+    # SIGN-001/002: use --output-signature so only the base64 sig goes to file;
+    # route stderr to a temp file so diagnostics never contaminate the .sig artifact.
+    local cosign_stderr
+    cosign_stderr=$(mktemp)
+    rm -f "${filepath}.sig" "${filepath}.bundle"
+    if cosign sign-blob \
       --fulcio-url=$(params.fulcio-url) \
       --rekor-url=$(params.rekor-url) \
       --oidc-issuer=$(params.oidc-issuer) \
       --identity-token="$token" \
       --yes \
-      --timeout=600s \
+      --timeout=3600s \
       --bundle="${filepath}.bundle" \
-      "$filepath" 2>&1 | tee "${filepath}.sig"; then
+      --output-signature="${filepath}.sig" \
+      "$filepath" 2>"$cosign_stderr"; then
+      rm -f "$cosign_stderr"
       echo "  ✓ Signed successfully"
       return 0
     fi
+    cat "$cosign_stderr" >&2
+    rm -f "$cosign_stderr" "${filepath}.sig" "${filepath}.bundle"
     echo "  Signing attempt $attempt/$max_retries failed, retrying in 10s..."
     sleep 10
   done
   echo "  Failed to sign $filepath after $max_retries attempts"
+  return 1
 }
 
 # Sign small files first (fast, validates the signing pipeline works)
@@ -10456,10 +10471,11 @@ echo "=== Bundle signing complete ==="
 		},
 
 		// Task 8: create-bundle-sbom (scan additional artifacts and create contextual SBOM for the signed bundle)
+		// SIGN-006: runs before sign-bundles so the SBOM exists when signing is attempted.
 		{
 			"name":     "create-bundle-sbom",
 			"retries":  2,
-			"runAfter": []string{"sign-bundles"},
+			"runAfter": []string{"repackage-bundle"},
 			"when": []map[string]interface{}{
 				{"input": "$(params.has-tpa)", "operator": "in", "values": []string{"true"}},
 			},
@@ -11360,17 +11376,21 @@ if [ -f "$FINAL_BUNDLE" ]; then
     --content-type="application/x-tar"
   BUNDLE_FILE="$BUNDLE_FILENAME"
 
-  # Upload signature if it exists
+  # Upload signature and attestation bundle — validate first (SIGN-005)
   if [ -f "${FINAL_BUNDLE}.sig" ]; then
+    if ! base64 -d "${FINAL_BUNDLE}.sig" >/dev/null 2>&1; then
+      echo "ERROR: ${BUNDLE_FILENAME}.sig is not valid base64 — keyless signing failed. Aborting upload."
+      exit 1
+    fi
+    if [ ! -f "${FINAL_BUNDLE}.bundle" ]; then
+      echo "ERROR: ${BUNDLE_FILENAME}.bundle is missing — keyless signing did not complete. Aborting upload."
+      exit 1
+    fi
     echo "Uploading bundle signature..."
     upload_with_retry "${FINAL_BUNDLE}.sig" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.sig" \
       --endpoint-url="$(params.s3-endpoint)" \
       --region="$(params.s3-region)"
     SIG_FILE="${BUNDLE_FILENAME}.sig"
-  fi
-
-  # Upload attestation bundle if it exists
-  if [ -f "${FINAL_BUNDLE}.bundle" ]; then
     echo "Uploading bundle attestation..."
     upload_with_retry "${FINAL_BUNDLE}.bundle" "s3://$(params.s3-bucket)/$COLLECTION_NAME/${BUNDLE_FILENAME}.bundle" \
       --endpoint-url="$(params.s3-endpoint)" \
