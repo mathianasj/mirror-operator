@@ -47,8 +47,16 @@ func BuildRHCOSServerTask() map[string]interface{} {
 							"add": []string{"SETFCAP"},
 						},
 					},
+					"volumeMounts": []map[string]interface{}{
+						{"name": "varlibcontainers", "mountPath": "/var/lib/containers"},
+						{"name": "vartmp", "mountPath": "/var/tmp"},
+					},
 					"args": []string{buildRHCOSServerScript()},
 				},
+			},
+			"volumes": []map[string]interface{}{
+				{"name": "varlibcontainers", "emptyDir": map[string]interface{}{}},
+				{"name": "vartmp", "emptyDir": map[string]interface{}{}},
 			},
 		},
 		"workspaces": []map[string]interface{}{
@@ -251,28 +259,36 @@ fi
 
 echo "=== Building RHCOS server OCI image ==="
 
-cat > "$RHCOS_DIR/Containerfile" <<CEOF
-FROM ${BASE_IMAGE}
-ADD --chown=1001:0 rhcos-live.x86_64.iso /tmp/src/rhcos-live.x86_64.iso
-ADD --chown=1001:0 rhcos-live-rootfs.x86_64.img /tmp/src/rhcos-live-rootfs.x86_64.img
-ADD --chown=1001:0 RHCOS_VERSION.txt /tmp/src/RHCOS_VERSION.txt
-RUN /usr/libexec/s2i/assemble
-CMD /usr/libexec/s2i/run
-LABEL io.openshift.rhcos.version="${RHCOS_VERSION}"
-LABEL io.openshift.mirror-operator/component="rhcos-server"
-CEOF
-
 CERT_DIR_FLAG=""
 if [ -d "/workspace/trusted-ca" ] && [ -f "/workspace/trusted-ca/ca-bundle.crt" ]; then
   mkdir -p /etc/docker/certs.d
   CERT_DIR_FLAG="--cert-dir=/workspace/trusted-ca"
 fi
 
-buildah bud --storage-driver=vfs --isolation=chroot \
+# Write Containerfile to /var/tmp (emptyDir-backed, not on the PVC workspace).
+# /var/tmp and /var/lib/containers are both emptyDir volumes so buildah bud's
+# build-context overlay mounts upper/work dirs on tmpfs rather than the PVC
+# filesystem, avoiding the EINVAL (userxattr) error on network-backed storage.
+cat > /var/tmp/Containerfile <<'CFEOF'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY --chown=1001:0 rhcos-live.x86_64.iso /tmp/src/rhcos-live.x86_64.iso
+COPY --chown=1001:0 rhcos-live-rootfs.x86_64.img /tmp/src/rhcos-live-rootfs.x86_64.img
+COPY --chown=1001:0 RHCOS_VERSION.txt /tmp/src/RHCOS_VERSION.txt
+RUN /usr/libexec/s2i/assemble
+CMD ["/usr/libexec/s2i/run"]
+CFEOF
+
+buildah bud \
+  --storage-driver=vfs \
+  --isolation=chroot \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
-  -t "$FULL_IMAGE" \
-  -f "$RHCOS_DIR/Containerfile" \
-  "$RHCOS_DIR"
+  --build-arg BASE_IMAGE="$BASE_IMAGE" \
+  --label "io.openshift.rhcos.version=${RHCOS_VERSION}" \
+  --label "io.openshift.mirror-operator/component=rhcos-server" \
+  -f /var/tmp/Containerfile \
+  --context "$RHCOS_DIR" \
+  -t "$FULL_IMAGE"
 
 # Push directly to internal Quay service (bypasses external route/HAProxy)
 NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "mirror-operator-system")
