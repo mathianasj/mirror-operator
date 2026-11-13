@@ -4396,6 +4396,327 @@ notifier:
 		})
 	})
 
+	Describe("deleteSubscriptions", func() {
+		It("deletes all operator subscriptions", func() {
+			var objs []client.Object
+			for _, op := range defaultOperators {
+				sub := &unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "operators.coreos.com/v1alpha1",
+					"kind":       "Subscription",
+					"metadata":   map[string]interface{}{"name": "mirror-operator-" + op.name, "namespace": op.ns},
+				}}
+				objs = append(objs, sub)
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(objs...).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteSubscriptions(ctx)
+
+			for _, op := range defaultOperators {
+				check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+				check.SetGroupVersionKind(subscriptionGVK)
+				err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-" + op.name, Namespace: op.ns}, check)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}
+		})
+
+		It("does not error when subscriptions do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteSubscriptions(ctx)
+		})
+	})
+
+	Describe("deleteOperatorGroups", func() {
+		It("deletes operator groups for non-openshift-operators namespaces", func() {
+			og := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "operators.coreos.com/v1",
+				"kind":       "OperatorGroup",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-rhbk-operator", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(og).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorGroups(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(operatorGroupGVK)
+			err := r.Get(ctx, client.ObjectKey{Name: "mirror-operator-rhbk-operator", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when operator groups do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorGroups(ctx)
+		})
+	})
+
+	Describe("deleteKeycloakPostgreSQL", func() {
+		It("deletes all Keycloak PostgreSQL resources", func() {
+			sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace}}
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql", Namespace: architectNamespace}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-postgresql-data", Namespace: architectNamespace}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "keycloak-db-secret", Namespace: architectNamespace}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sts, svc, pvc, secret).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteKeycloakPostgreSQL(ctx)
+
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql", Namespace: architectNamespace}, &appsv1.StatefulSet{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql", Namespace: architectNamespace}, &corev1.Service{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "keycloak-postgresql-data", Namespace: architectNamespace}, &corev1.PersistentVolumeClaim{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "keycloak-db-secret", Namespace: architectNamespace}, &corev1.Secret{}))).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteKeycloakPostgreSQL(ctx)
+		})
+	})
+
+	Describe("deleteRHTPAPostgreSQL", func() {
+		It("deletes all RHTPA PostgreSQL resources", func() {
+			sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql", Namespace: architectNamespace}}
+			svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql", Namespace: architectNamespace}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-postgresql-data", Namespace: architectNamespace}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "rhtpa-db-credentials", Namespace: architectNamespace}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sts, svc, pvc, secret).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAPostgreSQL(ctx)
+
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql", Namespace: architectNamespace}, &appsv1.StatefulSet{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql", Namespace: architectNamespace}, &corev1.Service{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "rhtpa-postgresql-data", Namespace: architectNamespace}, &corev1.PersistentVolumeClaim{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "rhtpa-db-credentials", Namespace: architectNamespace}, &corev1.Secret{}))).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAPostgreSQL(ctx)
+		})
+	})
+
+	Describe("deleteRHTPAOBC", func() {
+		It("deletes RHTPA ObjectBucketClaim", func() {
+			obc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "objectbucket.io/v1alpha1",
+				"kind":       "ObjectBucketClaim",
+				"metadata":   map[string]interface{}{"name": "rhtpa-storage", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(obc).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAOBC(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(schema.GroupVersionKind{Group: "objectbucket.io", Version: "v1alpha1", Kind: "ObjectBucketClaim"})
+			err := r.Get(ctx, client.ObjectKey{Name: "rhtpa-storage", Namespace: architectNamespace}, check)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("does not error when OBC does not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteRHTPAOBC(ctx)
+		})
+	})
+
+	Describe("deleteQuayConfig", func() {
+		It("deletes QuayRegistry and Certificate", func() {
+			quay := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "quay.redhat.com/v1",
+				"kind":       "QuayRegistry",
+				"metadata":   map[string]interface{}{"name": "mirror-operator-quay", "namespace": architectNamespace},
+			}}
+			cert := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "cert-manager.io/v1",
+				"kind":       "Certificate",
+				"metadata":   map[string]interface{}{"name": "quay-certificate", "namespace": architectNamespace},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay, cert).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteQuayConfig(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(schema.GroupVersionKind{Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry"})
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "mirror-operator-quay", Namespace: architectNamespace}, check))).To(BeTrue())
+
+			checkCert := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			checkCert.SetGroupVersionKind(certificateGVK)
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "quay-certificate", Namespace: architectNamespace}, checkCert))).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteQuayConfig(ctx)
+		})
+	})
+
+	Describe("deleteUpdateService", func() {
+		It("deletes UpdateService and OSUS pull secret", func() {
+			us := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "updateservice.operator.openshift.io/v1",
+				"kind":       "UpdateService",
+				"metadata":   map[string]interface{}{"name": "update-service-oc-mirror", "namespace": "openshift-update-service"},
+			}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "openshift-update-service"}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(us, secret).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteUpdateService(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(schema.GroupVersionKind{Group: "updateservice.operator.openshift.io", Version: "v1", Kind: "UpdateService"})
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "update-service-oc-mirror", Namespace: "openshift-update-service"}, check))).To(BeTrue())
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "openshift-update-service"}, &corev1.Secret{}))).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteUpdateService(ctx)
+		})
+	})
+
+	Describe("deleteArchitectServiceAccount", func() {
+		It("deletes SA, Role, and RoleBinding", func() {
+			sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "airgap-architect-backend", Namespace: architectNamespace}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(sa).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteArchitectServiceAccount(ctx)
+
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "airgap-architect-backend", Namespace: architectNamespace}, &corev1.ServiceAccount{}))).To(BeTrue())
+		})
+
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteArchitectServiceAccount(ctx)
+		})
+	})
+
+	Describe("deleteOperatorSecrets", func() {
+		It("deletes all operator-managed secrets", func() {
+			names := []string{"pull-secret", "mirror-operator-keycloak-client-secret", "quay-api-token", "quay-robot-credentials", "rhtpa-oidc-cli-secret"}
+			var objs []client.Object
+			for _, name := range names {
+				objs = append(objs, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: architectNamespace}})
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(objs...).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorSecrets(ctx)
+
+			for _, name := range names {
+				Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: name, Namespace: architectNamespace}, &corev1.Secret{}))).To(BeTrue())
+			}
+		})
+
+		It("does not error when secrets do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorSecrets(ctx)
+		})
+	})
+
+	Describe("deleteOperatorConfigMaps", func() {
+		It("deletes all operator-managed ConfigMaps", func() {
+			names := []string{clusterCABundleName, serviceCAConfigMap, combinedCABundleName, "airgap-architect-import-script"}
+			var objs []client.Object
+			for _, name := range names {
+				objs = append(objs, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: architectNamespace}})
+			}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(objs...).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorConfigMaps(ctx)
+
+			for _, name := range names {
+				Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: name, Namespace: architectNamespace}, &corev1.ConfigMap{}))).To(BeTrue())
+			}
+		})
+
+		It("does not error when ConfigMaps do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOperatorConfigMaps(ctx)
+		})
+	})
+
+	Describe("deleteOAuthClients", func() {
+		It("deletes OAuthClient resources", func() {
+			oc := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "oauth.openshift.io/v1",
+				"kind":       "OAuthClient",
+				"metadata":   map[string]interface{}{"name": "keycloak-trusted-artifact-signer"},
+			}}
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(oc).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOAuthClients(ctx)
+
+			check := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			check.SetGroupVersionKind(schema.GroupVersionKind{Group: "oauth.openshift.io", Version: "v1", Kind: "OAuthClient"})
+			Expect(apierrors.IsNotFound(r.Get(ctx, client.ObjectKey{Name: "keycloak-trusted-artifact-signer"}, check))).To(BeTrue())
+		})
+
+		It("does not error when OAuthClients do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deleteOAuthClients(ctx)
+		})
+	})
+
+	Describe("deletePipelineOSUSAccess", func() {
+		It("does not error when resources do not exist", func() {
+			r := &DisconnectedPlatformReconciler{
+				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Scheme: testScheme,
+			}
+			r.deletePipelineOSUSAccess(ctx)
+		})
+	})
+
 	Describe("reconcileRHTPAConfig", func() {
 		It("returns nil when RHTPA config is nil", func() {
 			platform := &mirrorv1.DisconnectedPlatform{

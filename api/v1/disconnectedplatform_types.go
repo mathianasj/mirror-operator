@@ -674,6 +674,37 @@ type GitOpsConfig struct {
 	Credentials *corev1.LocalObjectReference `json:"credentials,omitempty"`
 }
 
+// MirrorTuningConfig controls oc-mirror performance tuning parameters.
+// When AutoTune is enabled the operator periodically measures network throughput
+// to upstream registries and computes recommended values. User-specified fields
+// always override the auto-tuned recommendations.
+type MirrorTuningConfig struct {
+	// Enable automatic performance-based tuning. When true, the operator periodically
+	// tests network throughput and adjusts tuning values accordingly.
+	// +kubebuilder:default=true
+	// +optional
+	AutoTune bool `json:"autoTune,omitempty"`
+	// Maximum number of parallel image pulls per registry.
+	// When autoTune is enabled and this field is unset, the operator calculates
+	// an optimal value based on measured network throughput.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20
+	MaxPerRegistry *int32 `json:"maxPerRegistry,omitempty"`
+	// Number of retry attempts for failed mirror operations.
+	// When autoTune is enabled and this field is unset, the operator sets this
+	// based on observed network reliability.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	Retries *int32 `json:"retries,omitempty"`
+	// Timeout for individual registry requests (e.g. "5m", "10m").
+	// When autoTune is enabled and this field is unset, the operator calculates
+	// a timeout based on measured throughput for typical image layer sizes.
+	// +optional
+	RequestTimeout *metav1.Duration `json:"requestTimeout,omitempty"`
+}
+
 // DisconnectedPlatformSpec defines the desired state of DisconnectedPlatform
 type DisconnectedPlatformSpec struct {
 	// Platform operating mode: connected (internet access) or airgapped (disconnected)
@@ -691,6 +722,9 @@ type DisconnectedPlatformSpec struct {
 	// GitOps integration configuration
 	// +optional
 	GitOps *GitOpsConfig `json:"gitOps,omitempty"`
+	// oc-mirror performance tuning parameters for collection and import pipelines
+	// +optional
+	MirrorTuning *MirrorTuningConfig `json:"mirrorTuning,omitempty"`
 }
 
 type CollectionInfo struct {
@@ -744,6 +778,41 @@ const (
 	PlatformPhaseError      PlatformPhase = "Error"
 )
 
+// NetworkPerformanceStatus reports the results of network performance testing
+// and the effective tuning values in use for oc-mirror operations
+type NetworkPerformanceStatus struct {
+	// Measured download throughput in bytes per second
+	// +optional
+	ThroughputBytesPerSec int64 `json:"throughputBytesPerSec,omitempty"`
+	// Human-readable throughput (e.g. "12.5 MB/s")
+	// +optional
+	ThroughputHuman string `json:"throughputHuman,omitempty"`
+	// Timestamp of the last performance test
+	// +optional
+	LastTestTime *metav1.Time `json:"lastTestTime,omitempty"`
+	// Target endpoint that was tested
+	// +optional
+	TestEndpoint string `json:"testEndpoint,omitempty"`
+	// Recommended maxPerRegistry based on performance testing
+	// +optional
+	RecommendedMaxPerRegistry int32 `json:"recommendedMaxPerRegistry,omitempty"`
+	// Recommended retries based on performance testing
+	// +optional
+	RecommendedRetries int32 `json:"recommendedRetries,omitempty"`
+	// Recommended request timeout based on performance testing
+	// +optional
+	RecommendedRequestTimeout *metav1.Duration `json:"recommendedRequestTimeout,omitempty"`
+	// Effective maxPerRegistry in use (resolved from user overrides and auto-tune)
+	// +optional
+	EffectiveMaxPerRegistry int32 `json:"effectiveMaxPerRegistry,omitempty"`
+	// Effective retries in use
+	// +optional
+	EffectiveRetries int32 `json:"effectiveRetries,omitempty"`
+	// Effective request timeout in use
+	// +optional
+	EffectiveRequestTimeout *metav1.Duration `json:"effectiveRequestTimeout,omitempty"`
+}
+
 type DisconnectedPlatformStatus struct {
 	// Current phase of the platform lifecycle
 	// +optional
@@ -769,6 +838,9 @@ type DisconnectedPlatformStatus struct {
 	// RHTAS root key information for signature verification
 	// +optional
 	RHTASRootKeys *RHTASRootKeysInfo `json:"rhtasRootKeys,omitempty"`
+	// Network performance test results and effective oc-mirror tuning values
+	// +optional
+	NetworkPerformance *NetworkPerformanceStatus `json:"networkPerformance,omitempty"`
 }
 
 type RHTASRootKeysInfo struct {
