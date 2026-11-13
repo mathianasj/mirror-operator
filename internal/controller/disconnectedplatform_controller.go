@@ -9280,9 +9280,10 @@ func (r *DisconnectedPlatformReconciler) reconcileCollectionPipelineTemplate(ctx
 		{"name": "http-proxy", "type": "string", "default": "", "description": "HTTP proxy URL from cluster config"},
 		{"name": "https-proxy", "type": "string", "default": "", "description": "HTTPS proxy URL from cluster config"},
 		{"name": "no-proxy", "type": "string", "default": "", "description": "No-proxy hosts from cluster config"},
-		{"name": "mirror-max-per-registry", "type": "string", "default": "6", "description": "Maximum parallel image pulls per registry (oc-mirror --max-per-registry)"},
+		{"name": "mirror-max-per-registry", "type": "string", "default": "6", "description": "Maximum parallel image pulls (oc-mirror --parallel-images)"},
 		{"name": "mirror-retries", "type": "string", "default": "3", "description": "Number of retry attempts for failed mirror operations (oc-mirror --retry-times)"},
-		{"name": "mirror-request-timeout", "type": "string", "default": "300", "description": "Timeout in seconds for individual registry requests"},
+		{"name": "mirror-request-timeout", "type": "string", "default": "300", "description": "Timeout in seconds for mirroring an individual image (oc-mirror --image-timeout)"},
+		{"name": "mirror-parallel-layers", "type": "string", "default": "5", "description": "Number of image layers mirrored in parallel (oc-mirror --parallel-layers)"},
 	}
 
 	// Define workspaces
@@ -9435,8 +9436,10 @@ oc-mirror \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --dry-run \
   --workspace=file:///workspace/output \
-  --max-per-registry=$(params.mirror-max-per-registry) \
+  --parallel-images=$(params.mirror-max-per-registry) \
+  --parallel-layers=$(params.mirror-parallel-layers) \
   --retry-times=$(params.mirror-retries) \
+  --image-timeout=$(params.mirror-request-timeout)s \
   docker://$(params.intermediate-registry)
 `},
 					},
@@ -9484,8 +9487,10 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ $SUCCESS -eq 0 ]; do
     --authfile=/workspace/pull-secret/.dockerconfigjson \
     --cache-dir=/workspace/output/.cache \
     --workspace=file:///workspace/output/workspace-to-intermediate \
-    --max-per-registry=$(params.mirror-max-per-registry) \
+    --parallel-images=$(params.mirror-max-per-registry) \
+    --parallel-layers=$(params.mirror-parallel-layers) \
     --retry-times=$(params.mirror-retries) \
+    --image-timeout=$(params.mirror-request-timeout)s \
     docker://$(params.intermediate-registry) 2>&1 | tee "$OUTPUT_FILE" || true
 
   if grep -q "✗" "$OUTPUT_FILE"; then
@@ -10055,8 +10060,10 @@ oc-mirror \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --workspace=file:///workspace/output \
-  --max-per-registry=$(params.mirror-max-per-registry) \
-  --retry-times=$(params.mirror-retries)
+  --parallel-images=$(params.mirror-max-per-registry) \
+  --parallel-layers=$(params.mirror-parallel-layers) \
+  --retry-times=$(params.mirror-retries) \
+  --image-timeout=$(params.mirror-request-timeout)s
 `},
 					},
 				},
@@ -10358,8 +10365,10 @@ if ! oc-mirror \
   --config=/workspace/config/imageset-config.yaml \
   --authfile=/workspace/pull-secret/.dockerconfigjson \
   --cache-dir=/workspace/output/.oc-mirror/.cache \
-  --max-per-registry=$(params.mirror-max-per-registry) \
+  --parallel-images=$(params.mirror-max-per-registry) \
+  --parallel-layers=$(params.mirror-parallel-layers) \
   --retry-times=$(params.mirror-retries) \
+  --image-timeout=$(params.mirror-request-timeout)s \
   file:///workspace/output; then
 
   echo ""
