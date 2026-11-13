@@ -1035,6 +1035,41 @@ spec:
                     description: Git repository URL for storing platform configuration
                     type: string
                 type: object
+              mirrorTuning:
+                description: oc-mirror performance tuning parameters for collection
+                  and import pipelines
+                properties:
+                  autoTune:
+                    default: true
+                    description: |-
+                      Enable automatic performance-based tuning. When true, the operator periodically
+                      tests network throughput and adjusts tuning values accordingly.
+                    type: boolean
+                  maxPerRegistry:
+                    description: |-
+                      Maximum number of parallel image pulls per registry.
+                      When autoTune is enabled and this field is unset, the operator calculates
+                      an optimal value based on measured network throughput.
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                  requestTimeout:
+                    description: |-
+                      Timeout for individual registry requests (e.g. "5m", "10m").
+                      When autoTune is enabled and this field is unset, the operator calculates
+                      a timeout based on measured throughput for typical image layer sizes.
+                    type: string
+                  retries:
+                    description: |-
+                      Number of retry attempts for failed mirror operations.
+                      When autoTune is enabled and this field is unset, the operator sets this
+                      based on observed network reliability.
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                type: object
               mode:
                 allOf:
                 - enum:
@@ -1223,6 +1258,48 @@ spec:
                 - status
                 - timestamp
                 - version
+                type: object
+              networkPerformance:
+                description: Network performance test results and effective oc-mirror
+                  tuning values
+                properties:
+                  effectiveMaxPerRegistry:
+                    description: Effective maxPerRegistry in use (resolved from user
+                      overrides and auto-tune)
+                    format: int32
+                    type: integer
+                  effectiveRequestTimeout:
+                    description: Effective request timeout in use
+                    type: string
+                  effectiveRetries:
+                    description: Effective retries in use
+                    format: int32
+                    type: integer
+                  lastTestTime:
+                    description: Timestamp of the last performance test
+                    format: date-time
+                    type: string
+                  recommendedMaxPerRegistry:
+                    description: Recommended maxPerRegistry based on performance testing
+                    format: int32
+                    type: integer
+                  recommendedRequestTimeout:
+                    description: Recommended request timeout based on performance testing
+                    type: string
+                  recommendedRetries:
+                    description: Recommended retries based on performance testing
+                    format: int32
+                    type: integer
+                  testEndpoint:
+                    description: Target endpoint that was tested
+                    type: string
+                  throughputBytesPerSec:
+                    description: Measured download throughput in bytes per second
+                    format: int64
+                    type: integer
+                  throughputHuman:
+                    description: Human-readable throughput (e.g. "12.5 MB/s")
+                    type: string
                 type: object
               phase:
                 description: Current phase of the platform lifecycle

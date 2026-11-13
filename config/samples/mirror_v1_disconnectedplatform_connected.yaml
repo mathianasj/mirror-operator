@@ -33,6 +33,15 @@ spec:
         name: rhtpa
         username: rhtpa
         password: change-me
+  # oc-mirror performance tuning: auto-tune based on network throughput tests
+  # or override specific values. AutoTune runs periodic throughput checks and
+  # adjusts parallelism, retries, and timeouts for best mirror success rate.
+  mirrorTuning:
+    autoTune: true
+    # Uncomment to override auto-tuned values:
+    # maxPerRegistry: 6
+    # retries: 3
+    # requestTimeout: 5m
   architect:
     enabled: true
     # Optional: image overrides. Defaults are set from the operator's relatedImages.
