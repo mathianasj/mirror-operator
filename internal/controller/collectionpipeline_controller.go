@@ -992,6 +992,7 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 	}
 	params = append(params,
 		pipelinev1.Param{Name: "mirror-max-per-registry", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorMaxPerRegistry}},
+		pipelinev1.Param{Name: "mirror-parallel-layers", Value: pipelinev1.ParamValue{Type: "string", StringVal: "5"}},
 		pipelinev1.Param{Name: "mirror-retries", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRetries}},
 		pipelinev1.Param{Name: "mirror-request-timeout", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorRequestTimeout}},
 	)

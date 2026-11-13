@@ -14,14 +14,14 @@ import (
 )
 
 const (
-	defaultTestEndpoint     = "https://quay.io/v2/"
-	perfTestInterval        = 1 * time.Hour
-	defaultMaxPerRegistry   = int32(6)
-	defaultRetries          = int32(3)
-	defaultRequestTimeoutS  = 300
-	downloadTestMaxBytes    = 1 << 20 // 1 MiB cap for throughput probe
-	downloadTestTimeout     = 30 * time.Second
-	typicalLayerSizeMB      = 200
+	defaultTestEndpoint    = "https://quay.io/v2/"
+	perfTestInterval       = 1 * time.Hour
+	defaultMaxPerRegistry  = int32(6)
+	defaultRetries         = int32(3)
+	defaultRequestTimeoutS = 300
+	downloadTestMaxBytes   = 1 << 20 // 1 MiB cap for throughput probe
+	downloadTestTimeout    = 30 * time.Second
+	typicalLayerSizeMB     = 1024
 )
 
 // ThroughputResult holds the outcome of a single network throughput measurement.
