@@ -9998,6 +9998,16 @@ if [ -f "$ITMS_FILE" ]; then
 
   parse_yaml_mirrors "$ITMS_FILE" | awk -F'\t' '!seen[$1]++' | while IFS='	' read -r source mirror; do
     printf '\n[[registry]]\nlocation="%s"\nblocked = true\n[[registry.mirror]]\nlocation="%s"\n' "$source" "$mirror" >> "$CONF_FILE"
+    # For plain Docker Hub namespace sources (no dots = not a real registry hostname,
+    # e.g. "amazon", "mathianasj"), also add a docker.io/<namespace> prefix entry.
+    # oc-mirror normalizes "amazon/aws-cli:latest" to "docker.io/amazon/aws-cli:latest"
+    # before consulting registries.conf, so the bare "amazon" entry above is never matched.
+    # The docker.io/<namespace> entry is more specific than the broad docker.io fallback
+    # and redirects docker.io/amazon/aws-cli:latest -> mirror/aws-cli:latest (the actual
+    # flattened path where oc-mirror stored the image during mirror-to-intermediate).
+    if ! echo "$source" | grep -qE '[.]'; then
+      printf '\n[[registry]]\nlocation="docker.io/%s"\n[[registry.mirror]]\nlocation="%s"\n' "$source" "$mirror" >> "$CONF_FILE"
+    fi
   done
   echo "Added ITMS-based tag mirrors to registries.conf"
 else
