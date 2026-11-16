@@ -475,8 +475,10 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 		Kind: "DisconnectedPlatform", APIGroup: "mirror.mirror.mathianasj.github.com",
 	})
 
-	// Set Ready condition to true if no errors
-	r.setReadyCondition(platform, "ReconciliationSucceeded", "All components reconciled successfully")
+	// Set Ready condition to true only when airgapped reconciliation has no pending errors
+	if !airgappedRequeue {
+		r.setReadyCondition(platform, "ReconciliationSucceeded", "All components reconciled successfully")
+	}
 
 	// Only update status if it changed
 	if reflect.DeepEqual(*originalStatus, platform.Status) {
