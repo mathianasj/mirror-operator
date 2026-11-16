@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,7 +11,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -517,4 +521,57 @@ fi
 				"bundle SBOM signing must produce a .bundle artifact")
 		})
 	})
+})
+
+var _ = Describe("configureCollectionPipelineSigning requeue on missing Securesign URLs", func() {
+	var (
+		ctx    context.Context
+		scheme *runtime.Scheme
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		scheme = runtime.NewScheme()
+		Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
+		Expect(mirrorv1.AddToScheme(scheme)).To(Succeed())
+	})
+
+	It("returns an error when Securesign status has empty Fulcio/Rekor URLs", func() {
+		securesign := &unstructured.Unstructured{}
+		securesign.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "rhtas.redhat.com", Version: "v1alpha1", Kind: "Securesign",
+		})
+		securesign.SetName("mirror-operator-securesign")
+		securesign.SetNamespace(architectNamespace)
+		// status present but fulcio/rekor URLs absent — simulates Securesign not yet fully ready
+		Expect(unstructured.SetNestedMap(securesign.Object, map[string]interface{}{}, "status")).To(Succeed())
+
+		platform := &mirrorv1.DisconnectedPlatform{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-platform"},
+			Spec: mirrorv1.DisconnectedPlatformSpec{
+				Mode: mirrorv1.PlatformModeConnected,
+				Connected: &mirrorv1.ConnectedConfig{
+					RHTAS: &mirrorv1.RHTASInstallerConfig{
+						OIDC: &mirrorv1.RHTASOIDCConfig{
+							Managed: &mirrorv1.ManagedKeycloakConfig{Enabled: true, Realm: "mirror"},
+						},
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(platform).
+			WithStatusSubresource(platform).
+			Build()
+		// Register Securesign as an unstructured object so the fake client can store it
+		Expect(fakeClient.Create(ctx, securesign)).To(Succeed())
+
+		r := &DisconnectedPlatformReconciler{Client: fakeClient, Scheme: scheme}
+		err := r.configureCollectionPipelineSigning(ctx, platform)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Fulcio or Rekor URL not available"))
+	})
+
 })
