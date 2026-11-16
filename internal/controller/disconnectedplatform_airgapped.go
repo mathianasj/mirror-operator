@@ -2237,7 +2237,7 @@ ls -lh /workspace/bundle-data/
 						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
-set -ex
+set -e
 mkdir -p $HOME/.docker
 cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
 echo "=== Mirroring content to $(params.target-registry) ==="
@@ -2271,7 +2271,7 @@ echo "=== Mirror complete ==="
 						"image":   "$(params.mirror-image)",
 						"command": []string{"/bin/bash", "-c"},
 						"args": []string{`
-set -ex
+set -e
 mkdir -p $HOME/.docker
 cp /workspace/pull-secret/.dockerconfigjson $HOME/.docker/config.json
 

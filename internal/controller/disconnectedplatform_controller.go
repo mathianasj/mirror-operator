@@ -10911,7 +10911,7 @@ fi
 						"image":   r.SkopeoImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
-set -ex
+set -e
 echo "=== Exporting Airgap Architect images from intermediate registry ==="
 
 rm -f /workspace/output/airgap-architect-frontend.tar.gz
@@ -11359,7 +11359,7 @@ echo "=== Bundle creation complete ==="
 						"image":   "amazon/aws-cli:latest",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
-set -ex
+set -e
 echo "Uploading artifacts to S3..."
 
 # Tune S3 multipart upload — use smaller chunks and fewer concurrent
