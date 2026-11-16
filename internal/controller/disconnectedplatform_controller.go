@@ -296,7 +296,8 @@ func (r *DisconnectedPlatformReconciler) Reconcile(ctx context.Context, req ctrl
 			log.FromContext(ctx).Error(err, "failed to extract RHTAS root keys")
 		}
 		if err := r.configureCollectionPipelineSigning(ctx, platform); err != nil {
-			log.FromContext(ctx).Error(err, "failed to configure collection pipeline signing")
+			log.FromContext(ctx).Error(err, "failed to configure collection pipeline signing, requeuing")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, platform)
 		}
 
 		// Perform inline RHTAS health checks and self-healing
