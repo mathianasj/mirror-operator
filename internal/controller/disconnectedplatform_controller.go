@@ -5853,6 +5853,14 @@ func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Contex
 func (r *DisconnectedPlatformReconciler) ensureUpdateService(ctx context.Context, platform *mirrorv1.DisconnectedPlatform) error {
 	logger := log.FromContext(ctx)
 
+	// Guard: graph-data only exists in Quay after at least one collection has completed.
+	// Creating the UpdateService before graph-data is mirrored causes OSUS pods to fail
+	// on startup because the referenced graphDataImage tag does not yet exist.
+	if platform.Status.LastCollection == nil {
+		logger.V(1).Info("No completed collections yet, skipping UpdateService provisioning until graph-data is available")
+		return nil
+	}
+
 	quayRegistry := &unstructured.Unstructured{}
 	quayRegistry.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "quay.redhat.com", Version: "v1", Kind: "QuayRegistry",

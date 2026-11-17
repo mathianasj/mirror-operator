@@ -501,6 +501,8 @@ var _ = Describe("Integration CrossOp: Quay, Keycloak, Securesign", func() {
 			}
 			Expect(k8sClient.Create(ctx, platform)).To(Succeed())
 			defer cleanupPlatform(name)
+			platform.Status.LastCollection = &mirrorv1.CollectionInfo{Version: "4.14.0", Status: "Complete", Timestamp: metav1.Now()}
+			Expect(k8sClient.Status().Update(ctx, platform)).To(Succeed())
 
 			qr := newUnstructuredObj("quay.redhat.com", "v1", "QuayRegistry", "mirror-operator-quay", architectNamespace)
 			qr.Object["spec"] = map[string]interface{}{}
@@ -544,6 +546,8 @@ var _ = Describe("Integration CrossOp: Quay, Keycloak, Securesign", func() {
 			}
 			Expect(k8sClient.Create(ctx, platform)).To(Succeed())
 			defer cleanupPlatform(name)
+			platform.Status.LastCollection = &mirrorv1.CollectionInfo{Version: "4.14.0", Status: "Complete", Timestamp: metav1.Now()}
+			Expect(k8sClient.Status().Update(ctx, platform)).To(Succeed())
 
 			qr := newUnstructuredObj("quay.redhat.com", "v1", "QuayRegistry", "mirror-operator-quay", architectNamespace)
 			qr.Object["spec"] = map[string]interface{}{}
