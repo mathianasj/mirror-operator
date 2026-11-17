@@ -664,7 +664,7 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 			return fmt.Errorf("operatorgroup for %s: %w", op.name, err)
 		}
 
-		if err := r.ensureSubscription(ctx, op, cfg); err != nil {
+		if err := r.ensureSubscription(ctx, platform, op, cfg); err != nil {
 			components = append(components, mirrorv1.ComponentStatus{
 				Name: op.name, Status: "Error",
 				Kind: "Subscription", APIGroup: "operators.coreos.com", Namespace: op.ns,
@@ -756,7 +756,7 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedSubscriptions(ctx con
 		if err := r.ensureOperatorGroup(ctx, op); err != nil {
 			return true, fmt.Errorf("operatorgroup for %s: %w", op.name, err)
 		}
-		if err := r.ensureSubscription(ctx, op, nil); err != nil {
+		if err := r.ensureSubscription(ctx, platform, op, nil); err != nil {
 			return true, fmt.Errorf("subscription for %s: %w", op.name, err)
 		}
 
@@ -5596,7 +5596,7 @@ func (r *DisconnectedPlatformReconciler) ensureOperatorGroup(ctx context.Context
 	return r.Create(ctx, og)
 }
 
-func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context, op operatorDef, cfg *mirrorv1.OLMSubscriptionConfig) error {
+func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, op operatorDef, cfg *mirrorv1.OLMSubscriptionConfig) error {
 	sub := &unstructured.Unstructured{}
 	sub.SetGroupVersionKind(subscriptionGVK)
 	sub.SetName("mirror-operator-" + op.name)
@@ -5676,6 +5676,15 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 
 	if len(envSlice) > 0 {
 		unstructured.SetNestedSlice(sub.Object, envSlice, "spec", "config", "env")
+	}
+
+	// Set owner reference so the Subscription is garbage-collected when the
+	// DisconnectedPlatform CR is deleted (cluster-scoped owner → any namespace).
+	// Skip when the platform has no UID yet (e.g. unit-test stubs).
+	if platform.UID != "" {
+		if err := ctrl.SetControllerReference(platform, sub, r.Scheme); err != nil {
+			return fmt.Errorf("setting owner reference on subscription %s: %w", sub.GetName(), err)
+		}
 	}
 
 	return r.Create(ctx, sub)
