@@ -4907,6 +4907,9 @@ notifier:
 					Mode:      "connected",
 					Connected: &mirrorv1.ConnectedConfig{},
 				},
+				Status: mirrorv1.DisconnectedPlatformStatus{
+					LastCollection: &mirrorv1.CollectionInfo{Version: "4.14.0", Status: "Complete"},
+				},
 			}
 			r := &DisconnectedPlatformReconciler{
 				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(quay).Build(),
@@ -4948,6 +4951,9 @@ notifier:
 				Spec: mirrorv1.DisconnectedPlatformSpec{
 					Mode:      "connected",
 					Connected: &mirrorv1.ConnectedConfig{},
+				},
+				Status: mirrorv1.DisconnectedPlatformStatus{
+					LastCollection: &mirrorv1.CollectionInfo{Version: "4.14.0", Status: "Complete"},
 				},
 			}
 			r := &DisconnectedPlatformReconciler{
