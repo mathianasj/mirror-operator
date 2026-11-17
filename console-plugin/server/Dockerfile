@@ -6,7 +6,7 @@ WORKDIR /app
 
 COPY --chown=1001:0 package.json ./
 USER 1001
-RUN npm ci --omit=dev
+RUN npm install --omit=dev --no-audit --no-fund
 
 USER root
 COPY --chown=1001:0 . .
