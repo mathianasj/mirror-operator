@@ -3371,11 +3371,13 @@ notifier:
 			configYAML := string(secret.Data["config.yaml"])
 			Expect(configYAML).To(ContainSubstring("s3.example.com"))
 			Expect(configYAML).To(ContainSubstring("my-bucket"))
-			// Issue #138: MAXIMUM_LAYER_SIZE must be present in connected Quay config
-			// (it was already set in the airgapped config but was missing here, causing
-			// large-layer push failures on connected clusters).
+			// Issue #138: MAXIMUM_LAYER_SIZE must be present in connected Quay config.
 			Expect(configYAML).To(ContainSubstring("MAXIMUM_LAYER_SIZE"),
 				"connected Quay config bundle must include MAXIMUM_LAYER_SIZE to allow large image pushes")
+			// Issue #136: NGINX_TIMEOUT_S must match Gunicorn's 300s timeout so the
+			// blob-upload location's client_body_timeout does not default to 60s.
+			Expect(configYAML).To(ContainSubstring("NGINX_TIMEOUT_S"),
+				"connected Quay config bundle must include NGINX_TIMEOUT_S to align Nginx client_body_timeout with Gunicorn 300s")
 		})
 
 		It("updates existing config bundle secret", func() {
