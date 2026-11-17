@@ -5988,7 +5988,7 @@ func (r *DisconnectedPlatformReconciler) ensurePipelineOSUSAccess(ctx context.Co
 
 const (
 	architectPort = 4000
-	frontendPort  = 5173
+	frontendPort  = 8080
 )
 
 var (
@@ -7129,10 +7129,6 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 		},
 		"env": envVars,
 		"volumeMounts": []interface{}{
-			map[string]interface{}{
-				"name":      "data",
-				"mountPath": "/app/node_modules/.vite",
-			},
 			map[string]interface{}{
 				"name":      clusterCAVolumeName,
 				"mountPath": clusterCAMountPath,
