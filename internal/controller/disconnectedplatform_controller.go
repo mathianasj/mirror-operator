@@ -531,6 +531,7 @@ func (r *DisconnectedPlatformReconciler) cleanup(ctx context.Context, platform *
 		r.deleteOperatorSecrets(ctx)
 		r.deleteOperatorConfigMaps(ctx)
 		r.deleteSubscriptions(ctx)
+		r.deleteCSVs(ctx)
 		r.deleteOperatorGroups(ctx)
 		r.deleteAirgappedACM(ctx)
 		r.deleteAirgappedResources(ctx)
@@ -1301,13 +1302,53 @@ func (r *DisconnectedPlatformReconciler) deleteRHTPAConfig(ctx context.Context) 
 
 func (r *DisconnectedPlatformReconciler) deleteSubscriptions(ctx context.Context) {
 	logger := log.FromContext(ctx)
-	for _, op := range defaultOperators {
+	for _, op := range append(defaultOperators, airgappedOperators...) {
 		sub := &unstructured.Unstructured{}
 		sub.SetGroupVersionKind(subscriptionGVK)
 		sub.SetName("mirror-operator-" + op.name)
 		sub.SetNamespace(op.ns)
 		if err := r.Delete(ctx, sub); err != nil && !apierrors.IsNotFound(err) {
 			logger.Error(err, "failed to delete Subscription", "name", "mirror-operator-"+op.name)
+		}
+	}
+}
+
+// deleteCSVs removes ClusterServiceVersions for all managed operators (connected and
+// airgapped). OLM does not cascade-delete CSVs when their Subscription is removed, so
+// explicit cleanup is required on DisconnectedPlatform teardown.
+func (r *DisconnectedPlatformReconciler) deleteCSVs(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	allOps := append(defaultOperators, airgappedOperators...)
+
+	// Collect the unique namespaces we need to scan.
+	namespaceSeen := map[string]bool{}
+	for _, op := range allOps {
+		namespaceSeen[op.ns] = true
+	}
+
+	for ns := range namespaceSeen {
+		csvList := &unstructured.UnstructuredList{}
+		csvList.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   csvGVK.Group,
+			Version: csvGVK.Version,
+			Kind:    csvGVK.Kind + "List",
+		})
+		if err := r.List(ctx, csvList, client.InNamespace(ns)); err != nil {
+			if !apierrors.IsNotFound(err) && !isCRDNotFoundError(err) {
+				logger.Error(err, "failed to list CSVs for cleanup", "namespace", ns)
+			}
+			continue
+		}
+		for i := range csvList.Items {
+			csv := &csvList.Items[i]
+			for _, op := range allOps {
+				if strings.HasPrefix(csv.GetName(), op.pkg+".") {
+					if err := r.Delete(ctx, csv); err != nil && !apierrors.IsNotFound(err) {
+						logger.Error(err, "failed to delete CSV", "name", csv.GetName(), "namespace", ns)
+					}
+					break
+				}
+			}
 		}
 	}
 }
