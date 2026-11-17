@@ -271,6 +271,11 @@ type ManagedQuayConfig struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
+	// Override the Quay component image by setting RELATED_IMAGE_COMPONENT_QUAY
+	// on the Quay operator Subscription. Useful in airgapped environments where
+	// a specific Quay image must be used instead of the bundle default.
+	// +optional
+	ComponentQuayImage string `json:"componentQuayImage,omitempty"`
 }
 
 type ClairConfig struct {
@@ -416,6 +421,11 @@ type AirgappedQuayConfig struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
+	// Override the Quay component image by setting RELATED_IMAGE_COMPONENT_QUAY
+	// on the Quay operator Subscription. Useful in airgapped environments where
+	// a specific Quay image must be used instead of the bundle default.
+	// +optional
+	ComponentQuayImage string `json:"componentQuayImage,omitempty"`
 }
 
 type AirgappedQuayStorageConfig struct {

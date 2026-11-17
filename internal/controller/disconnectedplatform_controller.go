@@ -693,7 +693,62 @@ func (r *DisconnectedPlatformReconciler) reconcileSubscriptions(ctx context.Cont
 	}
 
 	platform.Status.Components = components
+
+	// Reconcile RELATED_IMAGE_COMPONENT_QUAY if a custom Quay image is configured.
+	if platform.Spec.Connected != nil &&
+		platform.Spec.Connected.Quay != nil &&
+		platform.Spec.Connected.Quay.Managed != nil &&
+		platform.Spec.Connected.Quay.Managed.ComponentQuayImage != "" {
+		if err := r.reconcileQuayComponentImage(ctx, platform.Spec.Connected.Quay.Managed.ComponentQuayImage); err != nil {
+			log.FromContext(ctx).Error(err, "failed to reconcile RELATED_IMAGE_COMPONENT_QUAY")
+		}
+	}
+
 	return nil
+}
+
+// reconcileQuayComponentImage sets or updates RELATED_IMAGE_COMPONENT_QUAY on the
+// Quay operator Subscription so OLM uses the specified Quay image instead of the
+// bundle default. This is a no-op when the Subscription does not exist yet.
+func (r *DisconnectedPlatformReconciler) reconcileQuayComponentImage(ctx context.Context, image string) error {
+	sub := &unstructured.Unstructured{}
+	sub.SetGroupVersionKind(subscriptionGVK)
+	sub.SetName("mirror-operator-quay-operator")
+	sub.SetNamespace("openshift-operators")
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sub), sub); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	envs, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "env")
+
+	// No-op if the value already matches.
+	for _, e := range envs {
+		em, ok := e.(map[string]interface{})
+		if ok && em["name"] == "RELATED_IMAGE_COMPONENT_QUAY" && em["value"] == image {
+			return nil
+		}
+	}
+
+	// Replace or append RELATED_IMAGE_COMPONENT_QUAY, keeping other env vars.
+	var newEnvs []interface{}
+	for _, e := range envs {
+		em, ok := e.(map[string]interface{})
+		if ok && em["name"] == "RELATED_IMAGE_COMPONENT_QUAY" {
+			continue
+		}
+		newEnvs = append(newEnvs, e)
+	}
+	newEnvs = append(newEnvs, map[string]interface{}{
+		"name":  "RELATED_IMAGE_COMPONENT_QUAY",
+		"value": image,
+	})
+
+	if err := unstructured.SetNestedSlice(sub.Object, newEnvs, "spec", "config", "env"); err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("Setting RELATED_IMAGE_COMPONENT_QUAY on Quay subscription", "image", image)
+	return r.Update(ctx, sub)
 }
 
 var airgappedOperators = []operatorDef{
