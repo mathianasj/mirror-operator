@@ -5562,7 +5562,11 @@ func (r *DisconnectedPlatformReconciler) ensureSubscription(ctx context.Context,
 	sub.SetNamespace(op.ns)
 
 	if err := r.Get(ctx, client.ObjectKeyFromObject(sub), sub); err == nil {
-		return r.ensureSubscriptionCABundle(ctx, sub)
+		if err := r.ensureSubscriptionCABundle(ctx, sub); err != nil {
+			return err
+		}
+		httpProxy, httpsProxy, noProxy := r.getClusterProxy(ctx)
+		return r.reconcileSubscriptionProxy(ctx, sub, httpProxy, httpsProxy, noProxy)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -5675,6 +5679,60 @@ func (r *DisconnectedPlatformReconciler) ensureSubscriptionCABundle(ctx context.
 	})
 	unstructured.SetNestedSlice(sub.Object, mounts, "spec", "config", "volumeMounts")
 
+	return r.Update(ctx, sub)
+}
+
+// reconcileSubscriptionProxy ensures the proxy env vars on an existing Subscription
+// match the current cluster proxy configuration. It replaces stale values and removes
+// vars that are no longer needed, making a single Update call only when changes are
+// required.
+func (r *DisconnectedPlatformReconciler) reconcileSubscriptionProxy(ctx context.Context, sub *unstructured.Unstructured, httpProxy, httpsProxy, noProxy string) error {
+	desired := proxyEnvForSubscription(httpProxy, httpsProxy, noProxy)
+
+	current, _, _ := unstructured.NestedSlice(sub.Object, "spec", "config", "env")
+
+	// Split current envs into proxy and non-proxy entries.
+	var nonProxy []interface{}
+	var currentProxy []interface{}
+	for _, e := range current {
+		em, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := em["name"].(string)
+		if name == "HTTP_PROXY" || name == "HTTPS_PROXY" || name == "NO_PROXY" {
+			currentProxy = append(currentProxy, e)
+		} else {
+			nonProxy = append(nonProxy, e)
+		}
+	}
+
+	// Check whether the proxy section already matches desired state.
+	if len(currentProxy) == len(desired) {
+		match := true
+		for i, d := range desired {
+			dm := map[string]interface{}{"name": d["name"], "value": d["value"]}
+			cm, ok := currentProxy[i].(map[string]interface{})
+			if !ok || cm["name"] != dm["name"] || cm["value"] != dm["value"] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return nil
+		}
+	}
+
+	// Rebuild env list with desired proxy vars appended after non-proxy vars.
+	newEnvs := nonProxy
+	for _, pe := range desired {
+		newEnvs = append(newEnvs, pe)
+	}
+
+	if err := unstructured.SetNestedSlice(sub.Object, newEnvs, "spec", "config", "env"); err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("Reconciling proxy env vars on subscription", "name", sub.GetName(), "namespace", sub.GetNamespace())
 	return r.Update(ctx, sub)
 }
 
