@@ -80,11 +80,12 @@ jobs:
     needs: test
     if: github.event_name == 'push' || inputs.version != ''
     runs-on: ubuntu-latest
+    continue-on-error: true  # Containerfile downloads oc tools from mirror.openshift.com; allow transient failures
     strategy:
       matrix:
         component:
           - name: frontend
-            context: frontend
+            context: .
             containerfile: frontend/Containerfile
             image: quay.io/mathianasj/openshift-airgap-architect-frontend
           - name: backend
