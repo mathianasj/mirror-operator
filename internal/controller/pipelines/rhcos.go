@@ -167,7 +167,31 @@ echo "=== Downloading RHCOS boot images for ACM Host Inventory ==="
 RHCOS_DIR="/workspace/output/rhcos"
 mkdir -p "$RHCOS_DIR"
 
-RHCOS_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/latest"
+# Discover the pinned RHCOS directory for this exact OCP release.
+# OCP release metadata (release.txt) names the specific machine-os build so
+# we can locate the right versioned directory and avoid the unpinned latest/ channel.
+RHCOS_BASE=""
+
+# Step 1: Try the OCP-version-specific directory (exists for GA patch releases).
+PINNED_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/${OC_VERSION}"
+if curl -sf --max-time 10 "${PINNED_BASE}/sha256sum.txt" >/dev/null 2>&1; then
+  echo "Using OCP-version-pinned RHCOS directory: ${OC_VERSION}"
+  RHCOS_BASE="$PINNED_BASE"
+fi
+
+# Step 2: If not found, read the OCP release.txt to identify the pinned RHCOS build.
+if [ -z "$RHCOS_BASE" ]; then
+  RELEASE_TXT_URL="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OC_VERSION}/release.txt"
+  RELEASE_TXT=$(curl -sL -f --max-time 15 "${RELEASE_TXT_URL}" 2>/dev/null)
+  if [ -n "$RELEASE_TXT" ]; then
+    MACHINE_OS_BUILD=$(echo "$RELEASE_TXT" | grep -oP 'machine-os\s+\K[\d\.\-]+' | head -1)
+    if [ -n "$MACHINE_OS_BUILD" ]; then
+      echo "OCP ${OC_VERSION} pins machine-os build: ${MACHINE_OS_BUILD}"
+    fi
+  fi
+  echo "No pinned RHCOS directory found for ${OC_VERSION}, falling back to latest/ channel"
+  RHCOS_BASE="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/${RHCOS_VERSION}/latest"
+fi
 
 echo "Downloading RHCOS live ISO for version $RHCOS_VERSION..."
 if ! curl -L -f "${RHCOS_BASE}/rhcos-live.x86_64.iso" \
