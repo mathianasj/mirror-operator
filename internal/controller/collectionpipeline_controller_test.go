@@ -2416,6 +2416,10 @@ mirror:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(job.Spec.Template.Spec.Containers[0].Args[0]).To(ContainSubstring("test-bucket"))
+			// Issue #141: image must include docker.io/ prefix so the airgapped mirror
+			// path (docker.io/amazon/aws-cli) matches what the pipeline task references.
+			Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal("docker.io/amazon/aws-cli:latest"),
+				"s3-cleanup Job image must use fully-qualified docker.io/amazon/aws-cli:latest reference")
 		})
 
 		It("skips when no OBC config exists", func() {
