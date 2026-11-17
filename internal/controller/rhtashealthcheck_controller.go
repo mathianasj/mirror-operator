@@ -72,7 +72,7 @@ func (r *RHTASHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Health Check 4: Email verified claim validation
 	if err := r.validateEmailVerifiedClaim(ctx); err != nil {
 		logger.Error(err, "Email verified claim validation failed")
-		healthIssues = append(healthIssues, "OIDC token missing email_verified claim or claim is false")
+		healthIssues = append(healthIssues, fmt.Sprintf("OIDC health check failed: %v", err))
 	}
 
 	// Update Securesign status with health check results instead of DisconnectedPlatform
