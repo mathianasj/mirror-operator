@@ -5,6 +5,11 @@
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
 VERSION ?= 0.1.8
 
+# ARCHITECT_REF pins the openshift-airgap-architect branch/tag/SHA to build
+# frontend and backend images from. Update when merging to upstream.
+ARCHITECT_REF ?= feature/mirror-operator-integration
+ARCHITECT_REPO ?= https://github.com/mathianasj/openshift-airgap-architect.git
+
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
 # To re-generate a bundle for other specific channels without changing the standard setup, you can:
@@ -111,6 +116,11 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(MAKE) sync-crds
+
+.PHONY: sync-crds
+sync-crds: ## Sync CRD YAMLs from config/crd/bases into config/scripts/bundledCrds for bundle embedding.
+	cp config/crd/bases/*.yaml config/scripts/bundledCrds/
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.

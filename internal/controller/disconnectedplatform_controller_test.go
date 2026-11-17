@@ -2391,16 +2391,20 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 	Describe("consolePluginDeployment", func() {
 		It("creates a console plugin Deployment with correct container name", func() {
 			labels := architectComponentLabels("plugin")
-			dep := consolePluginDeployment("test-plugin", "quay.io/test/plugin:v1", 1, labels, "pull-secret", "openshift-config")
+			dep := consolePluginDeployment("test-plugin", "quay.io/test/plugin:v1", "quay.io/test/plugin-backend:v1", 1, labels, "pull-secret", "openshift-config")
 
 			Expect(dep.GetName()).To(Equal("test-plugin"))
 			Expect(dep.GetNamespace()).To(Equal(architectNamespace))
 
 			containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
-			Expect(containers).To(HaveLen(1))
+			// Two containers: nginx (plugin) + Express backend sidecar (plugin-backend)
+			Expect(containers).To(HaveLen(2))
 			container := containers[0].(map[string]interface{})
 			Expect(container["name"]).To(Equal("plugin"))
 			Expect(container["image"]).To(Equal("quay.io/test/plugin:v1"))
+			sidecar := containers[1].(map[string]interface{})
+			Expect(sidecar["name"]).To(Equal("plugin-backend"))
+			Expect(sidecar["image"]).To(Equal("quay.io/test/plugin-backend:v1"))
 		})
 	})
 
@@ -7313,7 +7317,7 @@ notifier:
 
 	Describe("consolePluginContainer", func() {
 		It("returns container with correct structure", func() {
-			container := consolePluginContainer("plugin", "quay.io/test/plugin:v1", map[string]string{"app": "plugin"})
+			container := consolePluginContainer("plugin", "quay.io/test/plugin:v1", "quay.io/test/plugin-backend:v1", map[string]string{"app": "plugin"})
 			Expect(container["name"]).To(Equal("plugin"))
 			Expect(container["image"]).To(Equal("quay.io/test/plugin:v1"))
 			ports := container["ports"].([]interface{})
@@ -7333,7 +7337,7 @@ notifier:
 				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
 				Scheme: testScheme,
 			}
-			err := r.ensureConsolePlugin(ctx, platform, "airgap-architect-plugin", "quay.io/test/plugin:v1", 1, labels, "pull-secret", "openshift-config")
+			err := r.ensureConsolePlugin(ctx, platform, "airgap-architect-plugin", "quay.io/test/plugin:v1", "quay.io/test/plugin-backend:v1", 1, labels, "pull-secret", "openshift-config")
 			Expect(err).NotTo(HaveOccurred())
 
 			dep := &unstructured.Unstructured{}

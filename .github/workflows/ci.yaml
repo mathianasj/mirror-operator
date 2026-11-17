@@ -76,6 +76,135 @@ jobs:
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             VERSION=${{ inputs.version || (github.ref_type == 'tag' && github.ref_name) || 'latest' }}
 
+  build-and-push-architect-images:
+    needs: test
+    if: github.event_name == 'push' || inputs.version != ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component:
+          - name: frontend
+            context: frontend
+            containerfile: frontend/Containerfile
+            image: quay.io/mathianasj/openshift-airgap-architect-frontend
+          - name: backend
+            context: .
+            containerfile: backend/Containerfile
+            image: quay.io/mathianasj/openshift-airgap-architect-backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || '' }}
+
+      - name: Read pinned architect ref and repo from Makefile
+        id: arch-ref
+        run: |
+          REF=$(grep '^ARCHITECT_REF' Makefile | awk '{print $3}')
+          REPO=$(grep '^ARCHITECT_REPO' Makefile | awk '{print $3}')
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone architect repo at pinned ref
+        run: |
+          git clone --depth 1 --branch ${{ steps.arch-ref.outputs.ref }} \
+            ${{ steps.arch-ref.outputs.repo }} architect-src
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Set image tags
+        id: tags
+        run: |
+          REPO=${{ matrix.component.image }}
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "tags=${REPO}:${{ inputs.version }},${REPO}:latest" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tags=${REPO}:${{ github.ref_name }},${REPO}:latest" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "tags=${REPO}:latest,${REPO}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: architect-src/${{ matrix.component.context }}
+          file: architect-src/${{ matrix.component.containerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            APP_GIT_SHA=${{ github.sha }}
+
+  build-and-push-console-plugin:
+    needs: test
+    if: github.event_name == 'push' || inputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || '' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: console-plugin/package-lock.json
+
+      - name: Build plugin dist
+        working-directory: console-plugin
+        run: npm ci && npm run build
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Set image tags
+        id: plugin-tags
+        run: |
+          TAG_SUFFIX=""
+          if [[ -n "${{ inputs.version }}" ]]; then
+            TAG_SUFFIX="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG_SUFFIX="${{ github.ref_name }}"
+          else
+            TAG_SUFFIX="sha-$(echo "${{ github.sha }}" | cut -c1-7)"
+          fi
+          NGINX_REPO=quay.io/mathianasj/openshift-airgap-architect-console-plugin
+          BACKEND_REPO=quay.io/mathianasj/openshift-airgap-architect-console-plugin-backend
+          echo "nginx_tags=${NGINX_REPO}:${TAG_SUFFIX},${NGINX_REPO}:latest" >> "$GITHUB_OUTPUT"
+          echo "backend_tags=${BACKEND_REPO}:${TAG_SUFFIX},${BACKEND_REPO}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push nginx (static dist) image
+        uses: docker/build-push-action@v6
+        with:
+          context: console-plugin
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.plugin-tags.outputs.nginx_tags }}
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+
+      - name: Build and push backend (Express API) sidecar image
+        uses: docker/build-push-action@v6
+        with:
+          context: console-plugin/server
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.plugin-tags.outputs.backend_tags }}
+
   bundle-and-catalog:
     needs: build-and-push
     if: github.event_name == 'push' || inputs.version != ''

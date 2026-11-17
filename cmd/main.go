@@ -103,6 +103,10 @@ func main() {
 	flag.StringVar(&architectConsolePluginImage, "architect-console-plugin-image",
 		envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN", "quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest"),
 		"airgap-architect OpenShift console plugin container image")
+	var architectConsolePluginBackendImage string
+	flag.StringVar(&architectConsolePluginBackendImage, "architect-console-plugin-backend-image",
+		envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN_BACKEND", "quay.io/mathianasj/openshift-airgap-architect-console-plugin-backend:latest"),
+		"airgap-architect console plugin Express backend sidecar image")
 	var skopeoImage string
 	var ubi9Image string
 	var ubi9MinimalImage string
@@ -214,18 +218,19 @@ func main() {
 	}
 
 	if err = (&controller.DisconnectedPlatformReconciler{
-		Client:                      mgr.GetClient(),
-		Scheme:                      mgr.GetScheme(),
-		MirrorImage:                 mirrorImage,
-		ArchitectFrontendImage:      architectFrontendImage,
-		ArchitectBackendImage:       architectBackendImage,
-		ArchitectConsolePluginImage: architectConsolePluginImage,
-		SkopeoImage:                 skopeoImage,
-		UBI9Image:                   ubi9Image,
-		UBI9MinimalImage:            ubi9MinimalImage,
-		ClientSet:                   clientSet,
-		RESTConfig:                  mgr.GetConfig(),
-		TektonAvailable:             tektonAvailable,
+		Client:                             mgr.GetClient(),
+		Scheme:                             mgr.GetScheme(),
+		MirrorImage:                        mirrorImage,
+		ArchitectFrontendImage:             architectFrontendImage,
+		ArchitectBackendImage:              architectBackendImage,
+		ArchitectConsolePluginImage:        architectConsolePluginImage,
+		ArchitectConsolePluginBackendImage: architectConsolePluginBackendImage,
+		SkopeoImage:                        skopeoImage,
+		UBI9Image:                          ubi9Image,
+		UBI9MinimalImage:                   ubi9MinimalImage,
+		ClientSet:                          clientSet,
+		RESTConfig:                         mgr.GetConfig(),
+		TektonAvailable:                    tektonAvailable,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DisconnectedPlatform")
 		os.Exit(1)

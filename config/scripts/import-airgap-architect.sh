@@ -1958,6 +1958,206 @@ push_mirror_registry_images() {
     return 0
 }
 
+setup_bootstrap_manifests() {
+    # Populate ${SCRIPT_DIR}/bootstrap-manifests/ with the YAML files that
+    # the airgap architect backend injects into the agent ISO's openshift/
+    # directory when the user clicks "Generate Agent ISO".
+    #
+    # Only runs when MIRROR_REGISTRY_CONFIG is set (mirror bundle loaded).
+    local config_file="${DATA_DIR}/data/mirror-registry-config-container.json"
+    if [ ! -f "${config_file}" ]; then
+        log "MIRROR_REGISTRY_CONFIG not set, skipping bootstrap manifest generation"
+        return 0
+    fi
+
+    log "=== Generating bootstrap manifests for operator injection ==="
+    local manifest_dir="${SCRIPT_DIR}/bootstrap-manifests"
+    mkdir -p "${manifest_dir}"
+
+    # --- Step 1: Collect runtime values ---
+    local registry_fqdn="${MIRROR_REGISTRY_HOSTNAME}:${MIRROR_REGISTRY_PORT}"
+
+    # Get OCP minor version from the architect backend (already running)
+    local ocp_minor=""
+    if command -v python3 >/dev/null 2>&1; then
+        ocp_minor=$(curl -sf http://localhost:4000/api/state 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('blueprint',{}).get('selectedMinor',''))" 2>/dev/null || true)
+    fi
+    if [ -z "${ocp_minor}" ] && [ -f "${SCRIPT_DIR}/imageset-config.yaml" ]; then
+        ocp_minor=$(grep -oP 'minVersion:\s*\K[0-9]+\.[0-9]+' "${SCRIPT_DIR}/imageset-config.yaml" 2>/dev/null | head -1 || true)
+    fi
+    log "Registry FQDN: ${registry_fqdn}"
+    log "OCP minor:     ${ocp_minor:-<not detected>}"
+
+    # CA cert content (for mirror registry trust ConfigMap)
+    local ca_cert_path
+    ca_cert_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('caCertPath',''))" 2>/dev/null || true)
+
+    # IDMS/ITMS/CatalogSource paths from mirror-registry-config
+    local idms_path itms_path catalog_paths
+    idms_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('idmsPath',''))" 2>/dev/null || true)
+    itms_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('itmsPath',''))" 2>/dev/null || true)
+    catalog_paths=$(python3 -c "import sys,json; print('\n'.join(json.load(open('${config_file}')).get('catalogSourcePaths',[])))" 2>/dev/null || true)
+
+    # --- Step 2: Copy CRD YAMLs from bundledCrds/ ---
+    if [ -d "${SCRIPT_DIR}/bundledCrds" ]; then
+        for f in "${SCRIPT_DIR}/bundledCrds"/*.yaml; do
+            [ -f "$f" ] && cp "$f" "${manifest_dir}/"
+        done
+        log "Copied $(ls "${manifest_dir}"/00-crd-*.yaml 2>/dev/null | wc -l) CRD files"
+    else
+        log "WARNING: bundledCrds/ not found in bundle — CRDs will not be injected"
+    fi
+
+    # --- Step 3: Static manifests (no substitutions) ---
+    cat > "${manifest_dir}/01-operatorhub-disable-defaults.yaml" <<'YAML'
+apiVersion: config.openshift.io/v1
+kind: OperatorHub
+metadata:
+  name: cluster
+spec:
+  disableAllDefaultSources: true
+YAML
+
+    cat > "${manifest_dir}/01-mirror-operator-namespace.yaml" <<'YAML'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mirror-operator-system
+YAML
+
+    cat > "${manifest_dir}/02-mirror-operator-operatorgroup.yaml" <<'YAML'
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: mirror-operator-group
+  namespace: mirror-operator-system
+spec:
+  targetNamespaces:
+    - mirror-operator-system
+YAML
+
+    cat > "${manifest_dir}/99-mirror-operator-subscription.yaml" <<'YAML'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: mirror-operator
+  namespace: mirror-operator-system
+spec:
+  channel: alpha
+  installPlanApproval: Automatic
+  name: mirror-operator
+  source: community-operators
+  sourceNamespace: openshift-marketplace
+YAML
+
+    # --- Step 4: Runtime-templated manifests ---
+    cat > "${manifest_dir}/99-mirror-operator-catalogsource.yaml" <<YAML
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: mirror-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: ${registry_fqdn}/mirror/mirror-operator-catalog:latest
+  displayName: Mirror Operator
+  publisher: Silvermatic
+  updateStrategy:
+    registryPoll:
+      interval: 30m
+YAML
+
+    cat > "${manifest_dir}/99-disconnectedplatform.yaml" <<YAML
+apiVersion: mirror.mirror.mathianasj.github.com/v1
+kind: DisconnectedPlatform
+metadata:
+  name: disconnected-platform-airgapped
+  labels:
+    app.kubernetes.io/name: mirror-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  mode: airgapped
+  airgapped:
+    managementCluster: true
+    bootstrapEnabled: true
+    importPath: /mnt/physical-media
+    importScanSchedule: '*/30 * * * *'
+    mirrorRegistry: ${registry_fqdn}
+    quay:
+      enabled: true
+      organizationName: mirror
+      storage:
+        size: 500Gi
+    rhtas:
+      trustedRootKeys:
+        name: rhtas-trusted-root
+    acm:
+      enabled: true
+      hostInventory:
+        enabled: true
+        ${ocp_minor:+versions:
+        - openshiftVersion: "${ocp_minor}"
+        rhcosImage: "${registry_fqdn}/mirror/rhcos-server:${ocp_minor}"}
+  architect:
+    consolePlugin:
+      enabled: true
+      image: quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest
+YAML
+
+    # --- Step 5: Dynamic files from mirror registry config ---
+    if [ -f "${idms_path}" ]; then
+        cp "${idms_path}" "${manifest_dir}/99-idms.yaml"
+        log "Wrote 99-idms.yaml from ${idms_path}"
+    fi
+    if [ -f "${itms_path}" ]; then
+        cp "${itms_path}" "${manifest_dir}/99-itms.yaml"
+        log "Wrote 99-itms.yaml from ${itms_path}"
+    fi
+
+    # CatalogSource files with name remapping
+    if [ -n "${catalog_paths}" ]; then
+        while IFS= read -r cs_file; do
+            [ -z "${cs_file}" ] || [ ! -f "${cs_file}" ] && continue
+            local cs_base
+            cs_base=$(basename "${cs_file}")
+            local dest_name="${cs_base}"
+            # Apply CATALOG_NAME_MAP renaming
+            for orig in "redhat-operator-index" "certified-operator-index" "community-operator-index" "redhat-marketplace-index"; do
+                case "${cs_base}" in
+                    *redhat-operator-index*)   dest_name="99-redhat-operators.yaml" ;;
+                    *certified-operator-index*) dest_name="99-certified-operators.yaml" ;;
+                    *community-operator-index*) dest_name="99-community-operators.yaml" ;;
+                    *redhat-marketplace-index*) dest_name="99-redhat-marketplace.yaml" ;;
+                esac
+            done
+            [[ "${dest_name}" != 99-* ]] && dest_name="99-${dest_name}"
+            cp "${cs_file}" "${manifest_dir}/${dest_name}"
+            log "Wrote ${dest_name} (renamed from ${cs_base})"
+        done <<< "${catalog_paths}"
+    fi
+
+    # CA cert ConfigMap for operator pod trust
+    if [ -f "${ca_cert_path}" ]; then
+        local ca_content
+        ca_content=$(cat "${ca_cert_path}")
+        cat > "${manifest_dir}/99-mirror-registry-ca.yaml" <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mirror-registry-ca
+  namespace: openshift-config
+data:
+  ca-bundle.crt: |
+$(echo "${ca_content}" | sed 's/^/    /')
+YAML
+        log "Wrote 99-mirror-registry-ca.yaml"
+    fi
+
+    log "Bootstrap manifests written to ${manifest_dir}:"
+    ls -1 "${manifest_dir}/" | while read -r f; do log "  ${f}"; done
+}
+
 start_containers() {
     log "Starting Airgap Architect containers..."
 
@@ -2052,6 +2252,7 @@ start_containers() {
         -e IMAGESET_CONFIG=/data/imageset-config.yaml \
         -e IDMS_PATH=/data/data/imageDigestMirrorSet.yaml \
         -e ITMS_PATH=/data/data/imageTagMirrorSet.yaml \
+        -e BOOTSTRAP_MANIFESTS_DIR=/data/bootstrap-manifests \
         -e MOCK_MODE="${MOCK_MODE:-false}" \
         -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
         -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
@@ -2064,6 +2265,9 @@ start_containers() {
 
     log "Waiting for backend to be ready..."
     sleep 2
+
+    # Populate bootstrap-manifests/ so the architect can inject them into agent ISOs
+    setup_bootstrap_manifests
 
     log "Starting frontend container..."
     podman run -d \

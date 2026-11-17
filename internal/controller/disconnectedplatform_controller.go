@@ -114,17 +114,18 @@ var (
 
 type DisconnectedPlatformReconciler struct {
 	client.Client
-	Scheme                      *runtime.Scheme
-	MirrorImage                 string
-	ArchitectFrontendImage      string
-	ArchitectBackendImage       string
-	ArchitectConsolePluginImage string
-	SkopeoImage                 string
-	UBI9Image                   string
-	UBI9MinimalImage            string
-	ClientSet                   kubernetes.Interface
-	RESTConfig                  *rest.Config
-	TektonAvailable             bool
+	Scheme                             *runtime.Scheme
+	MirrorImage                        string
+	ArchitectFrontendImage             string
+	ArchitectBackendImage              string
+	ArchitectConsolePluginImage        string
+	ArchitectConsolePluginBackendImage string
+	SkopeoImage                        string
+	UBI9Image                          string
+	UBI9MinimalImage                   string
+	ClientSet                          kubernetes.Interface
+	RESTConfig                         *rest.Config
+	TektonAvailable                    bool
 }
 
 // +kubebuilder:rbac:groups=mirror.mirror.mathianasj.github.com,resources=disconnectedplatforms,verbs=get;list;watch;create;update;patch;delete
@@ -6950,9 +6951,14 @@ func (r *DisconnectedPlatformReconciler) reconcileArchitect(ctx context.Context,
 			consolePluginImage = envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN",
 				"quay.io/mathianasj/openshift-airgap-architect-console-plugin:latest")
 		}
+		consolePluginBackendImage := r.ArchitectConsolePluginBackendImage
+		if consolePluginBackendImage == "" {
+			consolePluginBackendImage = envOrDefault("RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN_BACKEND",
+				"quay.io/mathianasj/openshift-airgap-architect-console-plugin-backend:latest")
+		}
 		pluginName := "airgap-architect-plugin"
 		pluginLabels := architectComponentLabels("console-plugin")
-		if err := r.ensureConsolePlugin(ctx, platform, pluginName, consolePluginImage, replicas, pluginLabels, pullSecretName, pullSecretNamespace); err != nil {
+		if err := r.ensureConsolePlugin(ctx, platform, pluginName, consolePluginImage, consolePluginBackendImage, replicas, pluginLabels, pullSecretName, pullSecretNamespace); err != nil {
 			return err
 		}
 		if err := r.ensureArchitectService(ctx, platform, pluginName, int32(9001), pluginLabels); err != nil {
@@ -7328,36 +7334,49 @@ func frontendContainer(name, image string, labels map[string]string, backendRout
 
 // Console Plugin
 
-func (r *DisconnectedPlatformReconciler) ensureConsolePlugin(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) error {
+func (r *DisconnectedPlatformReconciler) ensureConsolePlugin(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name, image, backendImage string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) error {
 	dep := &unstructured.Unstructured{}
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
 	dep.SetNamespace(architectNamespace)
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
 		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(name, image string, labels map[string]string) map[string]interface{} {
-			return consolePluginContainer(name, image, labels)
+			return consolePluginContainer(name, image, backendImage, labels)
 		})
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	newDep := consolePluginDeployment(name, image, replicas, labels, pullSecretName, pullSecretNamespace)
+	newDep := consolePluginDeployment(name, image, backendImage, replicas, labels, pullSecretName, pullSecretNamespace)
 	setOwnerReference(newDep, platform)
 	return r.Create(ctx, newDep)
 }
 
-func consolePluginDeployment(name, image string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
+func consolePluginDeployment(name, image, backendImage string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
 	dep := &unstructured.Unstructured{}
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
 	dep.SetNamespace(architectNamespace)
 	dep.SetLabels(labels)
 	dep.Object["spec"] = architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(name, image string, labels map[string]string) map[string]interface{} {
-		return consolePluginContainer(name, image, labels)
+		return consolePluginContainer(name, image, backendImage, labels)
 	})
+	// Inject the Express backend sidecar into the pod's containers list.
+	if containers, ok, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers"); ok {
+		containers = append(containers, consolePluginBackendSidecar(backendImage))
+		_ = unstructured.SetNestedSlice(dep.Object, containers, "spec", "template", "spec", "containers")
+	}
 	return dep
 }
 
-func consolePluginContainer(name, image string, labels map[string]string) map[string]interface{} {
+// consolePluginContainer returns the FIRST container (nginx) for the console
+// plugin pod. The architectDeploymentSpec wraps it in containers:[...].
+// The sidecar Express backend is injected by patching the pod spec after
+// architectDeploymentSpec returns — see consolePluginDeployment.
+//
+// NOTE: backendImage is accepted here so callers that use the containerBuilder
+// callback (updateArchitectDeployment) can patch the existing containers list
+// with the sidecar via consolePluginDeployment's post-process step.
+func consolePluginContainer(name, image, backendImage string, labels map[string]string) map[string]interface{} {
 	return map[string]interface{}{
 		"name":            "plugin",
 		"image":           image,
@@ -7409,6 +7428,65 @@ func consolePluginContainer(name, image string, labels map[string]string) map[st
 			"failureThreshold":    int64(3),
 			"successThreshold":    int64(1),
 			"timeoutSeconds":      int64(1),
+		},
+	}
+}
+
+// consolePluginBackendSidecar returns the Express API sidecar container that
+// handles /api/* routes proxied from the nginx container on 127.0.0.1:4001.
+func consolePluginBackendSidecar(image string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":            "plugin-backend",
+		"image":           image,
+		"imagePullPolicy": "Always",
+		"ports": []interface{}{
+			map[string]interface{}{
+				"containerPort": int64(4001),
+				"name":          "api",
+				"protocol":      "TCP",
+			},
+		},
+		"env": []interface{}{
+			map[string]interface{}{"name": "PORT", "value": "4001"},
+			map[string]interface{}{"name": "NODE_ENV", "value": "production"},
+			map[string]interface{}{
+				"name": "OAA_BACKEND_URL",
+				"value": func() string {
+					if url := envOrDefault("OAA_BACKEND_URL", ""); url != "" {
+						return url
+					}
+					return "http://airgap-architect-backend:4000"
+				}(),
+			},
+			map[string]interface{}{"name": "OPENSHIFT_OPERATOR_MANAGED", "value": "true"},
+		},
+		"resources": map[string]interface{}{
+			"requests": map[string]interface{}{
+				"cpu":    "50m",
+				"memory": "64Mi",
+			},
+			"limits": map[string]interface{}{
+				"cpu":    "200m",
+				"memory": "256Mi",
+			},
+		},
+		"livenessProbe": map[string]interface{}{
+			"httpGet": map[string]interface{}{
+				"path": "/api/health",
+				"port": int64(4001),
+			},
+			"initialDelaySeconds": int64(10),
+			"periodSeconds":       int64(15),
+			"failureThreshold":    int64(3),
+		},
+		"readinessProbe": map[string]interface{}{
+			"httpGet": map[string]interface{}{
+				"path": "/api/health",
+				"port": int64(4001),
+			},
+			"initialDelaySeconds": int64(5),
+			"periodSeconds":       int64(10),
+			"failureThreshold":    int64(3),
 		},
 	}
 }
@@ -11306,11 +11384,17 @@ cat "$CLI_DIR/VERSIONS.txt"
 						"image":   r.UBI9MinimalImage,
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
-set -ex
-echo "=== Copying Airgap Architect import script to bundle ==="
+set -e
+echo "=== Copying Airgap Architect import script and CRDs to bundle ==="
 cp /workspace/architect-script/import-airgap-architect.sh /workspace/output/import-airgap-architect.sh
 chmod +x /workspace/output/import-airgap-architect.sh
-ls -lh /workspace/output/import-airgap-architect.sh
+
+mkdir -p /workspace/output/bundledCrds
+for f in /workspace/architect-script/00-crd-*.yaml; do
+  [ -f "$f" ] && cp "$f" /workspace/output/bundledCrds/
+done
+echo "Bundled CRDs:"
+ls -lh /workspace/output/bundledCrds/ 2>/dev/null || echo "(none found)"
 `},
 					},
 				},
@@ -11994,19 +12078,33 @@ func (r *DisconnectedPlatformReconciler) reconcileArtifactFileServer(ctx context
 }
 
 func (r *DisconnectedPlatformReconciler) ensureImportScriptConfigMap(ctx context.Context) error {
+	data := map[string]string{
+		"import-airgap-architect.sh": scripts.ImportAirgapArchitectScript,
+	}
+	for filename, content := range scripts.BundledCRDs {
+		data[filename] = content
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "airgap-architect-import-script",
 			Namespace: architectNamespace,
 		},
-		Data: map[string]string{
-			"import-airgap-architect.sh": scripts.ImportAirgapArchitectScript,
-		},
+		Data: data,
 	}
 
 	existing := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
-		if existing.Data["import-airgap-architect.sh"] != scripts.ImportAirgapArchitectScript {
+		needsUpdate := existing.Data["import-airgap-architect.sh"] != scripts.ImportAirgapArchitectScript
+		if !needsUpdate {
+			for k, v := range scripts.BundledCRDs {
+				if existing.Data[k] != v {
+					needsUpdate = true
+					break
+				}
+			}
+		}
+		if needsUpdate {
 			existing.Data = cm.Data
 			return r.Update(ctx, existing)
 		}
