@@ -4418,6 +4418,7 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 		quayConfig["PREFERRED_URL_SCHEME"] = "https"
 	}
 	quayConfig["FEATURE_PROXY_STORAGE"] = true
+	quayConfig["MAXIMUM_LAYER_SIZE"] = "20G"
 
 	configYAML, err := yaml.Marshal(quayConfig)
 	if err != nil {

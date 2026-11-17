@@ -3371,6 +3371,11 @@ notifier:
 			configYAML := string(secret.Data["config.yaml"])
 			Expect(configYAML).To(ContainSubstring("s3.example.com"))
 			Expect(configYAML).To(ContainSubstring("my-bucket"))
+			// Issue #138: MAXIMUM_LAYER_SIZE must be present in connected Quay config
+			// (it was already set in the airgapped config but was missing here, causing
+			// large-layer push failures on connected clusters).
+			Expect(configYAML).To(ContainSubstring("MAXIMUM_LAYER_SIZE"),
+				"connected Quay config bundle must include MAXIMUM_LAYER_SIZE to allow large image pushes")
 		})
 
 		It("updates existing config bundle secret", func() {
