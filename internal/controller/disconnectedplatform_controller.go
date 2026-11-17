@@ -11368,7 +11368,7 @@ echo "=== Bundle creation complete ==="
 				"steps": []map[string]interface{}{
 					{
 						"name":    "upload-artifacts",
-						"image":   "amazon/aws-cli:latest",
+						"image":   "docker.io/amazon/aws-cli:latest",
 						"command": []string{"/bin/sh", "-c"},
 						"args": []string{`
 set -e

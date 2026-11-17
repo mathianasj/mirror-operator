@@ -568,7 +568,7 @@ func (r *CollectionPipelineReconciler) deleteS3Objects(ctx context.Context, pipe
 					Containers: []corev1.Container{
 						{
 							Name:    "s3-cleanup",
-							Image:   "amazon/aws-cli:latest",
+							Image:   "docker.io/amazon/aws-cli:latest",
 							Command: []string{"/bin/sh", "-c"},
 							Args: []string{fmt.Sprintf(
 								`aws --endpoint-url %s s3 rm s3://%s/%s/ --recursive && echo "S3 cleanup complete for %s"`,
