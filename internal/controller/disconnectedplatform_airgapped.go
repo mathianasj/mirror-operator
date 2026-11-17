@@ -801,7 +801,7 @@ func (r *DisconnectedPlatformReconciler) reconcileAirgappedACM(ctx context.Conte
 		return false, fmt.Errorf("operatorgroup for ACM: %w", err)
 	}
 
-	if err := r.ensureSubscription(ctx, acmOp, subCfg); err != nil {
+	if err := r.ensureSubscription(ctx, platform, acmOp, subCfg); err != nil {
 		return false, fmt.Errorf("subscription for ACM: %w", err)
 	}
 

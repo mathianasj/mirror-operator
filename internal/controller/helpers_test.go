@@ -428,7 +428,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 				ns:        "test-ns",
 			}
 
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, &mirrorv1.DisconnectedPlatform{}, op, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{}
@@ -469,7 +469,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 				ns:        "test-ns",
 			}
 
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, &mirrorv1.DisconnectedPlatform{}, op, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{}
@@ -649,7 +649,7 @@ var _ = Describe("Proxy and CA helpers", func() {
 				ns:        "test-ns",
 			}
 
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, &mirrorv1.DisconnectedPlatform{}, op, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{}

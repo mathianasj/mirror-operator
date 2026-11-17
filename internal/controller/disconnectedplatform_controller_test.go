@@ -2483,9 +2483,16 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 	})
 
 	Describe("ensureSubscription", func() {
+		testPlatform := func() *mirrorv1.DisconnectedPlatform {
+			return &mirrorv1.DisconnectedPlatform{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-platform", UID: "test-uid"},
+			}
+		}
+
 		It("creates a subscription with correct fields from operatorDef defaults", func() {
+			p := testPlatform()
 			r := &DisconnectedPlatformReconciler{
-				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(p).Build(),
 				Scheme: testScheme,
 			}
 			op := operatorDef{
@@ -2496,7 +2503,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				catalogNS: "openshift-marketplace",
 				ns:        "test-ns",
 			}
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, p, op, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{Object: map[string]interface{}{}}
@@ -2530,13 +2537,14 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				Scheme: testScheme,
 			}
 			op := operatorDef{name: "test-op", ns: "test-ns"}
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, testPlatform(), op, nil)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("respects OLMSubscriptionConfig overrides", func() {
+			p := testPlatform()
 			r := &DisconnectedPlatformReconciler{
-				Client: fake.NewClientBuilder().WithScheme(testScheme).Build(),
+				Client: fake.NewClientBuilder().WithScheme(testScheme).WithObjects(p).Build(),
 				Scheme: testScheme,
 			}
 			op := operatorDef{
@@ -2554,7 +2562,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 				ApprovalStrategy: "Manual",
 				StartingCSV:      "test-operator.v1.0.0",
 			}
-			err := r.ensureSubscription(ctx, op, cfg)
+			err := r.ensureSubscription(ctx, p, op, cfg)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{Object: map[string]interface{}{}}

@@ -175,7 +175,7 @@ var _ = Describe("Integration CrossOp: OLM and Tekton", func() {
 				ns:        opNS,
 			}
 
-			err := r.ensureSubscription(ctx, op, nil)
+			err := r.ensureSubscription(ctx, &mirrorv1.DisconnectedPlatform{}, op, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{}
@@ -215,7 +215,7 @@ var _ = Describe("Integration CrossOp: OLM and Tekton", func() {
 				CatalogSourceNS: "custom-ns",
 			}
 
-			err := r.ensureSubscription(ctx, op, cfg)
+			err := r.ensureSubscription(ctx, &mirrorv1.DisconnectedPlatform{}, op, cfg)
 			Expect(err).NotTo(HaveOccurred())
 
 			sub := &unstructured.Unstructured{}
