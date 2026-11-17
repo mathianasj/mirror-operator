@@ -84,7 +84,7 @@ jobs:
       matrix:
         component:
           - name: frontend
-            context: frontend
+            context: .
             containerfile: frontend/Containerfile
             image: quay.io/mathianasj/openshift-airgap-architect-frontend
           - name: backend
