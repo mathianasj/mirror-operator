@@ -8157,10 +8157,12 @@ func (r *DisconnectedPlatformReconciler) clearDegradedCondition(ctx context.Cont
 	for i := range platform.Status.Conditions {
 		if platform.Status.Conditions[i].Type == "Degraded" && platform.Status.Conditions[i].Reason == reason {
 			if platform.Status.Conditions[i].Status == metav1.ConditionFalse &&
+				platform.Status.Conditions[i].Reason == "HealthCheckPassed" &&
 				platform.Status.Conditions[i].Message == "Health check passed" {
 				break
 			}
 			platform.Status.Conditions[i].Status = metav1.ConditionFalse
+			platform.Status.Conditions[i].Reason = "HealthCheckPassed"
 			platform.Status.Conditions[i].LastTransitionTime = metav1.Now()
 			platform.Status.Conditions[i].Message = "Health check passed"
 			break
