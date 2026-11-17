@@ -43,6 +43,12 @@ spec:
                 type: string
               imageSetConfig:
                 type: string
+              imageTimeout:
+                description: |-
+                  ImageTimeout sets the per-image deadline passed to oc-mirror via --image-timeout.
+                  When set, overrides the platform-level mirror-request-timeout derived from
+                  NetworkPerformance. Use this to give slow or large images more time to mirror.
+                type: string
               incremental:
                 type: boolean
               parentPipeline:

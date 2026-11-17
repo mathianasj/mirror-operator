@@ -990,6 +990,10 @@ func (r *CollectionPipelineReconciler) buildPipelineRun(ctx context.Context, pip
 			mirrorRequestTimeout = fmt.Sprintf("%d", int(np.EffectiveRequestTimeout.Duration.Seconds()))
 		}
 	}
+	// spec.imageTimeout on the CollectionPipeline overrides the platform-level value.
+	if pipeline.Spec.ImageTimeout != nil && pipeline.Spec.ImageTimeout.Duration > 0 {
+		mirrorRequestTimeout = fmt.Sprintf("%d", int(pipeline.Spec.ImageTimeout.Duration.Seconds()))
+	}
 	params = append(params,
 		pipelinev1.Param{Name: "mirror-max-per-registry", Value: pipelinev1.ParamValue{Type: "string", StringVal: mirrorMaxPerRegistry}},
 		pipelinev1.Param{Name: "mirror-parallel-layers", Value: pipelinev1.ParamValue{Type: "string", StringVal: "5"}},

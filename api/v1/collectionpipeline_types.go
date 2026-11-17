@@ -68,6 +68,11 @@ type CollectionPipelineSpec struct {
 	// StorageSize is the size of the working PVC for collection storage. Defaults to 100Gi.
 	// +optional
 	StorageSize *resource.Quantity `json:"storageSize,omitempty"`
+	// ImageTimeout sets the per-image deadline passed to oc-mirror via --image-timeout.
+	// When set, overrides the platform-level mirror-request-timeout derived from
+	// NetworkPerformance. Use this to give slow or large images more time to mirror.
+	// +optional
+	ImageTimeout *metav1.Duration `json:"imageTimeout,omitempty"`
 }
 
 type CollectionPhase string

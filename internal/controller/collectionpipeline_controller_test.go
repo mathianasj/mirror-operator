@@ -280,6 +280,48 @@ var _ = Describe("CollectionPipelineReconciler", func() {
 			}
 			Expect(paramMap["mirror-image"]).To(Equal(defaultMirrorImage))
 		})
+
+		It("uses spec.imageTimeout for mirror-request-timeout when set (issue #126)", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					ImageTimeout:   &metav1.Duration{Duration: 45 * time.Minute},
+				},
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			// 45 minutes = 2700 seconds
+			Expect(paramMap["mirror-request-timeout"]).To(Equal("2700"),
+				"spec.imageTimeout must override the platform-level mirror-request-timeout "+
+					"so users can tune --image-timeout per CollectionPipeline")
+		})
+
+		It("falls back to platform NetworkPerformance timeout when imageTimeout is not set", func() {
+			pipeline = &mirrorv1.CollectionPipeline{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "default"},
+				Spec: mirrorv1.CollectionPipelineSpec{
+					ImageSetConfig: "kind: ImageSetConfiguration",
+					// No ImageTimeout set — should use default
+				},
+			}
+
+			pr, err := r.buildPipelineRun(ctx, pipeline, cm)
+			Expect(err).NotTo(HaveOccurred())
+
+			paramMap := make(map[string]string)
+			for _, p := range pr.Spec.Params {
+				paramMap[p.Name] = p.Value.StringVal
+			}
+			Expect(paramMap["mirror-request-timeout"]).NotTo(BeEmpty(),
+				"mirror-request-timeout must always be set (from platform defaults when imageTimeout is absent)")
+		})
 	})
 
 	Describe("Reconcile", func() {
