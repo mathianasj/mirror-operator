@@ -4419,6 +4419,10 @@ func (r *DisconnectedPlatformReconciler) createOrUpdateQuayS3ConfigSecret(ctx co
 	}
 	quayConfig["FEATURE_PROXY_STORAGE"] = true
 	quayConfig["MAXIMUM_LAYER_SIZE"] = "20G"
+	// Set Nginx timeouts to match the Gunicorn worker timeout (300s) so the
+	// blob-upload location's client_body_timeout doesn't default to 60s and
+	// cause upload failures on slow networks.
+	quayConfig["NGINX_TIMEOUT_S"] = 300
 
 	configYAML, err := yaml.Marshal(quayConfig)
 	if err != nil {
