@@ -154,6 +154,43 @@ func TestBuildRHCOSServerScript_UsesRegistryHostPathSeparation(t *testing.T) {
 	}
 }
 
+// TestDownloadRHCOSScript_PinnedVersion verifies that the download script
+// uses OCP release metadata to select a pinned RHCOS version rather than
+// unconditionally hitting the unpinned latest/ channel (issue #142).
+func TestDownloadRHCOSScript_PinnedVersion(t *testing.T) {
+	script := downloadRHCOSScript()
+
+	// The script must NOT hardcode /latest as the only URL path.
+	if strings.Contains(script, `rhcos/${RHCOS_VERSION}/latest"`) &&
+		!strings.Contains(script, `rhcos/${RHCOS_VERSION}/${OC_VERSION}`) &&
+		!strings.Contains(script, "release.txt") {
+		t.Error("script uses hardcoded /latest URL without first trying a pinned version — " +
+			"must attempt OC_VERSION-specific directory or read release.txt before falling back to latest/")
+	}
+
+	// The script must attempt to discover the pinned RHCOS version from OCP
+	// release metadata before falling back to latest/.
+	hasPinnedAttempt := strings.Contains(script, "release.txt") ||
+		strings.Contains(script, `rhcos/${RHCOS_VERSION}/${OC_VERSION}`) ||
+		strings.Contains(script, "machine-os")
+	if !hasPinnedAttempt {
+		t.Error("script does not attempt to discover pinned RHCOS version from OCP release metadata; " +
+			"must consult release.txt or use OC_VERSION-specific directory path")
+	}
+
+	// When latest/ is used, it must be a fallback, not the primary path.
+	// Acceptable: contains "latest" only after a pinned-version attempt.
+	latestIdx := strings.Index(script, "/latest")
+	pinnedIdx := strings.Index(script, "release.txt")
+	if pinnedIdx == -1 {
+		pinnedIdx = strings.Index(script, `/${OC_VERSION}`)
+	}
+	if latestIdx != -1 && pinnedIdx != -1 && latestIdx < pinnedIdx {
+		t.Error("script uses latest/ before attempting the pinned OCP version directory or reading release.txt; " +
+			"pinned version discovery must come first")
+	}
+}
+
 func TestRegistryExistsCheckSnippet_AuthLookup(t *testing.T) {
 	snippet := registryExistsCheckSnippet()
 
