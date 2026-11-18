@@ -2241,6 +2241,23 @@ start_containers() {
     # Regenerate container-specific config with latest IDMS/ITMS paths
     update_container_config
 
+    # Detect OCP minor version from imageset-config to determine if extra supported
+    # minors need to be advertised to the architect backend (versions < 4.20 are
+    # not natively supported by the upstream architect UI).
+    local ocp_minor_pre=""
+    if [ -f "${SCRIPT_DIR}/imageset-config.yaml" ]; then
+        ocp_minor_pre=$(grep -oP 'minVersion:\s*\K[0-9]+\.[0-9]+' "${SCRIPT_DIR}/imageset-config.yaml" 2>/dev/null | head -1 || true)
+    fi
+    local extra_minors_env=()
+    if [ -n "${ocp_minor_pre}" ]; then
+        local minor_num
+        minor_num=$(echo "${ocp_minor_pre}" | cut -d. -f2)
+        if [ "${minor_num}" -lt 20 ] 2>/dev/null; then
+            log "OCP minor ${ocp_minor_pre} < 4.20 — passing OAA_EXTRA_SUPPORTED_MINORS=${ocp_minor_pre}"
+            extra_minors_env=(-e "OAA_EXTRA_SUPPORTED_MINORS=${ocp_minor_pre}")
+        fi
+    fi
+
     log "Starting backend container..."
     podman run -d \
         --name airgap-architect-backend \
@@ -2257,6 +2274,7 @@ start_containers() {
         -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
         -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
         -e APP_BRANCH="${APP_BRANCH:-main}" \
+        "${extra_minors_env[@]}" \
         --security-opt label=disable \
         --network host \
         -v "${SCRIPT_DIR}:/data" \
