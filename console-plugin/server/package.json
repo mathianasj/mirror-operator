@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Proxy backend for the Airgap Architect OpenShift Console plugin",
   "main": "server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node server.js",
     "start:dev": "node --watch server.js"
@@ -12,10 +12,9 @@
     "@kubernetes/client-node": "^1.0.0",
     "@aws-sdk/client-s3": "^3.0.0",
     "@aws-sdk/s3-request-presigner": "^3.0.0",
-    "express": "^4.21.0",
+    "express": "^4.22.0",
     "js-yaml": "^4.1.0",
-    "pino": "^10.0.0",
-    "nanoid": "^3.3.7",
-    "node-fetch": "^2.7.0"
+    "pino": "^10.3.0",
+    "nanoid": "^5.0.0"
   }
 }

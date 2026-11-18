@@ -1,19 +1,20 @@
-'use strict';
+import express from 'express';
+import { createLogger } from './logger.js';
+import { nanoid } from 'nanoid';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 
-const express = require('express');
-const { createLogger } = require('./logger');
-const { nanoid } = require('nanoid');
-const fetch = require('node-fetch');
-const path = require('path');
-const fs = require('fs');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const {
+import {
   createUploadPod, waitForPodReady, cleanupUploadPod,
   streamChunkToUploadPod, triggerAssembly, createPvc, deletePvc,
-} = require('./uploadPod');
-const { listPvcs } = require('./collectionPipeline');
-const { extractImageSetConfigFromTar } = require('./tarImageSetExtractor');
-const { generateCollectionDownloadUrls, resolveCollectionArtifact, streamS3ParallelDownload } = require('./s3Client');
+} from './uploadPod.js';
+import { listPvcs } from './collectionPipeline.js';
+import { extractImageSetConfigFromTar } from './tarImageSetExtractor.js';
+import { generateCollectionDownloadUrls, resolveCollectionArtifact, streamS3ParallelDownload } from './s3Client.js';
 
 const logger = createLogger('plugin-backend');
 const app = express();
