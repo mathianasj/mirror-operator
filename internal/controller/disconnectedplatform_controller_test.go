@@ -2391,7 +2391,7 @@ var _ = Describe("DisconnectedPlatformReconciler", func() {
 	Describe("consolePluginDeployment", func() {
 		It("creates a console plugin Deployment with correct container name", func() {
 			labels := architectComponentLabels("plugin")
-			dep := consolePluginDeployment("test-plugin", "quay.io/test/plugin:v1", "quay.io/test/plugin-backend:v1", 1, labels, "pull-secret", "openshift-config")
+			dep := consolePluginDeployment("test-plugin", "quay.io/test/plugin:v1", "quay.io/test/plugin-backend:v1", "mo-test-airgap-architect-backend", 1, labels, "pull-secret", "openshift-config")
 
 			Expect(dep.GetName()).To(Equal("test-plugin"))
 			Expect(dep.GetNamespace()).To(Equal(architectNamespace))

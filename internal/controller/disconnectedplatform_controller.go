@@ -7340,18 +7340,80 @@ func (r *DisconnectedPlatformReconciler) ensureConsolePlugin(ctx context.Context
 	dep.SetName(name)
 	dep.SetNamespace(architectNamespace)
 	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), dep); err == nil {
-		return r.updateArchitectDeployment(ctx, platform, name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(name, image string, labels map[string]string) map[string]interface{} {
-			return consolePluginContainer(name, image, backendImage, labels)
-		})
+		// Build the desired spec with the nginx container then inject the sidecar,
+		// mirroring what consolePluginDeployment does on the create path.
+		return r.updateConsolePluginDeployment(ctx, platform, name, image, backendImage, replicas, labels, pullSecretName, pullSecretNamespace)
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	newDep := consolePluginDeployment(name, image, backendImage, replicas, labels, pullSecretName, pullSecretNamespace)
+	newDep := consolePluginDeployment(name, image, backendImage, architectResourceName(platform, "airgap-architect-backend"), replicas, labels, pullSecretName, pullSecretNamespace)
 	setOwnerReference(newDep, platform)
 	return r.Create(ctx, newDep)
 }
 
-func consolePluginDeployment(name, image, backendImage string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
+// updateConsolePluginDeployment updates the console plugin Deployment ensuring
+// both the nginx container and the Express backend sidecar are present.
+func (r *DisconnectedPlatformReconciler) updateConsolePluginDeployment(ctx context.Context, platform *mirrorv1.DisconnectedPlatform, name, image, backendImage string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) error {
+	logger := log.FromContext(ctx)
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(deploymentGVK)
+	existing.SetName(name)
+	existing.SetNamespace(architectNamespace)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
+		return err
+	}
+
+	// Build desired spec with nginx container.
+	desiredSpec := architectDeploymentSpec(name, image, replicas, labels, pullSecretName, pullSecretNamespace, func(n, i string, l map[string]string) map[string]interface{} {
+		return consolePluginContainer(n, i, backendImage, l)
+	})
+
+	// Inject the Express backend sidecar alongside the nginx container.
+	if containers, ok, _ := unstructured.NestedSlice(desiredSpec, "template", "spec", "containers"); ok {
+		hasSidecar := false
+		for _, c := range containers {
+			cm, _ := c.(map[string]interface{})
+			if cm["name"] == "plugin-backend" {
+				hasSidecar = true
+				break
+			}
+		}
+		if !hasSidecar {
+			containers = append(containers, consolePluginBackendSidecar(backendImage, architectResourceName(platform, "airgap-architect-backend")))
+		} else {
+			// Update existing sidecar image if it changed.
+			for i, c := range containers {
+				cm, _ := c.(map[string]interface{})
+				if cm["name"] == "plugin-backend" {
+					cm["image"] = backendImage
+					containers[i] = cm
+					break
+				}
+			}
+		}
+		_ = unstructured.SetNestedSlice(desiredSpec, containers, "template", "spec", "containers")
+	}
+
+	existingSpec, _, _ := unstructured.NestedMap(existing.Object, "spec")
+	equal, reason := deploymentsEqual(existingSpec, desiredSpec)
+	if equal {
+		logger.V(1).Info("Console plugin deployment spec unchanged, skipping update", "name", name)
+		return nil
+	}
+	logger.Info("Updating console plugin deployment", "name", name, "reason", reason)
+
+	dep := &unstructured.Unstructured{}
+	dep.SetGroupVersionKind(deploymentGVK)
+	dep.SetName(name)
+	dep.SetNamespace(architectNamespace)
+	dep.SetLabels(labels)
+	dep.SetResourceVersion(existing.GetResourceVersion())
+	setOwnerReference(dep, platform)
+	dep.Object["spec"] = desiredSpec
+	return r.Update(ctx, dep)
+}
+
+func consolePluginDeployment(name, image, backendImage, architectBackendSvcName string, replicas int32, labels map[string]string, pullSecretName, pullSecretNamespace string) *unstructured.Unstructured {
 	dep := &unstructured.Unstructured{}
 	dep.SetGroupVersionKind(deploymentGVK)
 	dep.SetName(name)
@@ -7362,7 +7424,7 @@ func consolePluginDeployment(name, image, backendImage string, replicas int32, l
 	})
 	// Inject the Express backend sidecar into the pod's containers list.
 	if containers, ok, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers"); ok {
-		containers = append(containers, consolePluginBackendSidecar(backendImage))
+		containers = append(containers, consolePluginBackendSidecar(backendImage, architectBackendSvcName))
 		_ = unstructured.SetNestedSlice(dep.Object, containers, "spec", "template", "spec", "containers")
 	}
 	return dep
@@ -7434,7 +7496,10 @@ func consolePluginContainer(name, image, backendImage string, labels map[string]
 
 // consolePluginBackendSidecar returns the Express API sidecar container that
 // handles /api/* routes proxied from the nginx container on 127.0.0.1:4001.
-func consolePluginBackendSidecar(image string) map[string]interface{} {
+// architectBackendSvcName is the in-cluster Service name of the architect
+// backend (e.g. "mo-disconnected-platform-airgap-architect-backend").
+func consolePluginBackendSidecar(image, architectBackendSvcName string) map[string]interface{} {
+	oaaBackendURL := fmt.Sprintf("http://%s:%d", architectBackendSvcName, architectPort)
 	return map[string]interface{}{
 		"name":            "plugin-backend",
 		"image":           image,
@@ -7449,15 +7514,7 @@ func consolePluginBackendSidecar(image string) map[string]interface{} {
 		"env": []interface{}{
 			map[string]interface{}{"name": "PORT", "value": "4001"},
 			map[string]interface{}{"name": "NODE_ENV", "value": "production"},
-			map[string]interface{}{
-				"name": "OAA_BACKEND_URL",
-				"value": func() string {
-					if url := envOrDefault("OAA_BACKEND_URL", ""); url != "" {
-						return url
-					}
-					return "http://airgap-architect-backend:4000"
-				}(),
-			},
+			map[string]interface{}{"name": "OAA_BACKEND_URL", "value": oaaBackendURL},
 			map[string]interface{}{"name": "OPENSHIFT_OPERATOR_MANAGED", "value": "true"},
 		},
 		"resources": map[string]interface{}{
