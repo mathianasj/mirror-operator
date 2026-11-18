@@ -133,6 +133,16 @@ jobs:
             echo "tags=${REPO}:latest,${REPO}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve oc-mirror pinned URL and SHA256
+        id: oc-mirror
+        run: |
+          # oc-mirror.tar.gz is absent from the 'latest' channel sha256sum.txt;
+          # pin to stable-4.22 to bypass the broken lookup in the Containerfile.
+          SHA=$(curl -sL "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-4.22/sha256sum.txt" | awk '$2=="oc-mirror.tar.gz"{print $1}')
+          URL="https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-4.22/oc-mirror.tar.gz"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v6
         with:
           context: architect-src/${{ matrix.component.context }}
@@ -142,6 +152,8 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             APP_GIT_SHA=${{ github.sha }}
+            OCP_MIRROR_URL=${{ steps.oc-mirror.outputs.url }}
+            OCP_MIRROR_SHA256=${{ steps.oc-mirror.outputs.sha }}
 
   build-and-push-console-plugin:
     needs: test
@@ -207,7 +219,7 @@ jobs:
           tags: ${{ steps.plugin-tags.outputs.backend_tags }}
 
   bundle-and-catalog:
-    needs: build-and-push
+    needs: [build-and-push, build-and-push-console-plugin, build-and-push-architect-images]
     if: github.event_name == 'push' || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
