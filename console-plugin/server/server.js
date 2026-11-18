@@ -1,5 +1,5 @@
 import express from 'express';
-import { createLogger } from './logger.js';
+import logger from './logger.js';
 import { nanoid } from 'nanoid';
 import path from 'path';
 import fs from 'fs';
@@ -16,7 +16,7 @@ import { listPvcs } from './collectionPipeline.js';
 import { extractImageSetConfigFromTar } from './tarImageSetExtractor.js';
 import { generateCollectionDownloadUrls, resolveCollectionArtifact, streamS3ParallelDownload } from './s3Client.js';
 
-const logger = createLogger('plugin-backend');
+// logger is the default pino export from logger.js
 const app = express();
 const PORT = parseInt(process.env.PORT || '4001', 10);
 
