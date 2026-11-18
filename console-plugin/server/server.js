@@ -384,6 +384,6 @@ app.get('/api/collections/:name/download/:artifactType', async (req, res) => {
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-app.listen(PORT, '127.0.0.1', () => {
+app.listen(PORT, '0.0.0.0', () => {
   logger.info({ port: PORT }, 'Airgap Architect plugin backend listening');
 });
