@@ -1964,7 +1964,7 @@ setup_bootstrap_manifests() {
     # directory when the user clicks "Generate Agent ISO".
     #
     # Only runs when MIRROR_REGISTRY_CONFIG is set (mirror bundle loaded).
-    local config_file="${DATA_DIR}/data/mirror-registry-config-container.json"
+    local config_file="${DATA_DIR}/mirror-registry-config-container.json"
     if [ ! -f "${config_file}" ]; then
         log "MIRROR_REGISTRY_CONFIG not set, skipping bootstrap manifest generation"
         return 0
@@ -1981,7 +1981,7 @@ setup_bootstrap_manifests() {
     local ocp_minor=""
     if command -v python3 >/dev/null 2>&1; then
         ocp_minor=$(curl -sf http://localhost:4000/api/state 2>/dev/null | \
-            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('blueprint',{}).get('selectedMinor',''))" 2>/dev/null || true)
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version',{}).get('selectedMinor',''))" 2>/dev/null || true)
     fi
     if [ -z "${ocp_minor}" ] && [ -f "${SCRIPT_DIR}/imageset-config.yaml" ]; then
         ocp_minor=$(grep -oP 'minVersion:\s*\K[0-9]+\.[0-9]+' "${SCRIPT_DIR}/imageset-config.yaml" 2>/dev/null | head -1 || true)
@@ -1989,15 +1989,23 @@ setup_bootstrap_manifests() {
     log "Registry FQDN: ${registry_fqdn}"
     log "OCP minor:     ${ocp_minor:-<not detected>}"
 
+    # Paths in the config are stored as container-internal paths (/data/...)
+    # Translate them to host paths by replacing /data prefix with SCRIPT_DIR.
+    _host_path() { echo "${1/#\/data/${SCRIPT_DIR}}"; }
+
     # CA cert content (for mirror registry trust ConfigMap)
     local ca_cert_path
-    ca_cert_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('caCertPath',''))" 2>/dev/null || true)
+    ca_cert_path=$(_host_path "$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('caCertPath',''))" 2>/dev/null || true)")
 
     # IDMS/ITMS/CatalogSource paths from mirror-registry-config
     local idms_path itms_path catalog_paths
-    idms_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('idmsPath',''))" 2>/dev/null || true)
-    itms_path=$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('itmsPath',''))" 2>/dev/null || true)
-    catalog_paths=$(python3 -c "import sys,json; print('\n'.join(json.load(open('${config_file}')).get('catalogSourcePaths',[])))" 2>/dev/null || true)
+    idms_path=$(_host_path "$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('idmsPath',''))" 2>/dev/null || true)")
+    itms_path=$(_host_path "$(python3 -c "import sys,json; print(json.load(open('${config_file}')).get('itmsPath',''))" 2>/dev/null || true)")
+    catalog_paths=$(python3 -c "
+import sys,json
+paths=json.load(open('${config_file}')).get('catalogSourcePaths',[])
+print('\n'.join(paths))
+" 2>/dev/null | while read -r p; do _host_path "$p"; done || true)
 
     # --- Step 2: Copy CRD YAMLs from bundledCrds/ ---
     if [ -d "${SCRIPT_DIR}/bundledCrds" ]; then
@@ -2320,8 +2328,72 @@ stop_containers() {
 }
 
 restart_containers() {
+    log "Restarting Airgap Architect containers..."
     stop_containers
-    start_containers
+
+    # Load existing registry configuration — no prompts, no CLI install,
+    # no mirror-registry setup, no oc-mirror re-run.
+    if ! load_existing_registry_config; then
+        error "No existing registry configuration found. Run 'start' for first-time setup."
+    fi
+
+    configure_podman_ipv6
+    update_container_config
+
+    mkdir -p "${DATA_DIR}"
+    find "${SCRIPT_DIR}" -type d -user "$(id -u)" -exec chmod 777 {} \; 2>/dev/null || true
+    if command -v chcon &>/dev/null; then
+        chcon -Rt container_file_t "${SCRIPT_DIR}" 2>/dev/null || true
+    fi
+    if [ -f "${SCRIPT_DIR}/imageset-config.yaml" ]; then
+        chmod 644 "${SCRIPT_DIR}/imageset-config.yaml"
+    fi
+
+    log "Starting backend container..."
+    podman run -d \
+        --name airgap-architect-backend \
+        --replace \
+        --user "$(id -u):$(id -g)" \
+        -e PORT=4000 \
+        -e DATA_DIR=/data \
+        -e MIRROR_REGISTRY_CONFIG=/data/data/mirror-registry-config-container.json \
+        -e IMAGESET_CONFIG=/data/imageset-config.yaml \
+        -e IDMS_PATH=/data/data/imageDigestMirrorSet.yaml \
+        -e ITMS_PATH=/data/data/imageTagMirrorSet.yaml \
+        -e BOOTSTRAP_MANIFESTS_DIR=/data/bootstrap-manifests \
+        -e MOCK_MODE="${MOCK_MODE:-false}" \
+        -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
+        -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
+        -e APP_BRANCH="${APP_BRANCH:-main}" \
+        -e OAA_ALLOWED_ORIGINS="http://localhost:5173" \
+        -e OAA_EXTRA_SUPPORTED_MINORS="${OAA_EXTRA_SUPPORTED_MINORS:-}" \
+        --security-opt label=disable \
+        --network host \
+        -v "${SCRIPT_DIR}:/data" \
+        --stop-timeout 3 \
+        "${BACKEND_IMAGE}"
+
+    log "Waiting for backend to be ready..."
+    sleep 2
+
+    setup_bootstrap_manifests
+
+    log "Starting frontend container..."
+    podman run -d \
+        --name airgap-architect-frontend \
+        --replace \
+        -e VITE_API_BASE="" \
+        -e OAA_BACKEND_ORIGIN="http://127.0.0.1:4000" \
+        -e VITE_ALLOWED_HOSTS="${VITE_ALLOWED_HOSTS:-}" \
+        --network host \
+        --stop-timeout 3 \
+        "${FRONTEND_IMAGE}"
+
+    log ""
+    log "============================================================"
+    log "  Airgap Architect restarted!"
+    log "  Open your browser to: http://localhost:5173"
+    log "============================================================"
 }
 
 show_status() {

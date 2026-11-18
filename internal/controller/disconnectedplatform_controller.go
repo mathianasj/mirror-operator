@@ -11536,6 +11536,11 @@ else
     fi
   done
 
+  if [ -d "bundledCrds" ] && [ -n "$(ls -A bundledCrds/ 2>/dev/null)" ]; then
+    echo "Including bundledCrds/ in bundle"
+    SMALL_CONTENTS="$SMALL_CONTENTS bundledCrds"
+  fi
+
   if [ -f "imageset-config.yaml" ]; then
     echo "Including ImageSetConfiguration in bundle"
     SMALL_CONTENTS="$SMALL_CONTENTS imageset-config.yaml"
