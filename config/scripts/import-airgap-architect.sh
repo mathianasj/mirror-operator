@@ -2257,6 +2257,8 @@ start_containers() {
         -e FEEDBACK_MODE="${FEEDBACK_MODE:-github}" \
         -e APP_REPO="${APP_REPO:-bstrauss84/openshift-airgap-architect}" \
         -e APP_BRANCH="${APP_BRANCH:-main}" \
+        -e OAA_ALLOWED_ORIGINS="http://localhost:5173" \
+        -e OAA_EXTRA_SUPPORTED_MINORS="${OAA_EXTRA_SUPPORTED_MINORS:-}" \
         --security-opt label=disable \
         --network host \
         -v "${SCRIPT_DIR}:/data" \
@@ -2273,9 +2275,10 @@ start_containers() {
     podman run -d \
         --name airgap-architect-frontend \
         --replace \
-        -e VITE_API_BASE=http://localhost:4000 \
+        -e VITE_API_BASE="" \
+        -e OAA_BACKEND_ORIGIN="http://127.0.0.1:4000" \
         -e VITE_ALLOWED_HOSTS="${VITE_ALLOWED_HOSTS:-}" \
-        -p 127.0.0.1:5173:5173 \
+        --network host \
         --stop-timeout 3 \
         "${FRONTEND_IMAGE}"
 
