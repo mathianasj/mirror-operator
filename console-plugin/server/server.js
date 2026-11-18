@@ -10,9 +10,8 @@ const __dirname = path.dirname(__filename);
 
 import {
   createUploadPod, waitForPodReady, cleanupUploadPod,
-  streamChunkToUploadPod, triggerAssembly, createPvc, deletePvc,
+  streamChunkToUploadPod, triggerAssembly, createPvc, deletePvc, listPvcs,
 } from './uploadPod.js';
-import { listPvcs } from './collectionPipeline.js';
 import { extractImageSetConfigFromTar } from './tarImageSetExtractor.js';
 import { generateCollectionDownloadUrls, resolveCollectionArtifact, streamS3ParallelDownload } from './s3Client.js';
 
