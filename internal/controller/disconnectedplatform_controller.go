@@ -11622,11 +11622,18 @@ echo "=== Bundle creation complete ==="
 set -e
 echo "Uploading artifacts to S3..."
 
+# Disable the AWS CRT (Common Runtime) backend so --cli-read-timeout is
+# honoured for the first-byte wait. Without this, AWS CLI v2 uses the CRT
+# library which has its own ~60s first-byte timeout that ignores the CLI flag,
+# causing AWS_ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT on slow NooBaa responses.
+export AWS_CRT_DISABLE=1
+
 # Tune S3 multipart upload — use smaller chunks and fewer concurrent
 # requests to avoid overwhelming the NooBaa endpoint on large bundles
 aws configure set default.s3.multipart_chunksize 128MB
 aws configure set default.s3.multipart_threshold 128MB
 aws configure set default.s3.max_concurrent_requests 5
+aws configure set default.s3.payload_signing_enabled false
 
 S3_TIMEOUT_ARGS="--cli-read-timeout 600 --cli-connect-timeout 30"
 
