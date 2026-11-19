@@ -7,7 +7,7 @@ VERSION ?= 0.1.8
 
 # ARCHITECT_REF pins the openshift-airgap-architect branch/tag/SHA to build
 # frontend and backend images from. Update when merging to upstream.
-ARCHITECT_REF ?= feature/418-419-minor-support
+ARCHITECT_REF ?= feature/mirror-operator-integration
 ARCHITECT_REPO ?= https://github.com/mathianasj/openshift-airgap-architect.git
 
 # CHANNELS define the bundle channels used in the bundle.
