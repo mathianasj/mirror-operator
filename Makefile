@@ -464,8 +464,8 @@ release: ## Create a versioned release (usage: make release VERSION=x.y.z)
 	git add Makefile community-operators/release-config.yaml catalog-templates/alpha-channel.json catalog-templates/bundle-images.txt
 	git commit -m "Release v$(VERSION)"
 	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
-	git push origin HEAD "v$(VERSION)"
-	@NOTES=$$(hack/release-notes.sh $(VERSION)); \
-	gh release create "v$(VERSION)" --title "v$(VERSION)" --notes-file "$$NOTES"; \
-	rm -f "$$NOTES"
-	hack/close-milestone.sh $(VERSION)
+	@# Push to release branch (not master directly) to satisfy branch protection.
+	@# The CI workflow opens a PR, waits for the 'test' check, then merges.
+	@BRANCH=$${RELEASE_BRANCH:-releases/v$(VERSION)}; \
+	echo "Pushing release commit to branch: $$BRANCH"; \
+	git push origin HEAD:$$BRANCH "v$(VERSION)"
