@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Configure git
         run: |
@@ -36,13 +36,13 @@ jobs:
 
       - name: Run release (push to release branch)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
           RELEASE_BRANCH: ${{ steps.prep.outputs.release_branch }}
         run: make release VERSION=${{ inputs.version }} RELEASE_BRANCH=$RELEASE_BRANCH
 
       - name: Open release PR to master
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           gh pr create \
             --title "Release v${{ inputs.version }}" \
@@ -64,18 +64,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Merge release PR (admin override — CI already passed in build job)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           PR_NUMBER=$(gh pr list --base master --head releases/v${{ inputs.version }} --json number --jq '.[0].number')
           gh pr merge "$PR_NUMBER" --merge --admin --subject "Release v${{ inputs.version }}"
 
       - name: Create GitHub release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           NOTES=$(hack/release-notes.sh ${{ inputs.version }})
           gh release create "v${{ inputs.version }}" \
