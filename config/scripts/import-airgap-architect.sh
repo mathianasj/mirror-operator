@@ -2045,7 +2045,22 @@ spec:
     - mirror-operator-system
 YAML
 
-    cat > "${manifest_dir}/99-mirror-operator-subscription.yaml" <<'YAML'
+    # Detect whether the mirror-operator catalog was collected from the custom
+    # mirror-operator-catalog or from community-operators. If the catalog image
+    # exists in the mirror registry we generated the CatalogSource for it,
+    # so the subscription must reference it; otherwise fall back to community-operators.
+    local subscription_source="community-operators"
+    local ca_flag=""
+    [ -f "${DATA_DIR}/mirror-registry-ca.pem" ] && ca_flag="--tls-verify=false"
+    if skopeo inspect ${ca_flag:-} \
+        "docker://${registry_fqdn}/mirror/mirror-operator-catalog:latest" >/dev/null 2>&1; then
+        subscription_source="mirror-operator-catalog"
+        log "Detected mirror-operator-catalog in registry — subscription will use: mirror-operator-catalog"
+    else
+        log "mirror-operator-catalog not in registry — subscription will use: community-operators"
+    fi
+
+    cat > "${manifest_dir}/99-mirror-operator-subscription.yaml" <<YAML
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -2055,7 +2070,7 @@ spec:
   channel: alpha
   installPlanApproval: Automatic
   name: mirror-operator
-  source: community-operators
+  source: ${subscription_source}
   sourceNamespace: openshift-marketplace
 YAML
 
