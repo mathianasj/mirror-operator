@@ -3,7 +3,7 @@
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 0.1.8
+VERSION ?= 0.1.9
 
 # ARCHITECT_REF pins the openshift-airgap-architect branch/tag/SHA to build
 # frontend and backend images from. Update when merging to upstream.
