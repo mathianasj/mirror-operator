@@ -12,10 +12,13 @@ permissions:
   contents: write
   issues: write
   packages: write
+  pull-requests: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      release-branch: ${{ steps.prep.outputs.release_branch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,10 +30,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Run release
+      - name: Prepare release branch name
+        id: prep
+        run: echo "release_branch=releases/v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Run release (push to release branch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: make release VERSION=${{ inputs.version }}
+          RELEASE_BRANCH: ${{ steps.prep.outputs.release_branch }}
+        run: make release VERSION=${{ inputs.version }} RELEASE_BRANCH=$RELEASE_BRANCH
+
+      - name: Open release PR to master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Release v${{ inputs.version }}" \
+            --body "Automated release PR for v${{ inputs.version }}. Merge after CI passes." \
+            --base master \
+            --head ${{ steps.prep.outputs.release_branch }}
 
   build:
     needs: release
@@ -39,8 +57,35 @@ jobs:
       version: v${{ inputs.version }}
     secrets: inherit
 
-  submit-to-operatorhub:
+  merge-and-publish:
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge release PR (admin override — CI already passed in build job)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=$(gh pr list --base master --head releases/v${{ inputs.version }} --json number --jq '.[0].number')
+          gh pr merge "$PR_NUMBER" --merge --admin --subject "Release v${{ inputs.version }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES=$(hack/release-notes.sh ${{ inputs.version }})
+          gh release create "v${{ inputs.version }}" \
+            --title "v${{ inputs.version }}" \
+            --notes-file "$NOTES"
+          rm -f "$NOTES"
+          hack/close-milestone.sh ${{ inputs.version }}
+
+  submit-to-operatorhub:
+    needs: merge-and-publish
     uses: ./.github/workflows/operator-catalog-pr.yaml
     with:
       version: ${{ inputs.version }}
