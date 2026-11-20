@@ -63,8 +63,13 @@ type ConnectedConfig struct {
 	RHCOSCollection *RHCOSCollectionConfig `json:"rhcosCollection,omitempty"`
 	// Custom catalog image for mirroring the mirror-operator itself (defaults to community-operator-index).
 	// Set to a dev catalog image (e.g. "quay.io/mathianasj/mirror-operator-catalog:latest") to test pre-release code.
+	// Auto-populated by the controller from the operator's own Subscription when a custom catalog is detected.
 	// +optional
 	MirrorOperatorCatalog string `json:"mirrorOperatorCatalog,omitempty"`
+	// OLM channel the mirror-operator was installed from.
+	// Auto-populated by the controller from the operator's own Subscription.
+	// +optional
+	MirrorOperatorChannel string `json:"mirrorOperatorChannel,omitempty"`
 }
 
 // RHCOSCollectionConfig controls downloading RHCOS boot images and packaging them into a server container image

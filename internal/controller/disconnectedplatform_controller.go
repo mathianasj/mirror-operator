@@ -5867,6 +5867,13 @@ func (r *DisconnectedPlatformReconciler) ensureOwnSubscriptionConfig(ctx context
 			continue
 		}
 
+		// Auto-populate MirrorOperatorCatalog on the platform spec so the
+		// CollectionPipeline imageset injection mirrors the right catalog image
+		// and the import script generates the correct CatalogSource/Subscription.
+		if err := r.syncMirrorOperatorCatalogFromSubscription(ctx, sub); err != nil {
+			logger.Error(err, "failed to sync mirror-operator catalog source from subscription")
+		}
+
 		if err := r.ensureSubscriptionCABundle(ctx, sub); err != nil {
 			return fmt.Errorf("ensuring CA bundle on own subscription: %w", err)
 		}
@@ -5896,6 +5903,60 @@ func (r *DisconnectedPlatformReconciler) ensureOwnSubscriptionConfig(ctx context
 	}
 
 	return nil
+}
+
+// syncMirrorOperatorCatalogFromSubscription reads the catalog source that
+// mirror-operator was actually installed from (community-operators or a custom
+// catalog) and stores the catalog image in platform.Spec.Connected.MirrorOperatorCatalog
+// so the CollectionPipeline imageset injection mirrors the right catalog and the
+// import script generates a matching CatalogSource + Subscription.
+func (r *DisconnectedPlatformReconciler) syncMirrorOperatorCatalogFromSubscription(ctx context.Context, sub *unstructured.Unstructured) error {
+	sourceCS, _, _ := unstructured.NestedString(sub.Object, "spec", "source")
+	channel, _, _ := unstructured.NestedString(sub.Object, "spec", "channel")
+
+	// community-operators is the default — no override needed.
+	if sourceCS == "" || sourceCS == "community-operators" {
+		return nil
+	}
+
+	// Look up the CatalogSource image for the custom source.
+	cs := &unstructured.Unstructured{}
+	cs.SetGroupVersionKind(schema.GroupVersionKind{Group: "operators.coreos.com", Version: "v1alpha1", Kind: "CatalogSource"})
+	csNS, _, _ := unstructured.NestedString(sub.Object, "spec", "sourceNamespace")
+	if csNS == "" {
+		csNS = "openshift-marketplace"
+	}
+	if err := r.Get(ctx, client.ObjectKey{Name: sourceCS, Namespace: csNS}, cs); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	catalogImage, _, _ := unstructured.NestedString(cs.Object, "spec", "image")
+	if catalogImage == "" {
+		return nil
+	}
+
+	// Update the platform spec so the collection pipeline picks it up.
+	platformList := &mirrorv1.DisconnectedPlatformList{}
+	if err := r.List(ctx, platformList); err != nil || len(platformList.Items) == 0 {
+		return nil
+	}
+	platform := &platformList.Items[0]
+	if platform.Spec.Connected == nil {
+		return nil
+	}
+	needsUpdate := platform.Spec.Connected.MirrorOperatorCatalog != catalogImage
+	needsChannel := channel != "" && platform.Spec.Connected.MirrorOperatorChannel != channel
+	if !needsUpdate && !needsChannel {
+		return nil
+	}
+	if needsUpdate {
+		platform.Spec.Connected.MirrorOperatorCatalog = catalogImage
+	}
+	if needsChannel {
+		platform.Spec.Connected.MirrorOperatorChannel = channel
+	}
+	log.FromContext(ctx).Info("Syncing mirror-operator catalog source from subscription",
+		"catalogImage", catalogImage, "channel", channel, "source", sourceCS)
+	return r.Update(ctx, platform)
 }
 
 func (r *DisconnectedPlatformReconciler) ensureOSUSPullSecret(ctx context.Context) error {

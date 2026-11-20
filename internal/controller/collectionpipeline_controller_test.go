@@ -863,7 +863,7 @@ mirror:
 				Scheme: testScheme,
 			}
 
-			result := r.injectMirrorOperator(baseConfig, "")
+			result := r.injectMirrorOperator(baseConfig, "", "")
 			Expect(result).To(ContainSubstring("registry.redhat.io/redhat/community-operator-index"))
 			Expect(result).To(ContainSubstring("mirror-operator"))
 		})
@@ -874,7 +874,7 @@ mirror:
 				Scheme: testScheme,
 			}
 
-			result := r.injectMirrorOperator(baseConfig, "quay.io/mathianasj/mirror-operator-catalog:latest")
+			result := r.injectMirrorOperator(baseConfig, "quay.io/mathianasj/mirror-operator-catalog:latest", "")
 			Expect(result).To(ContainSubstring("quay.io/mathianasj/mirror-operator-catalog:latest"))
 			Expect(result).To(ContainSubstring("mirror-operator"))
 			Expect(result).NotTo(ContainSubstring("community-operator-index"))
@@ -894,7 +894,7 @@ mirror:
 				Scheme: testScheme,
 			}
 
-			result := r.injectMirrorOperator(configWithOperator, "quay.io/mathianasj/mirror-operator-catalog:latest")
+			result := r.injectMirrorOperator(configWithOperator, "quay.io/mathianasj/mirror-operator-catalog:latest", "")
 			Expect(result).To(Equal(configWithOperator))
 		})
 	})
@@ -1222,7 +1222,7 @@ mirror:
     - name: some-other-operator`
 
 			r := &CollectionPipelineReconciler{}
-			result := r.injectMirrorOperator(config, "")
+			result := r.injectMirrorOperator(config, "", "")
 			Expect(result).To(ContainSubstring("mirror-operator"))
 			Expect(result).To(ContainSubstring("some-other-operator"))
 		})
@@ -1241,7 +1241,7 @@ mirror:
     - name: advanced-cluster-management`
 
 			r := &CollectionPipelineReconciler{}
-			result := r.injectMirrorOperator(config, "")
+			result := r.injectMirrorOperator(config, "", "")
 			Expect(result).To(ContainSubstring("mirror-operator"))
 			Expect(result).To(ContainSubstring("community-operator-index"))
 		})
@@ -1256,14 +1256,14 @@ mirror:
     - name: mirror-operator`
 
 			r := &CollectionPipelineReconciler{}
-			result := r.injectMirrorOperator(config, "")
+			result := r.injectMirrorOperator(config, "", "")
 			Expect(result).To(Equal(config))
 		})
 
 		It("returns original on invalid YAML", func() {
 			config := "not: valid: {["
 			r := &CollectionPipelineReconciler{}
-			result := r.injectMirrorOperator(config, "")
+			result := r.injectMirrorOperator(config, "", "")
 			Expect(result).To(Equal(config))
 		})
 	})

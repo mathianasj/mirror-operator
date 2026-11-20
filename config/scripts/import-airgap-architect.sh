@@ -2045,7 +2045,22 @@ spec:
     - mirror-operator-system
 YAML
 
-    cat > "${manifest_dir}/99-mirror-operator-subscription.yaml" <<'YAML'
+    # Detect whether the mirror-operator catalog was collected from the custom
+    # mirror-operator-catalog or from community-operators. If the catalog image
+    # exists in the mirror registry we generated the CatalogSource for it,
+    # so the subscription must reference it; otherwise fall back to community-operators.
+    local subscription_source="community-operators"
+    local ca_flag=""
+    [ -f "${DATA_DIR}/mirror-registry-ca.pem" ] && ca_flag="--tls-verify=false"
+    if skopeo inspect ${ca_flag:-} \
+        "docker://${registry_fqdn}/mirror/mirror-operator-catalog:latest" >/dev/null 2>&1; then
+        subscription_source="mirror-operator-catalog"
+        log "Detected mirror-operator-catalog in registry — subscription will use: mirror-operator-catalog"
+    else
+        log "mirror-operator-catalog not in registry — subscription will use: community-operators"
+    fi
+
+    cat > "${manifest_dir}/99-mirror-operator-subscription.yaml" <<YAML
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -2055,7 +2070,7 @@ spec:
   channel: alpha
   installPlanApproval: Automatic
   name: mirror-operator
-  source: community-operators
+  source: ${subscription_source}
   sourceNamespace: openshift-marketplace
 YAML
 
@@ -2076,6 +2091,9 @@ spec:
       interval: 30m
 YAML
 
+    # Build DisconnectedPlatform CR — write base first, then append the
+    # openshiftVersion block separately so the value is always a quoted YAML
+    # string (bare "4.18" is parsed as a float by the Kubernetes API server).
     cat > "${manifest_dir}/99-disconnectedplatform.yaml" <<YAML
 apiVersion: mirror.mirror.mathianasj.github.com/v1
 kind: DisconnectedPlatform
@@ -2104,9 +2122,18 @@ spec:
       enabled: true
       hostInventory:
         enabled: true
-        ${ocp_minor:+versions:
+YAML
+    # Append versions block with openshiftVersion as a quoted YAML string.
+    # Must be done outside the heredoc to ensure the value is properly quoted
+    # — YAML parses bare "4.18" as a float, which the CRD rejects.
+    if [ -n "${ocp_minor}" ]; then
+        cat >> "${manifest_dir}/99-disconnectedplatform.yaml" <<YAML
+        versions:
         - openshiftVersion: "${ocp_minor}"
-        rhcosImage: "${registry_fqdn}/mirror/rhcos-server:${ocp_minor}"}
+          rhcosImage: "${registry_fqdn}/mirror/rhcos-server:${ocp_minor}"
+YAML
+    fi
+    cat >> "${manifest_dir}/99-disconnectedplatform.yaml" <<YAML
   architect:
     consolePlugin:
       enabled: true
@@ -2162,8 +2189,20 @@ YAML
         log "Wrote 99-mirror-registry-ca.yaml"
     fi
 
+    # Make files readable by the container process (which may run under a
+    # different UID due to rootless podman user namespace remapping).
+    chmod 644 "${manifest_dir}"/*.yaml 2>/dev/null || true
+
     log "Bootstrap manifests written to ${manifest_dir}:"
     ls -1 "${manifest_dir}/" | while read -r f; do log "  ${f}"; done
+
+    # Apply container_file_t SELinux context so the backend container can read
+    # these files. Must be done after all files are written — files created after
+    # chcon runs on the parent directory inherit the filesystem default context,
+    # not container_file_t.
+    if command -v chcon &>/dev/null; then
+        chcon -Rt container_file_t "${manifest_dir}" 2>/dev/null || true
+    fi
 }
 
 start_containers() {
@@ -2249,6 +2288,11 @@ start_containers() {
     # Regenerate container-specific config with latest IDMS/ITMS paths
     update_container_config
 
+    # openshift-install caches RHCOS ISOs at /opt/app-root/src/.cache/agent
+    # inside the container. Mount a writable host directory there so it
+    # survives container restarts and doesn't hit read-only container layers.
+    mkdir -p "${DATA_DIR}/oi-cache"
+
     log "Starting backend container..."
     podman run -d \
         --name airgap-architect-backend \
@@ -2270,6 +2314,7 @@ start_containers() {
         --security-opt label=disable \
         --network host \
         -v "${SCRIPT_DIR}:/data" \
+        -v "${DATA_DIR}/oi-cache:/opt/app-root/src/.cache/agent" \
         --stop-timeout 3 \
         "${BACKEND_IMAGE}"
 
@@ -2338,9 +2383,18 @@ restart_containers() {
     fi
 
     configure_podman_ipv6
+
+    # Reload images from tarballs if they have been replaced with custom/patched
+    # versions. Place updated tarballs in BUNDLE_DIR as:
+    #   airgap-architect-frontend.tar.gz
+    #   airgap-architect-backend.tar.gz
+    # Restart will re-import them so the new images are used immediately.
+    import_images
+
     update_container_config
 
     mkdir -p "${DATA_DIR}"
+    mkdir -p "${DATA_DIR}/oi-cache"
     find "${SCRIPT_DIR}" -type d -user "$(id -u)" -exec chmod 777 {} \; 2>/dev/null || true
     if command -v chcon &>/dev/null; then
         chcon -Rt container_file_t "${SCRIPT_DIR}" 2>/dev/null || true
@@ -2370,6 +2424,7 @@ restart_containers() {
         --security-opt label=disable \
         --network host \
         -v "${SCRIPT_DIR}:/data" \
+        -v "${DATA_DIR}/oi-cache:/opt/app-root/src/.cache/agent" \
         --stop-timeout 3 \
         "${BACKEND_IMAGE}"
 

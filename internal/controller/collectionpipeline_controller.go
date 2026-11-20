@@ -628,11 +628,12 @@ func (r *CollectionPipelineReconciler) ensureConfigMap(ctx context.Context, pipe
 	enrichedConfig := pipeline.Spec.ImageSetConfig
 
 	// Inject mirror-operator catalog so the operator and its relatedImages get mirrored
-	var catalogOverride string
+	var catalogOverride, channelOverride string
 	if platform, err := r.findPlatform(ctx); err == nil && platform != nil && platform.Spec.Connected != nil {
 		catalogOverride = platform.Spec.Connected.MirrorOperatorCatalog
+		channelOverride = platform.Spec.Connected.MirrorOperatorChannel
 	}
-	enrichedConfig = r.injectMirrorOperator(enrichedConfig, catalogOverride)
+	enrichedConfig = r.injectMirrorOperator(enrichedConfig, catalogOverride, channelOverride)
 
 	// Include Architect images consumed by the export task in the intermediate mirror.
 	enrichedConfig = r.injectArchitectImages(ctx, enrichedConfig)
@@ -1199,7 +1200,7 @@ const mirrorOperatorPackage = "mirror-operator"
 // injectMirrorOperator ensures a catalog with the mirror-operator package is present
 // in the ImageSetConfiguration operators section. When catalogOverride is set, it uses
 // that image directly; otherwise it defaults to the community-operator-index.
-func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string, catalogOverride string) string {
+func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML, catalogOverride, channelOverride string) string {
 	var config ImageSetConfiguration
 	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
 		return configYAML
@@ -1239,10 +1240,31 @@ func (r *CollectionPipelineReconciler) injectMirrorOperator(configYAML string, c
 		return string(enrichedYAML)
 	}
 
+	pkg := PackageConfig{Name: mirrorOperatorPackage}
+	if channelOverride != "" {
+		pkg.Channels = []ChannelConfig{{Name: channelOverride}}
+	}
 	config.Mirror.Operators = append(config.Mirror.Operators, OperatorConfig{
 		Catalog:  catalogRef,
-		Packages: []PackageConfig{{Name: mirrorOperatorPackage}},
+		Packages: []PackageConfig{pkg},
 	})
+
+	// When using a custom (non-community) catalog, also add the catalog image
+	// itself to additionalImages so oc-mirror explicitly mirrors it. Without
+	// this the CatalogSource on the airgapped cluster cannot pull the index.
+	if catalogOverride != "" {
+		alreadyAdded := false
+		for _, img := range config.Mirror.AdditionalImages {
+			if img.Name == catalogOverride {
+				alreadyAdded = true
+				break
+			}
+		}
+		if !alreadyAdded {
+			config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageConfig{Name: catalogOverride})
+		}
+	}
+
 	enrichedYAML, err := yaml.Marshal(&config)
 	if err != nil {
 		return configYAML
