@@ -1,425 +1,130 @@
-# Mirror Operator - Claude Integration Guide
+# CLAUDE.md
 
-This file provides guidance for Claude Code and other AI assistants working with the mirror-operator codebase.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-The mirror-operator is a Kubernetes operator for managing disconnected/airgapped OpenShift environments. It automates:
-- Content collection from internet sources
-- Bundle creation for physical transfer
-- Import into airgapped registries
-- Cluster bootstrapping from mirrored content
+The mirror-operator is a cluster-scoped Kubernetes operator for managing disconnected/airgapped OpenShift environments. It automates content collection from internet sources, bundle creation for physical transfer (DVD/USB), import into airgapped registries, and cluster bootstrapping. The operator also deploys and manages the **Airgap Architect UI** (a connected Node.js/React config tool).
 
-**Language**: Go 1.22+  
-**Framework**: Kubebuilder v4  
-**Primary Dependencies**: controller-runtime, Kubernetes client-go
+**Language**: Go 1.22+ | **Framework**: Kubebuilder v4 / controller-runtime | **API group**: `mirror.mirror.mathianasj.github.com/v1`
 
-## Repository Structure
-
-```
-mirror-operator/
-├── api/v1/                          # CRD type definitions
-│   ├── disconnectedplatform_types.go   # Main orchestration resource
-│   ├── collectionpipeline_types.go     # Collection automation
-│   ├── mirrorimport_types.go           # Import automation
-│   └── clusterbootstrap_types.go       # Cluster provisioning
-├── internal/controller/             # Controller reconciliation logic
-│   ├── disconnectedplatform_controller.go
-│   ├── collectionpipeline_controller.go
-│   ├── mirrorimport_controller.go
-│   └── clusterbootstrap_controller.go
-├── config/                          # Kubernetes manifests
-│   ├── crd/bases/                     # Generated CRD YAML
-│   ├── rbac/                          # RBAC roles
-│   ├── samples/                       # Example CRs
-│   └── manager/                       # Operator deployment
-├── docs/                            # Documentation
-│   ├── crd-reference.md              # API documentation
-│   ├── integration-guide.md          # Integration patterns
-│   └── reference-architecture-mapping.md
-└── cmd/main.go                      # Operator entrypoint
-```
-
-## Custom Resource Definitions (CRDs)
-
-### DisconnectedPlatform
-**Purpose**: Top-level orchestrator for connected/airgapped workflows  
-**Key Fields**:
-- `spec.mode`: `connected` | `airgapped`
-- `spec.architect`: Airgap Architect UI configuration
-- `spec.connected.collectionSchedule`: Cron schedule for collections
-- `spec.airgapped.importPath`: Bundle import location
-
-**Controller**: `internal/controller/disconnectedplatform_controller.go`
-
-### CollectionPipeline
-**Purpose**: Triggers Tekton pipelines to collect images from internet sources  
-**Key Fields**:
-- `spec.imageSetConfig`: oc-mirror ImageSetConfiguration YAML
-- `spec.storage`: PVC or S3 output location
-- `spec.signing`: Cosign signing configuration
-
-**Controller**: `internal/controller/collectionpipeline_controller.go`
-
-### MirrorImport
-**Purpose**: Imports bundles into airgapped registries  
-**Key Fields**:
-- `spec.bundle`: Source bundle location (PVC path)
-- `spec.targetRegistry`: Destination registry
-- `spec.publish`: CatalogSource/ICSP creation flags
-
-**Controller**: `internal/controller/mirrorimport_controller.go`
-
-### ClusterBootstrap
-**Purpose**: Provisions new OpenShift clusters from mirrored content  
-**Key Fields**:
-- `spec.version`: OpenShift version
-- `spec.platform`: `vsphere` | `baremetal` | `none`
-- `spec.mirrorRegistry`: Registry for cluster installation
-
-**Controller**: `internal/controller/clusterbootstrap_controller.go`
-
-## Development Workflow
-
-### Making Changes to CRDs
-
-1. **Edit types**: Modify `api/v1/*_types.go`
-2. **Regenerate manifests**: `make manifests`
-3. **Regenerate deepcopy**: `make generate`
-4. **Update CRDs in cluster**: `make install`
-
-### Testing Controllers Locally
+## Key Commands
 
 ```bash
-# Run operator locally (connects to current kubeconfig context)
-make run
-
-# Apply sample CR
-kubectl apply -f config/samples/mirror_v1_disconnectedplatform_airgapped.yaml
-
-# Watch logs in operator output
-# Check status
-kubectl get disconnectedplatform -o yaml
-```
-
-### Key Makefile Targets
-
-```bash
-make manifests      # Generate CRD/RBAC YAML from Go types
-make generate       # Generate deepcopy code
-make fmt            # Format Go code
-make vet            # Run Go vet
-make test           # Run unit tests
+make test           # Run all tests (also runs manifests, generate, fmt, vet)
+make run            # Run controller locally against current kubeconfig
+make restart        # Kill existing local instance and restart
+make manifests      # Regenerate CRD/RBAC YAML + sync bundledCrds/ (run after api/v1 changes)
+make generate       # Regenerate deepcopy functions
 make install        # Install CRDs into cluster
-make uninstall      # Remove CRDs from cluster
-make deploy         # Deploy operator to cluster
-make undeploy       # Remove operator from cluster
-make run            # Run controller locally
-make docker-build   # Build container image
+make bundle IMG=... VERSION=x.y.z  # Build OLM bundle
+make release VERSION=x.y.z         # Cut a versioned release (requires clean working tree)
 ```
 
-## Go Best Practices
+**Single test**: `go test ./internal/controller -v --ginkgo.focus="<describe block name>"`
 
-- Always pass `ctx context.Context` as the first parameter. Never store it in a struct.
-- Wrap errors with context: `fmt.Errorf("reconciling quay config: %w", err)`. Never swallow errors silently.
-- Use `errors.Is()` and `errors.As()` for error comparison — never match on `err.Error()` string content.
-- Use `:=` inside functions. Use `var` only for zero-value declarations or package-level variables.
-- Nil slices are fine — they work with `append`, `len`, `range`. Don't `make` unless you need specific capacity.
-- No unnecessary interfaces — don't define one until there are 2+ implementations. Accept interfaces, return concrete types.
-- No stutter in naming: `quay.Manager` not `quay.QuayManager`. Use short receiver names (`r` not `reconciler`).
-- Use pointer receivers consistently on a type — don't mix pointer and value receivers.
-- No `init()` functions — pass dependencies explicitly.
-- Prefer standard library (`net/http`, `encoding/json`, `slices`, `maps`) over third-party equivalents.
-- Use table-driven tests with `t.Run(tt.name, ...)` for unit helpers. Use Ginkgo/Gomega for controller tests.
+**`make test` already runs `manifests generate fmt vet`** — do not run them separately before `make test`.
 
-## Code Organization Guidelines
+After any `api/v1/*_types.go` change, run `make manifests generate` before committing.
 
-- Keep functions under 100 lines (excluding embedded shell script strings for pipeline tasks).
-- When adding new functionality to a controller, extract it into a focused helper function or a separate file rather than growing existing functions.
-- Group related functionality into domain-specific packages under `internal/controller/` (e.g., `internal/controller/quay/` for Quay registry management). Do not add new domain logic directly into the monolithic controller files.
-- Avoid duplicating logic across connected and airgapped code paths — extract shared logic into common helpers.
+## Architecture
+
+### Four CRDs
+
+| CRD | Scope | Purpose | Controller |
+|-----|-------|---------|-----------|
+| `DisconnectedPlatform` | Cluster | Top-level orchestrator; deploys Airgap Architect UI, manages OLM subscriptions, aggregates status | `disconnectedplatform_controller.go` + `disconnectedplatform_airgapped.go` |
+| `CollectionPipeline` | Namespaced | Triggers Tekton pipelines to run oc-mirror and produce bundles | `collectionpipeline_controller.go` |
+| `MirrorImport` | Namespaced | Imports bundles into airgapped Quay, verifies cosign signatures | `mirrorimport_controller.go` |
+| `ClusterBootstrap` | Namespaced | Provisions new OpenShift clusters from mirrored content (stub) | `clusterbootstrap_controller.go` |
+
+### DisconnectedPlatform — the monolith
+
+`disconnectedplatform_controller.go` is intentionally large (~12k lines). It embeds entire Tekton PipelineRun definitions as Go string literals (the `buildPipelineTasks()` family). The file owns: Airgap Architect deployments, Quay config, RHTAS/Keycloak/RHTPA wiring, OSUS, console plugin, OLM subscriptions, and the collection pipeline template. **Do not grow it further** — extract new domain logic into packages under `internal/controller/`.
+
+The airgapped reconcile path lives in `disconnectedplatform_airgapped.go` (import pipeline, mirror-to-nodes, UpdateService, ACM).
+
+### CollectionPipeline — imageset enrichment
+
+`collectionpipeline_controller.go` enriches the user-supplied `spec.imageSetConfig` YAML before passing it to the Tekton pipeline:
+- `injectMirrorOperator(configYAML, catalogOverride, channelOverride)` — adds mirror-operator package to the imageset; when a custom catalog is set via `platform.Spec.Connected.MirrorOperatorCatalog`, also adds the catalog image to `additionalImages` so oc-mirror explicitly mirrors it
+- `injectArchitectImages()` — adds frontend/backend images
+- `injectRHCOSServerImage()` — adds RHCOS server image for ACM host inventory
+- `injectDefaultArchitecture()` — pins to `amd64` to avoid OSUS graph mismatches
+
+### Console Plugin Sidecar
+
+The `airgap-architect-plugin` Deployment has **two containers**:
+- `plugin` — nginx on port 9001 (HTTPS) serving the React dist files; proxies `/api/` to `localhost:4001`
+- `plugin-backend` — Express.js sidecar on port 4001 handling `/api/mirror-import/*` and `/api/collections/*` routes; proxies shared architect routes to `OAA_BACKEND_URL`
+
+Source in `console-plugin/` (TypeScript/React UI + Express backend in `console-plugin/server/`). Images built by CI and referenced via `RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN` / `RELATED_IMAGE_ARCHITECT_CONSOLE_PLUGIN_BACKEND`.
+
+### Import Script
+
+`config/scripts/import-airgap-architect.sh` is embedded into the operator binary via `//go:embed` in `config/scripts/scripts.go` and stored as a Kubernetes ConfigMap (`airgap-architect-import-script`). The collection pipeline's `copy-import-script` Tekton task bundles it alongside CRD YAMLs from `config/scripts/bundledCrds/` into the airgapped bundle tar.
+
+The script's `start_containers` function (and lightweight `restart_containers` sibling) start the Airgap Architect backend+frontend via podman on the bastion. `setup_bootstrap_manifests()` generates BOOTSTRAP_MANIFESTS_DIR content (CRDs, operator manifests, DisconnectedPlatform CR) for injecting into agent ISOs.
+
+### Auto-Detection: MirrorOperatorCatalog
+
+`syncMirrorOperatorCatalogFromSubscription()` runs in reconcile and reads the operator's own `Subscription` to detect which catalog source (community-operators vs custom) and channel were used at install time. It auto-populates `platform.Spec.Connected.MirrorOperatorCatalog` and `MirrorOperatorChannel`, which the CollectionPipeline imageset injection uses.
+
+### Release Process
+
+```bash
+gh workflow run release.yaml --repo mathianasj/mirror-operator -f version=0.1.9
+```
+
+The `make release VERSION=x.y.z` target updates `Makefile`, `community-operators/release-config.yaml`, `catalog-templates/alpha-channel.json`, `catalog-templates/bundle-images.txt`, commits, tags, pushes, creates the GitHub release, and closes the milestone. Requires a clean working tree and the `gh` CLI.
+
+**Branch protection caveat**: master requires the `test` check to pass. The release workflow must bypass this — either via a PAT with bypass permission stored as `RELEASE_PAT` secret, or by adding `github-actions[bot]` as a bypass actor in branch protection settings.
+
+### CRD bundledCrds sync
+
+`make manifests` automatically runs `make sync-crds` which copies `config/crd/bases/*.yaml` → `config/scripts/bundledCrds/`. Always run `make manifests` after API changes to keep them in sync.
 
 ## Operator Conventions
 
-- **Logging**: Always use `log.FromContext(ctx)` — never `fmt.Println` or `log.Printf`.
-- **Requeue strategy**: Use `ctrl.Result{RequeueAfter: 30 * time.Second}` when waiting on external dependencies. Return `ctrl.Result{}` (no requeue) on success. Return the error to trigger default exponential backoff.
-- **Finalizers**: Use naming format `mirror.mathianasj.github.com/<resource>-finalizer`. Add finalizer before any reconciliation logic; remove it last in deletion handling.
-- **Owner references**: Use `ctrl.SetControllerReference(owner, owned, r.Scheme)` — not manual `OwnerReference` construction.
-- **Unstructured resources**: Always call `SetGroupVersionKind()` before any Get/Create/Update — omitting it causes silent failures.
-- **Status conditions**: Use `metav1.Condition` with `Ready` and `Degraded` types. Always set `ObservedGeneration: obj.Generation`. Only update `LastTransitionTime` when the condition status actually changes.
-- **Status update conflicts**: Ignore `apierrors.IsConflict(err)` on status updates — the next reconcile will pick it up.
-- **Optional CRD availability**: When a reconcile depends on a CRD that may not be installed (e.g., Tekton, OLM), track a `crdMissing` flag and requeue after 30s instead of erroring.
-- **Cross-resource watches**: Use custom event handlers (e.g., `secretEventHandler`) in `SetupWithManager` to map events from non-owned resources back to the parent CR via `handler.EnqueueRequestsFromMapFunc`.
-- **PipelineRun tracking**: Store `PipelineRunRef` in the CR status, then poll the referenced PipelineRun's conditions on each reconcile.
-- **After any CRD or RBAC marker change**: Run `make manifests generate` before committing.
-- **`make test` already runs `manifests generate fmt vet`** — don't run them separately before `make test`.
+- **Logging**: `log.FromContext(ctx)` only — never `fmt.Println`/`log.Printf`
+- **Requeue**: `ctrl.Result{RequeueAfter: 30 * time.Second}` while waiting on external deps; `ctrl.Result{}` on success; return error for exponential backoff
+- **Finalizer format**: `mirror.mathianasj.github.com/<resource>-finalizer`
+- **Owner references**: `ctrl.SetControllerReference(owner, owned, r.Scheme)` — not manual construction. `DisconnectedPlatform` is cluster-scoped so it can own namespace-scoped resources in any namespace
+- **Unstructured resources**: Always call `SetGroupVersionKind()` before Get/Create/Update
+- **Status conditions**: `metav1.Condition` with `Ready` / `Degraded` types. Set `ObservedGeneration: obj.Generation`. Only update `LastTransitionTime` when condition status actually changes (use `Reason: "HealthCheckPassed"` when clearing Degraded)
+- **Status update conflicts**: Ignore `apierrors.IsConflict(err)` — next reconcile will pick it up
+- **CRD-not-found errors**: Track `crdMissing` flag and requeue 30s instead of erroring (for Tekton, OLM, OpenShift-specific CRDs)
+- **`ensureSubscription` pattern**: always pass `platform` for owner reference; call `reconcileSubscriptionProxy` on existing subscriptions to keep proxy env vars current
 
-## Architecture Patterns
+## Go Best Practices
 
-### Target Package Structure
+- `fmt.Errorf("reconciling quay config: %w", err)` — always wrap errors with context
+- `errors.Is()` / `errors.As()` for error comparison — never string-match `err.Error()`
+- No `init()` functions — pass dependencies explicitly
+- Nil slices are fine for `append`/`len`/`range`; don't `make` unless you need capacity
+- Table-driven tests with `t.Run()` for unit helpers; Ginkgo/Gomega for controller tests
+- TDD: write failing test (RED) → minimum code to pass (GREEN) → refactor. Run `make test` before every commit
 
-The codebase is being refactored from monolithic controller files into domain-specific packages. New code should follow the target structure:
+## Testing Patterns
 
-```
-internal/controller/
-├── keycloak/       # Realm/client config, admin token, TLS, OIDC
-├── postgres/       # Shared EnsurePostgreSQL(opts) for RHTPA and Keycloak
-├── quay/           # Registry config, Clair VEX, OBC, routes, robot accounts
-├── trustservices/  # RHTAS root keys + signing, RHTPA OIDC + Trustify
-├── pipelines/      # CollectionBuilder and ImportBuilder — accept config, return pipeline specs
-├── architect/      # Frontend/backend deployments, SA, routes
-├── storage/        # Shared EnsureObjectBucketClaim(opts)
-├── constants.go    # API group strings, resource names, namespaces, labels, storage classes
-├── helpers.go      # newUnstructured() helper, shared findPlatform
-└── images.go       # All container image refs as configurable constants
-```
-
-Domain packages use a `Manager` struct pattern. Reconcilers should be thin orchestrators that call domain manager methods in sequence — the `Reconcile` method itself should stay under 100 lines.
-
-### Controller Pattern
-All controllers follow standard Kubernetes controller-runtime patterns:
+Controller tests use the fake client or envtest (`suite_test.go` wires up envtest for integration tests). Most new tests should use `fake.NewClientBuilder().WithScheme(scheme).WithObjects(...).Build()`.
 
 ```go
-func (r *SomeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    // 1. Fetch resource
-    obj := &v1.SomeResource{}
-    if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
-    
-    // 2. Handle deletion (finalizers)
-    if !obj.DeletionTimestamp.IsZero() {
-        return r.cleanup(ctx, obj)
-    }
-    
-    // 3. Add finalizer if missing
-    if !containsString(obj.Finalizers, finalizer) {
-        obj.Finalizers = append(obj.Finalizers, finalizer)
-        return ctrl.Result{}, r.Update(ctx, obj)
-    }
-    
-    // 4. Reconcile desired state
-    if err := r.reconcileResources(ctx, obj); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 5. Update status
-    return ctrl.Result{}, r.Status().Update(ctx, obj)
-}
-```
-
-### Using Unstructured for Dynamic Resources
-
-The operator frequently uses `unstructured.Unstructured` to work with Tekton, OLM, and OpenShift resources without importing their type definitions:
-
-```go
-deployment := &unstructured.Unstructured{}
-deployment.SetGroupVersionKind(schema.GroupVersionKind{
-    Group:   "apps",
-    Version: "v1",
-    Kind:    "Deployment",
-})
-deployment.SetName("my-deployment")
-deployment.SetNamespace("my-namespace")
-
-unstructured.SetNestedField(deployment.Object, int64(3), "spec", "replicas")
-```
-
-### Secret Handling
-
-OpenShift pull secrets and registry credentials are handled via:
-- `corev1.LocalObjectReference` in CRD specs
-- Automatic copying between namespaces when needed
-- Volume mounts in pods for consumption
-
-Example from `disconnectedplatform_controller.go`:
-```go
-// Copy pull secret from openshift-config to operator namespace
-sourceSecret := &corev1.Secret{}
-r.Get(ctx, client.ObjectKey{Name: "pull-secret", Namespace: "openshift-config"}, sourceSecret)
-
-targetSecret := &corev1.Secret{
-    ObjectMeta: metav1.ObjectMeta{
-        Name: "pull-secret",
-        Namespace: "mirror-operator-system",
-    },
-    Data: sourceSecret.Data,
-    Type: sourceSecret.Type,
-}
-r.Create(ctx, targetSecret)
-```
-
-## Common Tasks
-
-### Adding a New Field to a CRD
-
-1. Add field to struct in `api/v1/*_types.go`:
-   ```go
-   type DisconnectedPlatformSpec struct {
-       Mode      PlatformMode     `json:"mode"`
-       NewField  string           `json:"newField,omitempty"`  // Add here
-   }
-   ```
-
-2. Regenerate:
-   ```bash
-   make manifests generate
-   ```
-
-3. Update controller to use new field in `internal/controller/*.go`
-
-4. Update sample manifests in `config/samples/`
-
-### Adding RBAC Permissions
-
-Add kubebuilder markers to controller file:
-```go
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
-```
-
-Then regenerate:
-```bash
-make manifests
-```
-
-### Watching Additional Resources
-
-In `SetupWithManager()`:
-```go
-func (r *SomeReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&v1.SomeResource{}).
-        Owns(&appsv1.Deployment{}).        // Watch owned deployments
-        Watches(&corev1.Secret{}, &secretEventHandler{}).  // Watch secrets
-        Complete(r)
-}
-```
-
-### Creating/Updating Kubernetes Resources
-
-Use owner references for garbage collection:
-```go
-ctrl.SetControllerReference(platform, deployment, r.Scheme)
-```
-
-Check-create-update pattern:
-```go
-existing := &appsv1.Deployment{}
-if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err == nil {
-    // Update existing
-    desired.SetResourceVersion(existing.GetResourceVersion())
-    return r.Update(ctx, desired)
-} else if apierrors.IsNotFound(err) {
-    // Create new
-    return r.Create(ctx, desired)
-} else {
-    return err
-}
-```
-
-## Testing
-
-**All code changes must follow the TDD Red/Green/Refactor cycle.** Write a failing test first (RED), write the minimum code to make it pass (GREEN), then clean up (REFACTOR). Run `make test` to verify tests pass before committing. See `agents.md` for detailed TDD examples and anti-patterns.
-
-### Unit Tests
-Located in `*_test.go` files alongside controllers. Use `envtest` for controller testing:
-
-```go
-var _ = Describe("DisconnectedPlatformReconciler", func() {
-    It("adds finalizer on first reconcile", func() {
-        platform := &mirrorv1.DisconnectedPlatform{...}
-        r := &DisconnectedPlatformReconciler{Client: fakeClient}
-        
-        _, err := r.Reconcile(ctx, req)
+// Ginkgo style (controllers)
+var _ = Describe("MyReconciler", func() {
+    It("does something", func() {
+        r := &MyReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+        result, err := r.Reconcile(ctx, req)
         Expect(err).NotTo(HaveOccurred())
-        Expect(platform.Finalizers).To(ContainElement(finalizer))
     })
 })
 ```
 
-### Integration Testing
-Run operator locally with:
-```bash
-make run
-```
+Run a focused test: `go test ./internal/controller -v --ginkgo.focus="description text"`
 
-Then interact with real cluster:
-```bash
-kubectl apply -f config/samples/
-kubectl get disconnectedplatforms
-kubectl describe disconnectedplatform my-platform
-```
+## Git Workflow
 
-## Special Considerations
-
-### Airgap Architect UI
-The `DisconnectedPlatform` controller manages frontend/backend deployments for the Airgap Architect web UI:
-- Frontend: React/Vite serving at port 5173
-- Backend: Node.js API at port 4000
-- Pull secret automatically mounted from OpenShift global secret
-- Routes created for external access
-
-### Pull Secret Management
-The operator automatically:
-1. Copies `openshift-config/pull-secret` to `mirror-operator-system` namespace
-2. Watches for updates to source secret
-3. Triggers pod restarts when secret changes
-4. Allows custom pull secret override via `spec.architect.pullSecret`
-
-Environment variables set in backend pod:
-- `PULL_SECRET_FILE`: Path to mounted secret
-- `OPENSHIFT_OPERATOR_MANAGED=true`: Signals operator management
-
-### GitOps Considerations
-Resources are designed for GitOps workflows:
-- All specs are declarative
-- Status is separate from spec
-- Controllers are idempotent
-- Resources can be safely re-applied
-
-## Troubleshooting
-
-### Operator Not Reconciling
-```bash
-# Check operator is running
-kubectl get pods -n mirror-operator-system
-
-# View logs
-kubectl logs -n mirror-operator-system -l control-plane=controller-manager -f
-
-# Check for RBAC issues
-kubectl auth can-i create deployments --as=system:serviceaccount:mirror-operator-system:mirror-operator-controller-manager
-```
-
-### CRD Changes Not Applying
-```bash
-# Reinstall CRDs
-make uninstall install
-
-# Verify CRD version
-kubectl get crd disconnectedplatforms.mirror.mirror.mathianasj.github.com -o yaml | grep version
-```
-
-### Status Not Updating
-Status subresource must be updated separately:
-```go
-// Wrong - updates spec and status together
-r.Update(ctx, obj)
-
-// Right - only updates status
-r.Status().Update(ctx, obj)
-```
-
-## References
-
-- [Kubebuilder Book](https://book.kubebuilder.io/) - Operator framework documentation
-- [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) - Core reconciliation library
-- [CRD Reference](docs/crd-reference.md) - Complete API documentation
-- [Integration Guide](docs/integration-guide.md) - How to integrate with this operator
-
-## Contact
-
-For questions about this codebase:
-- Review existing issues: https://github.com/mathianasj/mirror-operator/issues
-- Documentation: See `docs/` directory
-- Code patterns: Follow existing controller implementations
+- Every commit must reference a GitHub issue: create one if none exists
+- Branch off master, open a PR — no direct pushes to master
+- Rebase on master before opening/merging PRs: `git fetch origin master && git rebase origin/master`
+- Branch name convention: `fix/<issue-number>-<short-desc>` or `feat/<issue-number>-<short-desc>`
